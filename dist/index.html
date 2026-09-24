@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#111416"><meta name="description" content="用 BTC 与 ETH 真实历史行情随机回放练单，逐根看盘、模拟开仓、止盈止损和复盘。">
+  <title>K线回放 · 历史行情模拟</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="./"><span class="brand-mark" aria-hidden="true">↗</span><strong>K线回放</strong><span class="brand-en">REPLAY LAB</span></a>
+    <div class="header-actions"><span class="private-label">个人练习 · 模拟资金</span><button class="quiet" id="rules">使用说明</button><button class="quiet" id="export">导出记录 ↗</button></div>
+  </header>
+  <main>
+    <section class="session-heading">
+      <div class="session-context"><strong>随机回放练习</strong><span id="session-badge">模拟资金 · 盲回放</span></div>
+      <div class="session-actions"><span id="save-status" class="muted">记录保存在此浏览器</span><button class="primary" id="new-session" disabled><span aria-hidden="true">⤨</span> 随机新一轮</button></div>
+    </section>
+    <section class="metrics" aria-label="本轮账户概况">
+      <div><span>账户净值 <small>USDT</small></span><strong id="equity">10,000.00</strong></div>
+      <div><span>本轮盈亏 <small>已含手续费</small></span><strong id="pnl">0.00 <em>0.00%</em></strong></div>
+      <div><span>持仓浮盈 <small>预扣平仓费</small></span><strong id="unreal">0.00</strong></div>
+      <div><span>平仓胜率 <small id="trade-count">0 笔成交</small></span><strong id="win-rate">—</strong></div>
+    </section>
+    <div class="workspace">
+      <section class="chart-panel" aria-label="历史行情回放">
+        <div class="chart-toolbar">
+          <label class="market-picker"><span class="coin-mark" id="coin-mark">₿</span><select id="symbol" aria-label="交易品种"><option value="BTCUSDT">BTC / USDT</option><option value="ETHUSDT">ETH / USDT</option></select></label>
+          <div class="timeframes" aria-label="K线周期"><button data-tf="900">15分</button><button data-tf="1800">30分</button><button data-tf="2700">45分</button><button data-tf="3600">1小时</button><button data-tf="14400" class="active">4小时</button><button data-tf="86400">1日</button><button data-tf="604800">1周</button></div>
+          <div class="chart-options"><label><input id="ma" type="checkbox">MA20</label><label><input id="blind" type="checkbox" checked>隐藏日期</label><button class="icon-btn" id="recenter" title="回到最新K线" aria-label="回到最新K线">⊙</button></div>
+        </div>
+        <div class="quote-line"><strong id="last-price">—</strong><span id="last-change">等待行情</span><span class="ohlc" id="ohlc">读取真实历史数据中</span></div>
+        <div class="chart-wrap"><div id="chart"></div><div class="chart-watermark" aria-hidden="true">REPLAY LAB<span>只看眼前，练习判断</span></div><div id="loading" role="status">正在准备历史行情…</div></div>
+        <div class="playback">
+          <div class="playback-left"><span class="replay-badge" id="replay-status">盲回放</span><span class="muted" id="progress-text">等待开始</span></div>
+          <div class="playback-controls"><button id="play" class="play-btn" aria-label="自动播放" disabled>▶</button><button class="step-btn" id="step" disabled>下一根 <kbd>→</kbd></button><select id="speed" aria-label="播放速度"><option value="1500">1×</option><option value="750">2×</option><option value="300">5×</option></select></div>
+          <span class="shortcut">空格 播放 / 暂停</span>
+        </div>
+        <div class="progress-track"><div id="progress-bar"></div></div>
+      </section>
+      <aside class="order-panel">
+        <div class="panel-heading"><h2>模拟下单</h2><span class="small-tag">1× 仓位</span></div>
+        <div class="available"><span>模拟账户余额</span><strong id="balance">10,000.00 <small>USDT</small></strong></div>
+        <form id="order-form">
+          <label class="field-label range-caption" for="size-range"><span>仓位比例</span><strong id="size-readout">10% · 999.60 USDT</strong></label>
+          <input id="size-range" type="range" min="0" max="100" step="0.1" value="10" aria-label="仓位比例">
+          <div class="size-presets"><button type="button" data-size="10">10%</button><button type="button" data-size="25">25%</button><button type="button" data-size="50">50%</button><button type="button" data-size="95">95%</button></div>
+          <div class="order-type-toggle" role="group" aria-label="成交方式"><button id="market-type" type="button" class="active">市价</button><button id="limit-type" type="button">限价</button></div>
+          <input id="notional" type="hidden" value="999.60">
+          <div class="risk-line"><span>价差估算（未计成本） · 盈亏比</span><span id="risk-preview">—</span></div>
+          <div class="trade-buttons"><button type="button" id="long" class="buy" aria-pressed="false" disabled>↗ 买入 / 做多</button><button type="button" id="short" class="sell" aria-pressed="false" disabled>↘ 卖出 / 做空</button></div>
+          <div id="plan-actions" hidden><p id="plan-hint" class="order-hint">市价单按当前回放收盘价立即成交；限价按指定价或更优成交，否则挂起等待。</p><button type="button" id="confirm-plan" class="primary full" disabled>确认市价做多</button><button type="button" id="locate-plan" class="quiet full" hidden>定位计划价格</button><button type="button" id="cancel-plan" class="quiet full">取消计划</button></div>
+          <p class="order-hint" id="order-hint">点击图上的「＋止损」「＋止盈」并向合法一侧拖出；拖动线可调整，点×移除</p>
+        </form>
+        <div class="position-heading"><h3>当前持仓</h3><span id="position-badge">空仓</span></div>
+        <div id="position" class="position-empty"><span class="empty-cross">＋</span><p>等待你的判断</p><span>止损、止盈可按需分别添加</span></div>
+        <div class="fee-note">单边费率 0.04% · 滑点 0.02%<br>模拟双向交易，不计资金费与杠杆强平</div>
+      </aside>
+      </div>
+    <section class="journal">
+      <div class="journal-heading"><div class="tabs"><button id="positions-tab" class="selected">持仓 <span id="position-count">0</span></button><button id="orders-tab">订单 <span id="order-count">0</span></button><button id="current-tab">成交历史 <span id="journal-count">0</span></button><button id="history-tab">往期练习 <span id="history-count">0</span></button></div><span id="source-label">Binance 历史行情 · UTC</span></div>
+      <div id="journal-content"></div>
+      <label class="note-field">本轮笔记<textarea id="notes" rows="2" placeholder="入场依据是什么？这笔交易哪里值得下次再看？"></textarea></label>
+    </section>
+    <footer><span>练习记录仅保存在当前浏览器，可导出备份。</span><span><a href="https://www.tradingview.com/" target="_blank" rel="noreferrer">TradingView Lightweight Charts™</a> · <button class="text-link" id="source-details">数据与成交规则</button></span></footer>
+  </main>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <dialog id="info-dialog"><div class="dialog-head"><h2>你的第一轮练习</h2><button class="icon-btn" data-close="info-dialog" aria-label="关闭">×</button></div>
+    <ol class="guide"><li><strong>随机一段行情</strong><p>开始时展示此前走势，未来K线不会出现在图表里。默认隐藏真实日期，减少记忆干扰。</p></li><li><strong>选方向与订单类型</strong><p>设置仓位比例；市价单按当前回放收盘价立即成交，限价单在图上选入场价，按指定价或更优价成交，否则挂起等待。止损和止盈可各自拖动图上的「＋止损」「＋止盈」标记添加，已设置的保护线可拖动或点×移除。</p></li><li><strong>管理订单并复盘</strong><p>已设置的止损或止盈触发后自动平仓；限价单成交前可撤销。每轮覆盖180天行情，换一轮时会平仓、撤销未成交订单并归档笔记和记录。</p></li></ol>
+    <details><summary>行情来源和成交规则</summary><p>内置 BTC/USDT、ETH/USDT 的 Binance 现货历史行情（2022-01-01 至 2025-12-31 UTC），基础颗粒度15分钟，较大周期仅合并已回放数据；未走完的K线随回放更新。官方归档在 2023-03-24 12:45 至 13:45 UTC 缺少5根K线，保留缺口，不补造数据；跨缺口按下一根真实K线继续。</p><p>市价单在当前回放收盘价模拟成交；限价按指定价或更优价格成交，否则等待后续真实K线触价。止损和止盈保护可分别启用或关闭，只有已设置的保护线会触发退出。成交模型为1倍名义仓位的双向模拟，并非真实合约撮合。不包含资金费、盘口深度及杠杆强平。单边手续费0.04%，成交价加不利滑点0.02%。</p><p>已启用的止盈止损逐根15分钟检查；若同根同时碰到两条线，按先止损计算。跳空穿过价位按开盘价成交，再计滑点。自动平仓会停在触发的15分钟K线。</p><p>“隐藏日期”只是练习界面遮挡，数据文件仍保留完整历史，并不是防作弊考试系统。时间显示采用UTC。</p><p><a href="https://github.com/binance/binance-public-data" target="_blank" rel="noreferrer">Binance 官方历史数据说明 ↗</a></p><p class="license">TradingView Lightweight Charts™<br>Copyright (c) 2025 TradingView, Inc. https://www.tradingview.com/<br><a href="./vendor/NOTICE" target="_blank">版权声明</a> · <a href="./vendor/LICENSE" target="_blank">Apache 2.0 许可证</a></p></details>
+    <button class="primary full" data-close="info-dialog">开始练习</button>
+  </dialog>
+  <dialog id="new-dialog"><div class="dialog-head"><h2>开始新一轮练习</h2><button class="icon-btn" data-close="new-dialog" aria-label="关闭">×</button></div><p>未成交限价单会撤销；当前持仓按最新已回放价格平仓。本轮成交、订单和笔记将归档，新一轮模拟资金为 10,000 USDT。</p><div class="dialog-actions"><button class="quiet" data-close="new-dialog">继续本轮</button><button class="primary" id="confirm-new">归档并开始</button></div></dialog>
+  <noscript>请开启浏览器 JavaScript 以使用K线回放。</noscript>
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>

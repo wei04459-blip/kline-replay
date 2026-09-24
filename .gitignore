@@ -1,0 +1,9 @@
+.DS_Store
+.sites-runtime/
+*.tar.gz
+*.log
+.cache/
+.openai/
+build/
+__pycache__/
+交付压缩包计划.md

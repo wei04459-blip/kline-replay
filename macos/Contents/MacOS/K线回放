@@ -1,0 +1,82 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_ID="com.yuwan.local.kline-replay"
+CONTENTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
+DIST_DIR="$RESOURCES_DIR/dist"
+KLINE_PORT=8765
+KLINE_URL="http://127.0.0.1:${KLINE_PORT}/"
+KLINE_PID_FILE="/tmp/${APP_ID}-$(id -u)-${KLINE_PORT}.pid"
+
+show_error() {
+  /usr/bin/osascript -e "display alert \"K线回放\" message \"$1\" as critical" >/dev/null 2>&1 || true
+}
+
+if [ ! -s "$DIST_DIR/index.html" ]; then
+  show_error "应用数据尚未安装完整，请稍后再试。"
+  exit 1
+fi
+
+# Reuse a listener only when its response carries this app's stable identity.
+if /usr/bin/python3 - "$KLINE_URL" "$APP_ID" <<'PY'
+import sys
+from urllib.request import urlopen
+try:
+    with urlopen(sys.argv[1], timeout=2) as response:
+        sys.exit(0 if response.headers.get("X-Kline-Replay-App") == sys.argv[2] else 1)
+except Exception:
+    sys.exit(1)
+PY
+then
+  /usr/bin/open "$KLINE_URL"
+  exit 0
+fi
+
+if /usr/sbin/lsof -nP -iTCP:"$KLINE_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  show_error "127.0.0.1:${KLINE_PORT} 已被其他服务占用，未结束或覆盖该服务。请先关闭占用服务后重试。"
+  exit 1
+fi
+
+nohup /usr/bin/python3 "$RESOURCES_DIR/serve.py" --bind 127.0.0.1 --port "$KLINE_PORT" --directory "$DIST_DIR" \
+  >/tmp/kline-replay-local-server.log 2>&1 </dev/null &
+KLINE_SERVER_PID=$!
+printf '%s\n' "$KLINE_SERVER_PID" >"$KLINE_PID_FILE"
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if /usr/bin/python3 - "$KLINE_URL" "$APP_ID" <<'PY'
+import sys
+from urllib.request import urlopen
+try:
+    with urlopen(sys.argv[1], timeout=1) as response:
+        sys.exit(0 if response.headers.get("X-Kline-Replay-App") == sys.argv[2] else 1)
+except Exception:
+    sys.exit(1)
+PY
+  then
+    /usr/bin/open "$KLINE_URL"
+    exit 0
+  fi
+  sleep 1
+done
+
+# On startup failure, stop only the exact process this launcher just started.
+/usr/bin/python3 - "$KLINE_SERVER_PID" "$RESOURCES_DIR/serve.py" "$KLINE_PORT" "$DIST_DIR" "$KLINE_PID_FILE" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+pid, script, port, directory, pid_file = int(sys.argv[1]), *sys.argv[2:]
+result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
+command = result.stdout.strip()
+expected = f"{script} --bind 127.0.0.1 --port {port} --directory {directory}"
+if command.endswith(expected):
+    os.kill(pid, signal.SIGTERM)
+try:
+    os.unlink(pid_file)
+except FileNotFoundError:
+    pass
+PY
+show_error "本地服务启动失败。请检查 /tmp/kline-replay-local-server.log。"
+exit 1
