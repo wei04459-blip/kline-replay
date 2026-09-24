@@ -6,7 +6,7 @@ CONTENTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 DIST_DIR="$RESOURCES_DIR/dist"
 KLINE_PORT=8765
-KLINE_URL="http://127.0.0.1:${KLINE_PORT}/"
+KLINE_URL="http://127.0.0.1:${KLINE_PORT}/?launch=$(/bin/date +%s)-$$"
 KLINE_PID_FILE="/tmp/${APP_ID}-$(id -u)-${KLINE_PORT}.pid"
 
 show_error() {
