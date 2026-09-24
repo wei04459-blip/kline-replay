@@ -2,12 +2,56 @@ export const INITIAL = 10000;
 export const FEE = 0.0004;
 export const SLIP = 0.0002;
 export const BASE = 900;
+export const DEFAULT_LEVERAGE = 1;
+export const MAX_LEVERAGE = 100;
+export const MAINTENANCE_MARGIN_RATE = 0.005;
+export const ISOLATED_MARGIN_MODE = 'isolated-v1';
 export const WARMUP = 365 * 24 * 60 * 60;
 export const LENGTH = 180 * 24 * 60 * 60;
 export const CONTEXT = WARMUP;
 const WEEK = 7 * 24 * 60 * 60;
 const MONDAY_OFFSET = 4 * 24 * 60 * 60; // 1970-01-05 00:00 UTC; Unix epoch was Thursday.
 const VALID_TFS = new Set([900, 1800, 2700, 3600, 14400, 86400, WEEK]);
+
+function validLeverage(value) {
+  return Number.isInteger(value) && value >= DEFAULT_LEVERAGE && value <= MAX_LEVERAGE;
+}
+
+function marginFor(notional, leverage) {
+  return notional / leverage;
+}
+
+export function maxNotional(balance, percent, leverage = DEFAULT_LEVERAGE) {
+  if (!Number.isFinite(balance) || balance < 0 || !Number.isFinite(percent) || percent < 0 || percent > 100 || !validLeverage(leverage))
+    throw new Error('可用余额、仓位比例或杠杆倍数无效');
+  const budget = balance * percent / 100;
+  let amount = Math.floor((budget / (1 / leverage + FEE)) * 100 + 1e-9) / 100;
+  while (amount > 0 && amount / leverage + amount * FEE > budget + 1e-9) amount = Math.floor((amount - 0.01) * 100 + 1e-9) / 100;
+  return Math.max(0, amount);
+}
+
+export function positionLiquidationPrice(position) {
+  if (position?.marginMode !== ISOLATED_MARGIN_MODE || ![1, -1].includes(position.side) ||
+      ![position.entry, position.qty, position.margin].every(Number.isFinite) ||
+      position.entry <= 0 || position.qty <= 0 || position.margin <= 0) return null;
+  const denominator = position.qty * (position.side === 1
+    ? 1 - MAINTENANCE_MARGIN_RATE - FEE
+    : 1 + MAINTENANCE_MARGIN_RATE + FEE);
+  const notionalAtEntry = position.qty * position.entry;
+  const numerator = position.side === 1
+    ? notionalAtEntry - position.margin
+    : notionalAtEntry + position.margin;
+  if (position.side === 1 && numerator <= 1e-10 * Math.max(notionalAtEntry, position.margin)) return null;
+  const price = numerator / denominator;
+  return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+function withMargin(notional, leverage, entryPrice, side) {
+  const positionLike = {side, entry: entryPrice, qty: notional / entryPrice,
+    notional, margin: marginFor(notional, leverage), leverage, marginMode: ISOLATED_MARGIN_MODE};
+  return {marginMode: ISOLATED_MARGIN_MODE, leverage, margin: positionLike.margin,
+    liquidationPrice: positionLiquidationPrice(positionLike)};
+}
 
 function candleAt(data, index) {
   if (!Array.isArray(data) || !Number.isInteger(index) || index < 0 || index >= data.length) return null;
@@ -105,6 +149,39 @@ function storedPercent(value) {
   return value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
 }
 
+function near(a, b, tolerance = 1e-8) {
+  return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= tolerance * Math.max(1, Math.abs(a), Math.abs(b));
+}
+
+function marginRecordValid(record, entryPrice, {trade = false} = {}) {
+  if (record?.marginMode === undefined)
+    return record?.leverage === undefined && record?.margin === undefined && record?.liquidationPrice === undefined &&
+      (!trade || record?.isolatedAdjustment === undefined);
+  if (record.marginMode !== ISOLATED_MARGIN_MODE || !validLeverage(record.leverage) ||
+      !Number.isFinite(record.margin) || record.margin <= 0 || !Number.isFinite(record.notional) || record.notional <= 0 ||
+      !near(record.margin, marginFor(record.notional, record.leverage)) || !optionalPriceOrNull(record.liquidationPrice)) return false;
+  const expected = positionLiquidationPrice({side: record.side, entry: entryPrice, qty: record.qty ?? record.notional / entryPrice,
+    margin: record.margin, marginMode: record.marginMode});
+  if (!near(record.qty ?? record.notional / entryPrice, record.notional / entryPrice) ||
+      (record.entryFee !== undefined && (!Number.isFinite(record.entryFee) || !near(record.entryFee, record.notional * FEE)))) return false;
+  if (expected === null ? record.liquidationPrice !== null : !near(record.liquidationPrice, expected)) return false;
+  if (trade) {
+    if (!Number.isFinite(record.entryFee) || !Number.isFinite(record.exit) || !Number.isFinite(record.fees) ||
+        !Number.isFinite(record.isolatedAdjustment) || record.isolatedAdjustment < 0) return false;
+    const exitFee = record.exit * record.qty * FEE;
+    const gross = (record.exit - record.entry) * record.qty * record.side;
+    const expectedAdjustment = Math.max(0, -record.margin - (gross - exitFee));
+    if (!near(record.entryFee, record.notional * FEE) || !near(record.fees, record.entryFee + exitFee) ||
+        !near(record.isolatedAdjustment, expectedAdjustment) ||
+        !near(record.pnl, gross - record.entryFee - exitFee + expectedAdjustment)) return false;
+  }
+  return true;
+}
+
+function optionalPriceOrNull(value) {
+  return value === null || (Number.isFinite(value) && value > 0);
+}
+
 function normalizeEntryReason(value) {
   if (typeof value !== 'string') throw new Error('下单理由必须是非空文本，最多2000字');
   const trimmed = value.trim();
@@ -151,8 +228,10 @@ export function validateSession(session, symbol, data) {
       pending.placedIndex < session.start || pending.placedIndex > visibleIndex || typeof pending.id !== 'string' ||
       (pending.placedTime !== undefined && (!timeMatchesIndex(pending.placedTime, pending.placedIndex, data) || pending.placedTime > replayTime(session, data))) ||
       (pending.modifiedTime !== undefined && (!timeMatchesIndex(pending.modifiedTime, pending.modifiedIndex, data) || pending.modifiedTime > replayTime(session, data))) ||
-      !optionalSavedEntryReason(pending.entryReason) ||
-      pending.notional * (1 + FEE) > session.balance + 1e-8 ||
+      !optionalSavedEntryReason(pending.entryReason) || !marginRecordValid(pending, pending.entryPrice) ||
+      (pending.marginMode === ISOLATED_MARGIN_MODE
+        ? pending.margin + pending.notional * FEE > session.balance + 1e-8
+        : pending.notional * (1 + FEE) > session.balance + 1e-8) ||
       !protectionsBracket(pending.side, pending.entryPrice, pending.stop, pending.take))) return false;
   if (session.position !== null && session.position !== undefined) {
     const p = session.position;
@@ -160,11 +239,12 @@ export function validateSession(session, symbol, data) {
         !optionalPrice(p.stop) || !optionalPrice(p.take) || !storedPercent(p.stopPct) || !storedPercent(p.takePct) ||
         !optionalSavedEntryReason(p.entryReason) || p.entry <= 0 || p.qty <= 0 || p.notional <= 0 || p.entryFee < 0 ||
         !Number.isInteger(p.entryIndex) || p.entryIndex < session.start || p.entryIndex > visibleIndex || p.entryIndex > session.end || !candleAt(data, p.entryIndex) ||
-        (p.entryTime !== undefined && (!timeMatchesIndex(p.entryTime, p.entryIndex, data) || p.entryTime > replayTime(session, data)))) return false;
+        (p.entryTime !== undefined && (!timeMatchesIndex(p.entryTime, p.entryIndex, data) || p.entryTime > replayTime(session, data))) ||
+        !marginRecordValid(p, p.entry) || (p.marginMode === ISOLATED_MARGIN_MODE && p.margin > session.balance + 1e-8)) return false;
   }
   if (session.orderHistory !== undefined && (!Array.isArray(session.orderHistory) || !session.orderHistory.every(o => o &&
       ['filled', 'cancelled'].includes(o.status) && ['limit', 'market'].includes(o.type) && typeof o.id === 'string' && [o.side, o.notional, o.entryPrice].every(Number.isFinite) &&
-      optionalSavedEntryReason(o.entryReason) &&
+      optionalSavedEntryReason(o.entryReason) && marginRecordValid(o, o.status === 'filled' ? o.fillPrice : o.entryPrice) &&
       (o.placedTime === undefined || timeMatchesIndex(o.placedTime, o.placedIndex, data) && o.placedTime <= replayTime(session, data)) &&
       (o.fillTime === undefined || timeMatchesIndex(o.fillTime, o.fillIndex, data) && o.fillTime <= replayTime(session, data)) &&
       (o.modifiedTime === undefined || Number.isInteger(o.modifiedIndex) && timeMatchesIndex(o.modifiedTime, o.modifiedIndex, data) && o.modifiedTime <= replayTime(session, data)) &&
@@ -177,7 +257,7 @@ export function validateSession(session, symbol, data) {
     (t.exitTime === undefined || timeMatchesIndex(t.exitTime, t.exitIndex, data) && t.exitTime <= replayTime(session, data)) &&
     t.entry > 0 && t.exit > 0 && t.qty > 0 && Number.isInteger(t.entryIndex) && Number.isInteger(t.exitIndex) &&
     t.entryIndex >= session.start && t.entryIndex <= t.exitIndex && t.exitIndex <= visibleIndex &&
-    !!candleAt(data, t.entryIndex) && !!candleAt(data, t.exitIndex));
+    !!candleAt(data, t.entryIndex) && !!candleAt(data, t.exitIndex) && marginRecordValid(t, t.entry, {trade: true}));
 }
 
 export function createSession(symbol, data, random = Math.random) {
@@ -297,8 +377,8 @@ export function advanceMinute(session, minuteBar, data) {
     if (fillPrice !== null) {
       next.pending = null;
       positionAtPrice(next, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, eventIndex,
-        pending.id, pending.entryReason, eventTime);
-      orderFilled = recordFilledOrder(next, pending, eventIndex, fillPrice, eventTime);
+        pending.id, pending.entryReason, eventTime, pending.leverage ?? DEFAULT_LEVERAGE, pending.marginMode);
+      orderFilled = recordFilledOrder(next, pending, eventIndex, fillPrice, eventTime, next.position);
       entryBar = true;
     }
   }
@@ -316,7 +396,7 @@ export function advanceMinute(session, minuteBar, data) {
     trade, orderFilled, orderCancelled};
 }
 
-export function openPosition(s, data, side, notional, stopPct, takePct, entryReason = '') {
+export function openPosition(s, data, side, notional, stopPct, takePct, entryReason = '', leverage = DEFAULT_LEVERAGE) {
   const normalizedReason = normalizeEntryReason(entryReason);
   if (!validIndexTriplet(s, data)) throw new Error('本轮行情范围无效');
   assertCandle(data, s.cursor);
@@ -324,13 +404,13 @@ export function openPosition(s, data, side, notional, stopPct, takePct, entryRea
   if (s.position || s.pending) throw new Error('请先处理当前仓位或挂单');
   if (s.cursor >= s.end) throw new Error('本轮已结束，请开启新一轮');
   if (![1, -1].includes(side)) throw new Error('下单方向无效');
-  if (!Number.isFinite(notional) || notional <= 0 || !optionalPercent(stopPct) || !optionalPercent(takePct))
+  if (!Number.isFinite(notional) || notional <= 0 || !optionalPercent(stopPct) || !optionalPercent(takePct) || !validLeverage(leverage))
     throw new Error('请输入有效金额和止盈止损距离（0到50%）；关闭保护请传null');
-  if (!Number.isFinite(s.balance) || s.balance < 0 || notional * (1 + FEE) > s.balance) throw new Error('下单金额加手续费不能超过可用余额');
+  if (!Number.isFinite(s.balance) || s.balance < 0 || marginFor(notional, leverage) + notional * FEE > s.balance + 1e-8) throw new Error('保证金加开仓手续费不能超过可用余额');
   const c = assertCandle(data, s.cursor), currentPrice = replayPrice(s, data), entry = currentPrice * (1 + side * SLIP);
   const entryFee = notional * FEE;
   const entryIndex = visibleUpperIndex(s, data);
-  s.position = {side, entry, qty: notional / entry, notional, entryFee, entryIndex,
+  s.position = {side, entry, qty: notional / entry, notional, entryFee, entryIndex, ...withMargin(notional, leverage, entry, side),
     stop: stopPct === null ? null : entry * (1 - side * stopPct / 100),
     take: takePct === null ? null : entry * (1 + side * takePct / 100), stopPct, takePct, entryReason: normalizedReason,
     entryTime: replayTime(s, data)};
@@ -338,18 +418,20 @@ export function openPosition(s, data, side, notional, stopPct, takePct, entryRea
   return s.position;
 }
 
-function validateOrderPlan(s, side, notional, entryPrice, stopPrice, takePrice) {
+function validateOrderPlan(s, side, notional, entryPrice, stopPrice, takePrice, leverage = DEFAULT_LEVERAGE, marginMode = ISOLATED_MARGIN_MODE) {
   if (![1, -1].includes(side)) throw new Error('下单方向无效');
-  if (![notional, entryPrice].every(Number.isFinite) || !optionalPrice(stopPrice) || !optionalPrice(takePrice) || notional <= 0 || entryPrice <= 0)
+  if (![notional, entryPrice].every(Number.isFinite) || !optionalPrice(stopPrice) || !optionalPrice(takePrice) || notional <= 0 || entryPrice <= 0 || !validLeverage(leverage))
     throw new Error('请输入有效金额和价格');
   if (!protectionsBracket(side, entryPrice, stopPrice, takePrice)) throw new Error('已启用的止损和止盈必须位于计划入场价正确一侧');
-  if (!Number.isFinite(s.balance) || s.balance < 0 || notional * (1 + FEE) > s.balance + 1e-8)
-    throw new Error('下单金额加手续费不能超过可用余额');
+  const required = marginMode === ISOLATED_MARGIN_MODE ? marginFor(notional, leverage) + notional * FEE : notional * (1 + FEE);
+  if (!Number.isFinite(s.balance) || s.balance < 0 || required > s.balance + 1e-8)
+    throw new Error('保证金加开仓手续费不能超过可用余额');
 }
 
-function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, index, orderId = null, entryReason = undefined, entryTime = undefined) {
+function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, index, orderId = null, entryReason = undefined, entryTime = undefined, leverage = DEFAULT_LEVERAGE, marginMode = null) {
   const entryFee = notional * FEE;
   const position = {side, entry: fillPrice, qty: notional / fillPrice, notional, entryFee, entryIndex: index,
+    ...(marginMode === ISOLATED_MARGIN_MODE ? withMargin(notional, leverage, fillPrice, side) : {}),
     stop: stopPrice, take: takePrice,
     stopPct: stopPrice === null ? null : Math.abs((fillPrice - stopPrice) / fillPrice * 100),
     takePct: takePrice === null ? null : Math.abs((takePrice - fillPrice) / fillPrice * 100), orderId,
@@ -360,8 +442,9 @@ function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePric
   return position;
 }
 
-function recordFilledOrder(s, order, fillIndex, fillPrice, fillTime = undefined) {
-  const record = {...order, status: 'filled', fillIndex, fillPrice, ...(fillTime === undefined ? {} : {fillTime})};
+function recordFilledOrder(s, order, fillIndex, fillPrice, fillTime = undefined, position = null) {
+  const record = {...order, ...(position?.marginMode === ISOLATED_MARGIN_MODE ? {marginMode: position.marginMode, leverage: position.leverage,
+    margin: position.margin, liquidationPrice: position.liquidationPrice} : {}), status: 'filled', fillIndex, fillPrice, ...(fillTime === undefined ? {} : {fillTime})};
   s.orderHistory ??= [];
   s.orderHistory.push(record);
   return record;
@@ -369,7 +452,7 @@ function recordFilledOrder(s, order, fillIndex, fillPrice, fillTime = undefined)
 
 // Market orders fill at the already disclosed close. Limit orders stay pending
 // until a future observed 15m candle touches their price.
-export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takePrice, orderType = 'market', entryReason = '') {
+export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takePrice, orderType = 'market', entryReason = '', leverage = DEFAULT_LEVERAGE) {
   const normalizedReason = normalizeEntryReason(entryReason);
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
   if (s.position || s.pending) throw new Error('请先处理当前仓位或挂单');
@@ -377,9 +460,10 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
   if (!['market', 'limit'].includes(orderType)) throw new Error('订单类型无效');
   const currentPrice = replayPrice(s, data), eventIndex = visibleUpperIndex(s, data), eventTime = replayTime(s, data);
   const planPrice = orderType === 'market' ? currentPrice : entryPrice;
-  validateOrderPlan(s, side, notional, planPrice, stopPrice, takePrice);
+  validateOrderPlan(s, side, notional, planPrice, stopPrice, takePrice, leverage);
   const order = {id: crypto.randomUUID(), side, notional, entryPrice: planPrice, stop: stopPrice, take: takePrice,
-    type: orderType, placedIndex: eventIndex, placedTime: eventTime, entryReason: normalizedReason};
+    type: orderType, placedIndex: eventIndex, placedTime: eventTime, entryReason: normalizedReason,
+    ...withMargin(notional, leverage, planPrice, side)};
   const marketableLimit = orderType === 'limit' && (side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice);
   if (orderType === 'market' || marketableLimit) {
     const slippedMarket = currentPrice * (1 + side * SLIP);
@@ -387,8 +471,8 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
       side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
     // Immediate fills must leave both protections on the correct side of fill.
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
-    const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, eventIndex, order.id, normalizedReason, eventTime);
-    const filled = recordFilledOrder(s, order, eventIndex, fillPrice, eventTime);
+    const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, eventIndex, order.id, normalizedReason, eventTime, leverage, ISOLATED_MARGIN_MODE);
+    const filled = recordFilledOrder(s, order, eventIndex, fillPrice, eventTime, position);
     return {status: 'filled', order: filled, position};
   }
   const pending = {...order};
@@ -411,17 +495,19 @@ export function cancelOrder(s, reason = '用户撤单') {
 export function updatePendingOrder(s, data, entryPrice, stopPrice, takePrice) {
   if (!validateSession(s, s?.symbol, data) || !s.pending) throw new Error('当前没有有效挂单');
   if (s.cursor >= s.end) throw new Error('本轮已结束，请开启新一轮');
-  validateOrderPlan(s, s.pending.side, s.pending.notional, entryPrice, stopPrice, takePrice);
+  validateOrderPlan(s, s.pending.side, s.pending.notional, entryPrice, stopPrice, takePrice, s.pending.leverage ?? DEFAULT_LEVERAGE, s.pending.marginMode);
   const currentPrice = replayPrice(s, data), side = s.pending.side, eventIndex = visibleUpperIndex(s, data), eventTime = replayTime(s, data);
-  const updated = {...s.pending, entryPrice, stop: stopPrice, take: takePrice, modifiedIndex: eventIndex, modifiedTime: eventTime};
+  const updated = {...s.pending, entryPrice, stop: stopPrice, take: takePrice,
+    ...(s.pending.marginMode === ISOLATED_MARGIN_MODE ? withMargin(s.pending.notional, s.pending.leverage, entryPrice, s.pending.side) : {}),
+    modifiedIndex: eventIndex, modifiedTime: eventTime};
   const marketable = side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice;
   if (marketable) {
     const slippedMarket = currentPrice * (1 + side * SLIP);
     const fillPrice = side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
     s.pending = null;
-    const position = positionAtPrice(s, data, side, updated.notional, fillPrice, stopPrice, takePrice, eventIndex, updated.id, updated.entryReason, eventTime);
-    const filled = recordFilledOrder(s, updated, eventIndex, fillPrice, eventTime);
+    const position = positionAtPrice(s, data, side, updated.notional, fillPrice, stopPrice, takePrice, eventIndex, updated.id, updated.entryReason, eventTime, updated.leverage ?? DEFAULT_LEVERAGE, updated.marginMode);
+    const filled = recordFilledOrder(s, updated, eventIndex, fillPrice, eventTime, position);
     return {status: 'filled', order: filled, position};
   }
   s.pending = updated;
@@ -504,11 +590,19 @@ function pendingFillPrice(order, candle) {
 function exitPositionOnBar(s, data, c, index, entryBar = false) {
   const p = s.position;
   if (!p) return null;
+  const liquidation = p.marginMode === ISOLATED_MARGIN_MODE ? p.liquidationPrice : null;
+  const gapLiquidation = Number.isFinite(liquidation) && (p.side === 1 ? c[1] <= liquidation : c[1] >= liquidation);
+  if (gapLiquidation) return closePosition(s, data, c[1], '强平', index);
   const gapStop = p.stop !== null && (p.side === 1 ? c[1] <= p.stop : c[1] >= p.stop);
   const hitStop = p.stop !== null && (p.side === 1 ? c[3] <= p.stop : c[2] >= p.stop);
   if (gapStop) return closePosition(s, data, c[1], '跳空止损', index);
   const gapTake = p.take !== null && (p.side === 1 ? c[1] >= p.take : c[1] <= p.take);
   if (!entryBar && gapTake) return closePosition(s, data, c[1], '跳空止盈', index);
+  const hitLiquidation = Number.isFinite(liquidation) && (p.side === 1 ? c[3] <= liquidation : c[2] >= liquidation);
+  if (hitLiquidation) {
+    const stopIsCloser = p.stop !== null && (p.side === 1 ? p.stop >= liquidation : p.stop <= liquidation);
+    if (!hitStop || !stopIsCloser) return closePosition(s, data, liquidation, '强平', index);
+  }
   if (hitStop) {
     const hitTake = p.take !== null && (p.side === 1 ? c[2] >= p.take : c[3] <= p.take);
     return closePosition(s, data, p.stop, hitTake ? '双触发，按止损' : entryBar ? '入场同根止损' : '止损', index);
@@ -530,12 +624,16 @@ export function closePosition(s, data, price, reason = '手动平仓', index = u
   const exit = price * (1 - p.side * SLIP);
   const exitFee = exit * p.qty * FEE;
   const gross = (exit - p.entry) * p.qty * p.side;
+  const isolatedAdjustment = p.marginMode === ISOLATED_MARGIN_MODE
+    ? Math.max(0, -p.margin - (gross - exitFee)) : 0;
+  const settlement = gross - exitFee + isolatedAdjustment;
   const legacyExitTime = c[0] + BASE;
   const trade = {...p, id: crypto.randomUUID(), exit, exitIndex: index,
     exitTime: Number.isInteger(s.minuteCursorTime) ? replayTime(s, data) : legacyExitTime,
     entryTime: p.entryTime ?? assertCandle(data, p.entryIndex)[0] + BASE,
-    pnl: gross - p.entryFee - exitFee, fees: p.entryFee + exitFee, reason};
-  s.balance += gross - exitFee;
+    pnl: settlement - p.entryFee, fees: p.entryFee + exitFee, reason,
+    ...(p.marginMode === ISOLATED_MARGIN_MODE ? {isolatedAdjustment} : {})};
+  s.balance += settlement;
   s.trades.push(trade);
   s.position = null;
   return trade;
@@ -565,8 +663,8 @@ export function advance(s, data) {
       if (fillPrice !== null) {
         s.pending = null;
         const fillTime = c[0] + BASE;
-        positionAtPrice(s, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, i, pending.id, pending.entryReason, fillTime);
-        orderFilled = recordFilledOrder(s, pending, i, fillPrice, fillTime);
+        positionAtPrice(s, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, i, pending.id, pending.entryReason, fillTime, pending.leverage ?? DEFAULT_LEVERAGE, pending.marginMode);
+        orderFilled = recordFilledOrder(s, pending, i, fillPrice, fillTime, s.position);
         entryBar = true;
       }
     }
@@ -588,5 +686,10 @@ export function metrics(s, data) {
   const equity = s.balance + unreal;
   const win = s.trades.filter(t => t.pnl > 0).length;
   const fees = s.trades.reduce((n, t) => n + t.fees, 0) + (p?.entryFee || 0) + (p ? estimatedExit * p.qty * FEE : 0);
-  return {unreal, equity, pnl: equity - INITIAL, winRate: s.trades.length ? win / s.trades.length * 100 : null, fees};
+  const usedMargin = p ? (p.marginMode === ISOLATED_MARGIN_MODE ? p.margin : p.notional) : 0;
+  const reservedMargin = s.pending ? (s.pending.marginMode === ISOLATED_MARGIN_MODE
+    ? s.pending.margin + s.pending.notional * FEE : s.pending.notional * (1 + FEE)) : 0;
+  return {unreal, equity, pnl: equity - INITIAL, winRate: s.trades.length ? win / s.trades.length * 100 : null, fees,
+    availableBalance: s.balance - usedMargin - reservedMargin, usedMargin, reservedMargin,
+    liquidationPrice: p?.marginMode === ISOLATED_MARGIN_MODE ? positionLiquidationPrice(p) : null};
 }

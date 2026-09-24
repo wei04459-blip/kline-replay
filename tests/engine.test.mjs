@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, FEE, INITIAL, intervalStart, LENGTH, metrics, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
 
 const TEST_ENTRY_REASON = '测试入场理由';
 function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
@@ -87,6 +87,8 @@ test('open short loss can leave negative cash without invalidating the saved res
   const data = bars(3);
   const s = session(data, {end: 2});
   openPosition(s, data, -1, 9990, 40, 40);
+  // Simulate a pre-leverage snapshot: legacy positions keep their original uncapped settlement.
+  for (const key of ['marginMode', 'leverage', 'margin', 'liquidationPrice']) delete s.position[key];
   s.cursor = 1;
   const trade = closePosition(s, data, 300, 'extreme gap', 1);
   assert.ok(s.balance < 0);
@@ -965,4 +967,243 @@ test('pending minute order is cancelled exactly once when the final 15m complete
   assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
   assert.equal(advanceMinute(s, null, data).ended, true);
   assert.equal(s.orderHistory.length, 1);
+});
+
+test('100 percent notional sizing reserves both margin and entry fee and never exceeds the wallet budget', () => {
+  for (const leverage of [1, 2, 10, 100]) {
+    const amount = maxNotional(INITIAL, 100, leverage);
+    assert.ok(amount / leverage + amount * FEE <= INITIAL);
+    assert.ok((amount + 0.01) / leverage + (amount + 0.01) * FEE > INITIAL);
+    const s = session(bars(3));
+    const result = enginePlaceOrder(s, bars(3), 1, amount, 100, null, null, 'market', TEST_ENTRY_REASON, leverage);
+    assert.equal(result.status, 'filled');
+    assert.ok(metrics(s, bars(3)).availableBalance >= -1e-8);
+    assert.ok(Math.abs(metrics(s, bars(3)).usedMargin - amount / leverage) < 1e-8);
+    assert.ok(Math.abs(s.balance - (INITIAL - amount * FEE)) < 1e-8); // Margin is locked, not debited twice.
+  }
+});
+
+test('leverage changes locked margin and liquidation risk, not nominal exposure PnL or fees', () => {
+  const data = bars(3);
+  const results = [];
+  for (const leverage of [2, 10]) {
+    const s = session(data);
+    enginePlaceOrder(s, data, 1, 1000, 100, null, null, 'market', TEST_ENTRY_REASON, leverage);
+    const p = s.position;
+    assert.equal(p.leverage, leverage);
+    assert.equal(p.marginMode, 'isolated-v1');
+    assert.ok(Math.abs(p.margin - 1000 / leverage) < 1e-10);
+    assert.ok(Math.abs(s.balance - (INITIAL - 1000 * FEE)) < 1e-10);
+    assert.equal(p.liquidationPrice, positionLiquidationPrice(p));
+    assert.ok(metrics(s, data).availableBalance >= 0);
+    s.cursor = 1;
+    results.push(closePosition(s, data, 110, 'test', 1));
+  }
+  assert.ok(Math.abs(results[0].pnl - results[1].pnl) < 1e-10);
+  assert.ok(Math.abs(results[0].fees - results[1].fees) < 1e-10);
+});
+
+test('leverage input is an integer from 1 to 100 and rejects atomically', () => {
+  for (const leverage of [0, 101, 1.5, NaN, '2']) {
+    const data = bars(3), s = session(data), before = structuredClone(s);
+    assert.throws(() => enginePlaceOrder(s, data, 1, 1000, 100, null, null, 'market', TEST_ENTRY_REASON, leverage));
+    assert.deepEqual(s, before);
+    assert.throws(() => engineOpenPosition(s, data, 1, 1000, null, null, TEST_ENTRY_REASON, leverage));
+    assert.deepEqual(s, before);
+  }
+  assert.equal(maxNotional(INITIAL, 100, MAX_LEVERAGE) > 0, true);
+});
+
+test('marketable limits fill at actual price but retain leverage and reprice preview liquidation', () => {
+  const data = bars(3), s = session(data);
+  const result = enginePlaceOrder(s, data, -1, 1200, 90, null, null, 'limit', TEST_ENTRY_REASON, 6);
+  assert.equal(result.status, 'filled');
+  assert.equal(result.position.leverage, 6);
+  assert.equal(result.order.leverage, 6);
+  assert.equal(result.order.liquidationPrice, positionLiquidationPrice(result.position));
+  assert.notEqual(result.order.liquidationPrice, positionLiquidationPrice({...result.position, entry: result.order.entryPrice}));
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+});
+
+test('pending orders reserve margin and fee, release on cancel, and transfer reservation on fill', () => {
+  const data = bars(4), s = session(data);
+  const before = s.balance;
+  placeOrder(s, data, 1, 2000, 90, null, null, 'limit');
+  s.pending.leverage = 5;
+  Object.assign(s.pending, {marginMode: 'isolated-v1', margin: 400,
+    liquidationPrice: positionLiquidationPrice({side: 1, entry: 90, qty: 2000 / 90, margin: 400, marginMode: 'isolated-v1'})});
+  assert.equal(metrics(s, data).reservedMargin, 400 + 2000 * FEE);
+  assert.equal(s.balance, before);
+  cancelOrder(s);
+  assert.equal(s.balance, before);
+  assert.equal(metrics(s, data).reservedMargin, 0);
+  assert.equal(metrics(s, data).availableBalance, before);
+
+  const f = session(data);
+  enginePlaceOrder(f, data, 1, 2000, 90, null, null, 'limit', TEST_ENTRY_REASON, 5);
+  const oldCash = f.balance;
+  const result = advanceMinute(f, [900, 90, 91, 88, 90, 2], data);
+  assert.equal(result.orderFilled.leverage, 5);
+  assert.equal(f.position.leverage, 5);
+  assert.equal(f.balance, oldCash - 2000 * FEE);
+  assert.equal(metrics(f, data).reservedMargin, 0);
+  assert.equal(metrics(f, data).usedMargin, 400);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(f)), 'BTCUSDT', data), true);
+});
+
+test('isolated liquidation uses estimated maintenance and close fee threshold and ignores float dust at 1x', () => {
+  const nonInteger = {side: 1, entry: 123.4567, qty: 321.987 / 123.4567, margin: 321.987, marginMode: 'isolated-v1'};
+  assert.equal(positionLiquidationPrice(nonInteger), null);
+  const long = {side: 1, entry: 123.4567, qty: 321.987 / 123.4567, margin: 321.987 / 4, marginMode: 'isolated-v1'};
+  const short = {...long, side: -1};
+  const expectedLong = (long.qty * long.entry - long.margin) / (long.qty * (1 - MAINTENANCE_MARGIN_RATE - FEE));
+  const expectedShort = (short.qty * short.entry + short.margin) / (short.qty * (1 + MAINTENANCE_MARGIN_RATE + FEE));
+  assert.ok(Math.abs(positionLiquidationPrice(long) - expectedLong) < 1e-10);
+  assert.ok(Math.abs(positionLiquidationPrice(short) - expectedShort) < 1e-10);
+  assert.equal(positionLiquidationPrice({side: 1, entry: 100, qty: 10, margin: 1000}), null); // Legacy has no inferred liquidation line.
+});
+
+test('isolated liquidation gap caps loss to margin without consuming unused wallet funds', () => {
+  const data = bars(3), s = session(data, {tf: 900});
+  enginePlaceOrder(s, data, -1, 1000, 100, null, null, 'market', TEST_ENTRY_REASON, 2);
+  const openingFee = s.position.entryFee, margin = s.position.margin;
+  const liq = s.position.liquidationPrice;
+  data[1] = [900, liq * 2, liq * 2.1, liq * 1.9, liq * 2, 5];
+  const result = advance(s, data);
+  const trade = result.trade;
+  assert.equal(trade.reason, '强平');
+  assert.ok(trade.isolatedAdjustment > 0);
+  assert.ok(Math.abs(s.balance - (INITIAL - margin - openingFee)) < 1e-7);
+  assert.ok(Math.abs(s.balance - (INITIAL + trade.pnl)) < 1e-7);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+});
+
+test('manual closing execution cannot charge an isolated loss beyond its margin', () => {
+  const data = bars(3), s = session(data);
+  enginePlaceOrder(s, data, 1, 2400, 100, null, null, 'market', TEST_ENTRY_REASON, 3);
+  const margin = s.position.margin, entryFee = s.position.entryFee, liq = s.position.liquidationPrice;
+  const trade = closePosition(s, data, liq / 2, '手动平仓', 0);
+  assert.equal(trade.reason, '手动平仓');
+  assert.ok(trade.isolatedAdjustment > 0);
+  assert.ok(Math.abs(trade.pnl + margin + entryFee) < 1e-7);
+  assert.ok(Math.abs(s.balance - (INITIAL - margin - entryFee)) < 1e-7);
+});
+
+test('intrabar stop versus liquidation takes the nearer threshold, and gap liquidation beats a distant stop', () => {
+  const data = bars(4);
+  const nearStop = session(data);
+  enginePlaceOrder(nearStop, data, 1, 1000, 100, 60, null, 'market', TEST_ENTRY_REASON, 2);
+  data[1] = [900, 100, 105, 45, 90, 1];
+  assert.equal(advance(nearStop, data).trade.reason, '止损');
+
+  const liqFirst = session(bars(4));
+  enginePlaceOrder(liqFirst, bars(4), 1, 1000, 100, 40, null, 'market', TEST_ENTRY_REASON, 2);
+  const liq = liqFirst.position.liquidationPrice;
+  const liqData = bars(4);
+  liqData[1] = [900, 100, 105, liq - 1, 90, 1];
+  const out = advance(liqFirst, liqData);
+  assert.equal(out.trade.reason, '强平');
+
+  const gap = session(bars(4));
+  enginePlaceOrder(gap, bars(4), 1, 1000, 100, 40, null, 'market', TEST_ENTRY_REASON, 2);
+  const gapData = bars(4);
+  gapData[1] = [900, gap.position.liquidationPrice - 10, gap.position.liquidationPrice, gap.position.liquidationPrice - 20, gap.position.liquidationPrice - 5, 1];
+  assert.equal(advance(gap, gapData).trade.reason, '强平');
+});
+
+test('legacy pending records stay uncapped through repricing and fill, including extreme short loss', () => {
+  const data = bars(4), s = session(data);
+  placeOrder(s, data, -1, 9990, 110, null, null, 'limit');
+  for (const key of ['marginMode', 'leverage', 'margin', 'liquidationPrice']) delete s.pending[key];
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+  updatePendingOrder(s, data, 105, null, null);
+  assert.equal(Object.hasOwn(s.pending, 'marginMode'), false);
+  data[1] = [900, 105, 106, 104, 105, 1];
+  const result = advance(s, data);
+  assert.equal(result.orderFilled.status, 'filled');
+  assert.equal(Object.hasOwn(s.position, 'marginMode'), false);
+  assert.equal(Object.hasOwn(result.orderFilled, 'marginMode'), false);
+  data[2] = [1800, 400, 410, 390, 400, 1];
+  s.end = 2;
+  s.cursor = 1;
+  const trade = advance(s, data).trade;
+  assert.equal(trade.reason, '本轮结束');
+  assert.ok(s.balance < 0);
+  assert.equal(Object.hasOwn(trade, 'isolatedAdjustment'), false);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+});
+
+test('saved isolated positions and minute recovery retain leverage and liquidation accounting', () => {
+  const data = bars(4), s = session(data);
+  enginePlaceOrder(s, data, -1, 1500, 100, null, null, 'market', TEST_ENTRY_REASON, 3);
+  const restored = JSON.parse(JSON.stringify(s));
+  assert.equal(validateSession(restored, 'BTCUSDT', data), true);
+  const result = advanceMinute(restored, [900, 100, 102, 99, 101, 1], data);
+  assert.equal(result.trade, null);
+  assert.equal(restored.position.leverage, 3);
+  assert.equal(restored.position.margin, 500);
+  assert.equal(restored.trades.length, 0);
+});
+
+test('protection edits preserve isolated accounting and mirror only the linked filled order', () => {
+  const data = bars(3), s = session(data);
+  const {position, order} = enginePlaceOrder(s, data, 1, 1600, 100, null, null, 'market', TEST_ENTRY_REASON, 4);
+  const margin = position.margin, liquidationPrice = position.liquidationPrice;
+  updateProtection(s, data, 90, null);
+  assert.equal(s.orderHistory[0].id, order.id);
+  assert.equal(s.orderHistory[0].stop, 90);
+  assert.equal(s.orderHistory[0].take, null);
+  assert.equal(s.orderHistory[0].margin, margin);
+  assert.equal(s.orderHistory[0].liquidationPrice, liquidationPrice);
+  assert.equal(position.margin, margin);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+});
+
+test('saved isolated accounting rejects altered leverage, margin, quantity, fee, or liquidation estimate', () => {
+  const data = bars(3), s = session(data);
+  enginePlaceOrder(s, data, -1, 1800, 100, null, null, 'market', TEST_ENTRY_REASON, 3);
+  for (const [key, value] of [['leverage', 1.5], ['margin', 1], ['qty', s.position.qty + 1], ['entryFee', 99], ['liquidationPrice', 1]]) {
+    const corrupt = structuredClone(s);
+    corrupt.position[key] = value;
+    assert.equal(validateSession(corrupt, 'BTCUSDT', data), false, `must reject ${key}`);
+  }
+});
+
+test('saved isolated trade validator recomputes entry fee, exit fee, and exact margin adjustment', () => {
+  const data = bars(3), s = session(data);
+  enginePlaceOrder(s, data, 1, 1500, 100, null, null, 'market', TEST_ENTRY_REASON, 2);
+  const p = s.position;
+  closePosition(s, data, p.liquidationPrice / 2, '测试极端成交', 0);
+  const saved = JSON.parse(JSON.stringify(s));
+  const t = saved.trades[0];
+  assert.ok(t.isolatedAdjustment > 0);
+  assert.equal(validateSession(saved, 'BTCUSDT', data), true);
+
+  const adjustmentTamper = structuredClone(saved);
+  adjustmentTamper.trades[0].isolatedAdjustment += 100;
+  adjustmentTamper.trades[0].pnl += 100;
+  assert.equal(validateSession(adjustmentTamper, 'BTCUSDT', data), false);
+
+  const missingEntryFee = structuredClone(saved);
+  delete missingEntryFee.trades[0].entryFee;
+  assert.equal(validateSession(missingEntryFee, 'BTCUSDT', data), false);
+
+  const feeTamper = structuredClone(saved);
+  feeTamper.trades[0].fees = 0;
+  feeTamper.trades[0].pnl = (feeTamper.trades[0].exit - feeTamper.trades[0].entry) * feeTamper.trades[0].qty * feeTamper.trades[0].side + feeTamper.trades[0].isolatedAdjustment;
+  assert.equal(validateSession(feeTamper, 'BTCUSDT', data), false);
+});
+
+test('short intrabar liquidation caps isolated loss, while minute liquidation is timestamped and recoverable', () => {
+  const data = bars(4), s = session(data, {tf: 900});
+  enginePlaceOrder(s, data, -1, 1000, 100, null, null, 'market', TEST_ENTRY_REASON, 2);
+  const entryFee = s.position.entryFee, margin = s.position.margin, liq = s.position.liquidationPrice;
+  const saved = JSON.parse(JSON.stringify(s));
+  const minuteData = bars(4);
+  const event = advanceMinute(saved, [900, liq + 10, liq + 15, liq + 5, liq + 12, 3], minuteData);
+  assert.equal(event.trade.reason, '强平');
+  assert.equal(event.trade.exitTime, 960);
+  assert.ok(event.trade.isolatedAdjustment > 0);
+  assert.ok(Math.abs(saved.balance - (INITIAL - margin - entryFee)) < 1e-7);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(saved)), 'BTCUSDT', minuteData), true);
 });

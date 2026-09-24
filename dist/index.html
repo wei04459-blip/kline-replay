@@ -40,14 +40,23 @@
         <div class="minute-note">真实分钟回放 · 当前K线随每分钟行情逐步形成</div>
       </section>
       <aside class="order-panel">
-        <div class="panel-heading"><h2>模拟下单</h2><span class="small-tag">1× 仓位</span></div>
+        <div class="panel-heading"><h2>模拟下单</h2><span class="small-tag" id="leverage-badge">1× 逐仓模拟</span></div>
         <div class="available"><span>模拟账户余额</span><strong id="balance">10,000.00 <small>USDT</small></strong></div>
         <form id="order-form">
-          <label class="field-label range-caption" for="size-range"><span>仓位比例</span><strong id="size-readout">10% · 999.60 USDT</strong></label>
-          <input id="size-range" type="range" min="0" max="100" step="0.1" value="10" aria-label="仓位比例">
+          <label class="field-label range-caption leverage-caption" for="leverage-range"><span>杠杆倍数 <small>1× 默认</small></span><strong id="leverage-readout">1×</strong></label>
+          <input id="leverage-range" type="range" min="1" max="100" step="1" value="1" aria-label="杠杆倍数，1至100倍">
+          <div class="leverage-presets" role="group" aria-label="常用杠杆倍数"><button type="button" data-leverage="1" class="active" aria-pressed="true">1×</button><button type="button" data-leverage="2" aria-pressed="false">2×</button><button type="button" data-leverage="5" aria-pressed="false">5×</button><button type="button" data-leverage="10" aria-pressed="false">10×</button><button type="button" data-leverage="20" aria-pressed="false">20×</button><button type="button" data-leverage="50" aria-pressed="false">50×</button><button type="button" data-leverage="100" aria-pressed="false">100×</button></div>
+          <label class="field-label range-caption" for="size-range"><span>保证金比例</span><strong id="size-readout">10% · 999.60 USDT 保证金</strong></label>
+          <input id="size-range" type="range" min="0" max="100" step="0.1" value="10" aria-label="保证金比例">
           <div class="size-presets"><button type="button" data-size="10">10%</button><button type="button" data-size="25">25%</button><button type="button" data-size="50">50%</button><button type="button" data-size="95">95%</button></div>
           <div class="order-type-toggle" role="group" aria-label="成交方式"><button id="market-type" type="button" class="active">市价</button><button id="limit-type" type="button">限价</button></div>
           <input id="notional" type="hidden" value="999.60">
+          <div class="leverage-estimates" aria-label="逐仓模拟估算">
+            <div><span>名义仓位</span><strong id="notional-value">999.60 U</strong></div>
+            <div><span>占用保证金</span><strong id="margin-value">999.60 U</strong></div>
+            <div><span>开仓手续费</span><strong id="entry-fee-value">0.40 U</strong></div>
+            <div><span>预估强平价</span><strong id="liquidation-value">—</strong></div>
+          </div>
           <div class="risk-line"><span>价差估算（未计成本） · 盈亏比</span><span id="risk-preview">—</span></div>
           <div class="trade-buttons"><button type="button" id="long" class="buy" aria-pressed="false" disabled>↗ 买入 / 做多</button><button type="button" id="short" class="sell" aria-pressed="false" disabled>↘ 卖出 / 做空</button></div>
           <div id="plan-actions" hidden><p id="plan-hint" class="order-hint">市价单按当前回放收盘价立即成交；限价按指定价或更优成交，否则挂起等待。</p><button type="button" id="confirm-plan" class="primary full" disabled>确认市价做多</button><button type="button" id="locate-plan" class="quiet full" hidden>定位计划价格</button><button type="button" id="cancel-plan" class="quiet full">取消计划</button></div>
@@ -55,7 +64,7 @@
         </form>
         <div class="position-heading"><h3>当前持仓</h3><span id="position-badge">空仓</span></div>
         <div id="position" class="position-empty"><span class="empty-cross">＋</span><p>等待你的判断</p><span>止损、止盈可按需分别添加</span></div>
-        <div class="fee-note">单边费率 0.04% · 滑点 0.02%<br>模拟双向交易，不计资金费与杠杆强平</div>
+        <div class="fee-note">单边费率 0.04% · 滑点 0.02%<br>逐仓模拟 · 不含资金费与分档</div>
       </aside>
       </div>
     <section class="journal">
@@ -77,8 +86,8 @@
     <div class="reason-actions"><button id="reason-cancel" class="quiet" type="button">取消</button><button id="reason-confirm" class="primary" type="button">确认下单</button></div>
   </section>
   <dialog id="info-dialog"><div class="dialog-head"><h2>你的第一轮练习</h2><button class="icon-btn" data-close="info-dialog" aria-label="关闭">×</button></div>
-    <ol class="guide"><li><strong>随机一段行情</strong><p>开始时展示此前走势，未来K线不会出现在图表里。默认隐藏真实日期，减少记忆干扰。</p></li><li><strong>逐分钟形成K线</strong><p>自动播放和「下一分钟」每次揭示一根真实1分钟OHLC；所选周期的当前K线随之逐步更新。「下一根K线」快进至所选周期的下一边界。分钟数据只有开高低收，不包含分钟内逐笔顺序，因此不绘制或推测平滑路径。</p></li><li><strong>选方向与订单类型</strong><p>设置仓位比例；市价单按当前回放收盘价立即成交，限价单在图上选入场价，按指定价或更优价成交，否则挂起等待。止损和止盈可各自拖动图上的「＋止损」「＋止盈」标记添加；已下单后的图上线位修改先预览，需在右侧确认才生效，取消可恢复。只有未成交限价单的入场价可修改。</p></li><li><strong>确认订单修改并复盘</strong><p>持仓或限价挂单的图上线位拖动及保护线增删会先显示待确认预览；在右侧确认修改后才生效，取消会恢复实际价位。未确认修改只保留在当前页面，刷新后丢弃。已设置的保护触发后自动平仓；换一轮时会平仓、撤销挂单并归档记录。</p></li></ol>
-    <details><summary>行情来源和成交规则</summary><p>内置 BTC/USDT、ETH/USDT 的 Binance 现货历史行情（2022-01-01 至 2025-12-31 UTC）。回放会按需读取真实1分钟行情，并逐分钟更新所选周期K线；更大周期仅合并已披露数据。官方归档在 2023-03-24 12:45 至 13:45 UTC 缺少5根15分钟K线，保留缺口，不补造数据；跨缺口按下一根真实行情继续。</p><p>市价单在当前回放收盘价模拟成交；限价按指定价或更优价格成交，否则等待后续真实行情满足条件。止损和止盈保护可分别启用或关闭，只有已设置的保护线会触发退出。成交模型为1倍名义仓位的双向模拟，并非真实合约撮合。不包含资金费、盘口深度及杠杆强平。单边手续费0.04%，成交价加不利滑点0.02%。</p><p>保护线随每根已完成的真实1分钟行情检查。分钟数据只包含开盘、最高、最低、收盘价，无法得知分钟内先后路径；同一分钟触及止损和止盈时，按先止损处理。跳空穿过价位按开盘价成交，再计滑点。成交或保护线触发后，回放按原有播放状态继续。</p><p>“隐藏日期”只是练习界面遮挡，数据文件仍保留完整历史，并不是防作弊考试系统。时间显示采用UTC。</p><p><a href="https://github.com/binance/binance-public-data" target="_blank" rel="noreferrer">Binance 官方历史数据说明 ↗</a></p><p class="license">TradingView Lightweight Charts™<br>Copyright (c) 2025 TradingView, Inc. https://www.tradingview.com/<br><a href="./vendor/NOTICE" target="_blank">版权声明</a> · <a href="./vendor/LICENSE" target="_blank">Apache 2.0 许可证</a></p></details>
+    <ol class="guide"><li><strong>随机一段行情</strong><p>开始时展示此前走势，未来K线不会出现在图表里。默认隐藏真实日期，减少记忆干扰。</p></li><li><strong>逐分钟形成K线</strong><p>自动播放和「下一分钟」每次揭示一根真实1分钟OHLC；所选周期的当前K线随之逐步更新。「下一根K线」快进至所选周期的下一边界。分钟数据只有开高低收，不包含分钟内逐笔顺序，因此不绘制或推测平滑路径。</p></li><li><strong>选方向与订单类型</strong><p>选择杠杆倍数与保证金比例；市价单按当前回放收盘价立即成交，限价单在图上选入场价，按指定价或更优价成交，否则挂起等待。止损和止盈可各自拖动图上的「＋止损」「＋止盈」标记添加；已下单后的图上线位修改先预览，需在右侧确认才生效，取消可恢复。只有未成交限价单的入场价可修改。</p></li><li><strong>确认订单修改并复盘</strong><p>持仓或限价挂单的图上线位拖动及保护线增删会先显示待确认预览；在右侧确认修改后才生效，取消会恢复实际价位。未确认修改只保留在当前页面，刷新后丢弃。已设置的保护触发后自动平仓；换一轮时会平仓、撤销挂单并归档记录。</p></li></ol>
+    <details><summary>行情来源和成交规则</summary><p>内置 BTC/USDT、ETH/USDT 的 Binance 现货历史行情（2022-01-01 至 2025-12-31 UTC）。回放会按需读取真实1分钟行情，并逐分钟更新所选周期K线；更大周期仅合并已披露数据。官方归档在 2023-03-24 12:45 至 13:45 UTC 缺少5根15分钟K线，保留缺口，不补造数据；跨缺口按下一根真实行情继续。</p><p>市价单在当前回放收盘价模拟成交；限价按指定价或更优价格成交，否则等待后续真实行情满足条件。止损和止盈保护可分别启用或关闭，只有已设置的保护线会触发退出。成交模型支持1–100×逐仓模拟，默认1×；不是交易所真实合约撮合。预估强平触发价采用固定0.5%维持保证金率，并基于回放中的现货分钟价估算，不等同交易所标记价格或真实强平价。不计资金费和分档维持保证金；成交仍按原规则计0.02%不利滑点，极端跳空可能出现逐仓结算补差，成交历史会单独记录补差金额。单边手续费0.04%。</p><p>保护线随每根已完成的真实1分钟行情检查。分钟数据只包含开盘、最高、最低、收盘价，无法得知分钟内先后路径；同一分钟触及止损和止盈时按止损处理，限价入场所在分钟会检查止损与强平，止盈从下一分钟起检查。若分钟开盘已跳空越过强平价，优先按强平处理；同一分钟内止损和强平价都触及时，按先经过的保护阈值处理（多仓取价格较高者，空仓取价格较低者）。跳空触发止盈或止损按开盘价成交，再计滑点。成交或保护线触发后，回放按原有播放状态继续。</p><p>“隐藏日期”只是练习界面遮挡，数据文件仍保留完整历史，并不是防作弊考试系统。时间显示采用UTC。</p><p><a href="https://github.com/binance/binance-public-data" target="_blank" rel="noreferrer">Binance 官方历史数据说明 ↗</a></p><p class="license">TradingView Lightweight Charts™<br>Copyright (c) 2025 TradingView, Inc. https://www.tradingview.com/<br><a href="./vendor/NOTICE" target="_blank">版权声明</a> · <a href="./vendor/LICENSE" target="_blank">Apache 2.0 许可证</a></p></details>
     <button class="primary full" data-close="info-dialog">开始练习</button>
   </dialog>
   <dialog id="new-dialog"><div class="dialog-head"><h2>开始新一轮练习</h2><button class="icon-btn" data-close="new-dialog" aria-label="关闭">×</button></div><p>未成交限价单会撤销；当前持仓按最新已回放价格平仓。本轮成交、订单和笔记将归档，新一轮模拟资金为 10,000 USDT。</p><div class="dialog-actions"><button class="quiet" data-close="new-dialog">继续本轮</button><button class="primary" id="confirm-new">归档并开始</button></div></dialog>

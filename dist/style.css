@@ -42,3 +42,15 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .modification-confirmation{margin-top:12px;padding:10px;border:1px solid #75603a;border-radius:5px;background:#211f19}.modification-confirmation>strong{display:block;color:#f0ca7d;font-size:13px;margin-bottom:6px}.modification-values{margin:4px 0;color:#aeb8ba;font-size:12px;line-height:1.6;overflow-wrap:anywhere}.modification-values.preview{color:#f1d99f}.modification-actions{display:flex;gap:7px;margin-top:9px}.modification-actions button{flex:1;padding:7px 9px;font-size:12px}.plan-price-label.modification-preview{outline:1px solid #e8c36e;box-shadow:0 0 0 2px #e8c36e24}.plan-price-line.entry{border-color:#c9d5d8}.plan-price-line.modification-preview{border-top-style:solid;border-top-width:2px}
 #toast{left:20px;bottom:20px;transform:translateY(16px);max-width:min(calc(100vw - 40px),520px);border-left:3px solid var(--green);border-radius:4px;box-shadow:0 8px 28px #0008}#toast.show{transform:translateY(0)}
 @media(max-width:600px){.modification-confirmation{padding:9px}.modification-values{font-size:12px}.modification-actions button{min-width:0;padding:7px 5px}#toast{left:12px;bottom:max(12px,env(safe-area-inset-bottom));max-width:calc(100vw - 24px)}}
+
+/* Isolated leverage controls and transparent order sizing estimates. */
+.leverage-caption small{font-size:10px;color:#788589;font-weight:400;margin-left:4px}
+.leverage-presets{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;margin:6px 0 11px}
+.leverage-presets button{min-width:0;border:1px solid var(--line);border-radius:3px;background:#1e2528;color:#aeb9bc;padding:5px 1px;font-size:10px;white-space:nowrap}
+.leverage-presets button.active{border-color:#7c8f92;background:#2b3639;color:#f1f6f6}
+.leverage-estimates{display:grid;grid-template-columns:1fr 1fr;gap:7px 10px;padding:9px 10px;margin-top:9px;border:1px solid var(--line);border-radius:4px;background:#14191b}
+.leverage-estimates>div{min-width:0;display:flex;flex-direction:column;gap:2px}
+.leverage-estimates span{font-size:10px;color:var(--muted)}
+.leverage-estimates strong{font:11px var(--mono);font-variant-numeric:tabular-nums;color:#dce4e6;overflow-wrap:anywhere}
+.leverage-estimates .liquidation-value{color:#ed9299}
+@media(max-width:600px){.leverage-presets{gap:3px}.leverage-presets button{font-size:10px;padding:6px 0}.leverage-estimates{padding:8px;gap:6px 8px}}
