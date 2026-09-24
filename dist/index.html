@@ -65,6 +65,16 @@
     <footer><span>练习记录仅保存在当前浏览器，可导出备份。</span><span><a href="https://www.tradingview.com/" target="_blank" rel="noreferrer">TradingView Lightweight Charts™</a> · <button class="text-link" id="source-details">数据与成交规则</button></span></footer>
   </main>
   <div id="toast" role="status" aria-live="polite"></div>
+  <section id="order-reason-window" class="order-reason-window" role="dialog" aria-modal="false" aria-labelledby="order-reason-title" aria-describedby="order-reason-summary" hidden>
+    <header id="order-reason-drag" class="order-reason-drag" tabindex="-1">
+      <div><h2 id="order-reason-title">填写下单理由</h2><span>拖动标题可移到旁边，图表仍可缩放查看</span></div>
+      <button id="reason-close" class="icon-btn" type="button" aria-label="取消本次下单">×</button>
+    </header>
+    <p id="order-reason-summary" class="order-reason-summary"></p>
+    <label class="entry-reason-label" for="entry-reason">为什么在这里下单？<textarea id="entry-reason" maxlength="2000" rows="4" required placeholder="写下你的判断依据…"></textarea></label>
+    <p id="entry-reason-error" class="entry-reason-error" aria-live="polite"></p>
+    <div class="reason-actions"><button id="reason-cancel" class="quiet" type="button">取消</button><button id="reason-confirm" class="primary" type="button">确认下单</button></div>
+  </section>
   <dialog id="info-dialog"><div class="dialog-head"><h2>你的第一轮练习</h2><button class="icon-btn" data-close="info-dialog" aria-label="关闭">×</button></div>
     <ol class="guide"><li><strong>随机一段行情</strong><p>开始时展示此前走势，未来K线不会出现在图表里。默认隐藏真实日期，减少记忆干扰。</p></li><li><strong>选方向与订单类型</strong><p>设置仓位比例；市价单按当前回放收盘价立即成交，限价单在图上选入场价，按指定价或更优价成交，否则挂起等待。止损和止盈可各自拖动图上的「＋止损」「＋止盈」标记添加，已设置的保护线可拖动或点×移除。</p></li><li><strong>管理订单并复盘</strong><p>已设置的止损或止盈触发后自动平仓；限价单成交前可撤销。每轮覆盖180天行情，换一轮时会平仓、撤销未成交订单并归档笔记和记录。</p></li></ol>
     <details><summary>行情来源和成交规则</summary><p>内置 BTC/USDT、ETH/USDT 的 Binance 现货历史行情（2022-01-01 至 2025-12-31 UTC），基础颗粒度15分钟，较大周期仅合并已回放数据；未走完的K线随回放更新。官方归档在 2023-03-24 12:45 至 13:45 UTC 缺少5根K线，保留缺口，不补造数据；跨缺口按下一根真实K线继续。</p><p>市价单在当前回放收盘价模拟成交；限价按指定价或更优价格成交，否则等待后续真实K线触价。止损和止盈保护可分别启用或关闭，只有已设置的保护线会触发退出。成交模型为1倍名义仓位的双向模拟，并非真实合约撮合。不包含资金费、盘口深度及杠杆强平。单边手续费0.04%，成交价加不利滑点0.02%。</p><p>已启用的止盈止损逐根15分钟检查；若同根同时碰到两条线，按先止损计算。跳空穿过价位按开盘价成交，再计滑点。自动平仓会停在触发的15分钟K线。</p><p>“隐藏日期”只是练习界面遮挡，数据文件仍保留完整历史，并不是防作弊考试系统。时间显示采用UTC。</p><p><a href="https://github.com/binance/binance-public-data" target="_blank" rel="noreferrer">Binance 官方历史数据说明 ↗</a></p><p class="license">TradingView Lightweight Charts™<br>Copyright (c) 2025 TradingView, Inc. https://www.tradingview.com/<br><a href="./vendor/NOTICE" target="_blank">版权声明</a> · <a href="./vendor/LICENSE" target="_blank">Apache 2.0 许可证</a></p></details>

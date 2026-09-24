@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, aggregate, cancelOrder, closePosition, createSession, FEE, INITIAL, LENGTH, metrics, openPosition, placeOrder, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, aggregate, cancelOrder, closePosition, createSession, FEE, INITIAL, LENGTH, metrics, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+
+const TEST_ENTRY_REASON = '测试入场理由';
+function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
+function placeOrder(...args) { return enginePlaceOrder(...args, TEST_ENTRY_REASON); }
 
 function bars(count, {start = 0, price = 100} = {}) {
   return Array.from({length: count}, (_, i) => [start + i * 900, price, price + 1, price - 1, price, 10]);
@@ -557,4 +561,90 @@ test('immediate fills reject enabled protection on the wrong side but accept dis
     assert.equal(s.balance, balance);
     assert.equal(s.orderHistory.length, 0);
   }
+});
+
+test('market and direct position entry trim and preserve entry reasons separately from exit reason', () => {
+  const data = bars(4), s = session(data);
+  const market = enginePlaceOrder(s, data, 1, 1000, 100, null, null, 'market', '  breakout retest  ');
+  assert.equal(market.order.entryReason, 'breakout retest');
+  assert.equal(market.position.entryReason, 'breakout retest');
+  const trade = closePosition(s, data, undefined, 'manual close');
+  assert.equal(trade.entryReason, 'breakout retest');
+  assert.equal(trade.reason, 'manual close');
+  assert.equal(s.orderHistory[0].entryReason, 'breakout retest');
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+
+  const direct = session(data);
+  const p = engineOpenPosition(direct, data, -1, 500, null, null, '  direct api reason ');
+  assert.equal(p.entryReason, 'direct api reason');
+  assert.equal(closePosition(direct, data, undefined, 'stop button').entryReason, 'direct api reason');
+});
+
+test('marketable limit and pending limit preserve the submitted reason through reprice, fill, and close', () => {
+  const marketableData = bars(4), marketable = session(marketableData);
+  const immediate = enginePlaceOrder(marketable, marketableData, -1, 1000, 99.99, null, null, 'limit', '  marketable thesis  ');
+  assert.equal(immediate.order.entryReason, 'marketable thesis');
+  assert.equal(immediate.position.entryReason, 'marketable thesis');
+
+  const data = bars(5), s = session(data, {tf: 900});
+  const pending = enginePlaceOrder(s, data, 1, 1000, 95, 90, null, 'limit', 'support bounce');
+  assert.equal(pending.status, 'pending');
+  assert.equal(s.pending.entryReason, 'support bounce');
+  data[1] = [900, 100, 101, 96, 100, 10];
+  assert.equal(advance(s, data).orderFilled, null);
+  const changed = updatePendingOrder(s, data, 94, 89, null);
+  assert.equal(changed.status, 'pending');
+  assert.equal(s.pending.entryReason, 'support bounce');
+  data[2] = [1800, 100, 101, 93, 95, 10];
+  const fill = advance(s, data);
+  assert.equal(fill.orderFilled.entryReason, 'support bounce');
+  assert.equal(s.position.entryReason, 'support bounce');
+  assert.equal(s.orderHistory[0].entryReason, 'support bounce');
+  const trade = closePosition(s, data, undefined, 'manual close');
+  assert.equal(trade.entryReason, 'support bounce');
+  assert.equal(trade.reason, 'manual close');
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+});
+
+test('cancelled orders keep entry reason distinct from cancellation reason', () => {
+  const data = bars(4), s = session(data);
+  enginePlaceOrder(s, data, 1, 1000, 90, null, 95, 'limit', '  oversold setup ');
+  const cancelled = cancelOrder(s, 'changed mind');
+  assert.equal(cancelled.entryReason, 'oversold setup');
+  assert.equal(cancelled.reason, 'changed mind');
+  assert.equal(s.orderHistory[0].entryReason, 'oversold setup');
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+});
+
+test('blank, nonstring, and overlong entry reasons reject all fresh entry APIs without mutation', () => {
+  const invalid = ['', '  \n\t ', null, 5, 'x'.repeat(2001)];
+  for (const reason of invalid) {
+    const orderData = bars(4), orderSession = session(orderData);
+    const before = JSON.stringify(orderSession);
+    assert.throws(() => enginePlaceOrder(orderSession, orderData, 1, 1000, 100, null, null, 'market', reason), /下单理由/);
+    assert.equal(JSON.stringify(orderSession), before);
+
+    const positionData = bars(4), positionSession = session(positionData);
+    const positionBefore = JSON.stringify(positionSession);
+    assert.throws(() => engineOpenPosition(positionSession, positionData, 1, 1000, null, null, reason), /下单理由/);
+    assert.equal(JSON.stringify(positionSession), positionBefore);
+  }
+});
+
+test('legacy trades and pending orders without entryReason remain manageable and fill without failure', () => {
+  const data = bars(5), legacy = session(data, {tf: 900});
+  legacy.pending = {id: 'legacy-order', side: 1, notional: 1000, entryPrice: 95, stop: null, take: null, type: 'limit', placedIndex: 0};
+  legacy.orderHistory.push({...legacy.pending, status: 'cancelled', reason: 'old record', cancelledIndex: 0});
+  legacy.trades.push({pnl: 1, fees: 1, entry: 100, exit: 101, qty: 1, entryIndex: 0, exitIndex: 0, reason: 'legacy close'});
+  assert.equal(validateSession(legacy, 'BTCUSDT', data), true);
+  assert.equal(updatePendingOrder(legacy, data, 94, null, null).status, 'pending');
+  data[1] = [900, 100, 101, 93, 95, 10];
+  const result = advance(legacy, data);
+  assert.equal(result.orderFilled.id, 'legacy-order');
+  assert.equal(Object.hasOwn(legacy.position, 'entryReason'), false);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(legacy)), 'BTCUSDT', data), true);
+  const closed = closePosition(legacy, data, undefined, 'legacy manual close');
+  assert.equal(Object.hasOwn(closed, 'entryReason'), false);
+  assert.equal(closed.reason, 'legacy manual close');
+  assert.equal(validateSession(JSON.parse(JSON.stringify(legacy)), 'BTCUSDT', data), true);
 });

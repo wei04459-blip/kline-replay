@@ -46,6 +46,17 @@ function storedPercent(value) {
   return value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
 }
 
+function normalizeEntryReason(value) {
+  if (typeof value !== 'string') throw new Error('下单理由必须是非空文本，最多2000字');
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 2000) throw new Error('下单理由必须是非空文本，最多2000字');
+  return trimmed;
+}
+
+function optionalSavedEntryReason(value) {
+  return value === undefined || (typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 2000);
+}
+
 function protectionsBracket(side, anchor, stop, take) {
   if (!optionalPrice(stop) || !optionalPrice(take)) return false;
   return side === 1
@@ -64,21 +75,23 @@ export function validateSession(session, symbol, data) {
       ![pending.notional, pending.entryPrice].every(Number.isFinite) || !optionalPrice(pending.stop) || !optionalPrice(pending.take) || pending.notional <= 0 ||
       pending.entryPrice <= 0 || !Number.isInteger(pending.placedIndex) ||
       pending.placedIndex < session.start || pending.placedIndex > session.cursor || typeof pending.id !== 'string' ||
+      !optionalSavedEntryReason(pending.entryReason) ||
       pending.notional * (1 + FEE) > session.balance + 1e-8 ||
       !protectionsBracket(pending.side, pending.entryPrice, pending.stop, pending.take))) return false;
   if (session.position !== null && session.position !== undefined) {
     const p = session.position;
     if (!p || ![1, -1].includes(p.side) || ![p.entry, p.qty, p.notional, p.entryFee].every(Number.isFinite) ||
         !optionalPrice(p.stop) || !optionalPrice(p.take) || !storedPercent(p.stopPct) || !storedPercent(p.takePct) ||
-        p.entry <= 0 || p.qty <= 0 || p.notional <= 0 || p.entryFee < 0 ||
+        !optionalSavedEntryReason(p.entryReason) || p.entry <= 0 || p.qty <= 0 || p.notional <= 0 || p.entryFee < 0 ||
         !Number.isInteger(p.entryIndex) || p.entryIndex < session.start || p.entryIndex > session.cursor || p.entryIndex > session.end || !candleAt(data, p.entryIndex)) return false;
   }
   if (session.orderHistory !== undefined && (!Array.isArray(session.orderHistory) || !session.orderHistory.every(o => o &&
       ['filled', 'cancelled'].includes(o.status) && ['limit', 'market'].includes(o.type) && typeof o.id === 'string' && [o.side, o.notional, o.entryPrice].every(Number.isFinite) &&
+      optionalSavedEntryReason(o.entryReason) &&
       [1, -1].includes(o.side) && o.notional > 0 && o.entryPrice > 0 && (o.status !== 'filled' ||
         [o.fillIndex, o.fillPrice].every(Number.isFinite) && o.fillIndex >= session.start && o.fillIndex <= session.cursor && o.fillPrice > 0) &&
       (o.status !== 'cancelled' || Number.isInteger(o.cancelledIndex) && o.cancelledIndex >= session.start && o.cancelledIndex <= session.cursor)))) return false;
-  return session.trades.every(t => t && [t.pnl, t.fees, t.entry, t.exit, t.qty].every(Number.isFinite) &&
+  return session.trades.every(t => t && optionalSavedEntryReason(t.entryReason) && [t.pnl, t.fees, t.entry, t.exit, t.qty].every(Number.isFinite) &&
     t.entry > 0 && t.exit > 0 && t.qty > 0 && Number.isInteger(t.entryIndex) && Number.isInteger(t.exitIndex) &&
     t.entryIndex >= session.start && t.entryIndex <= t.exitIndex && t.exitIndex <= session.cursor &&
     !!candleAt(data, t.entryIndex) && !!candleAt(data, t.exitIndex));
@@ -142,7 +155,8 @@ export function aggregate(data, cursor, seconds, from = 0) {
   return out;
 }
 
-export function openPosition(s, data, side, notional, stopPct, takePct) {
+export function openPosition(s, data, side, notional, stopPct, takePct, entryReason = '') {
+  const normalizedReason = normalizeEntryReason(entryReason);
   if (!validIndexTriplet(s, data)) throw new Error('本轮行情范围无效');
   assertCandle(data, s.cursor);
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
@@ -157,7 +171,7 @@ export function openPosition(s, data, side, notional, stopPct, takePct) {
   const entryFee = notional * FEE;
   s.position = {side, entry, qty: notional / entry, notional, entryFee, entryIndex: s.cursor,
     stop: stopPct === null ? null : entry * (1 - side * stopPct / 100),
-    take: takePct === null ? null : entry * (1 + side * takePct / 100), stopPct, takePct};
+    take: takePct === null ? null : entry * (1 + side * takePct / 100), stopPct, takePct, entryReason: normalizedReason};
   s.balance -= entryFee;
   return s.position;
 }
@@ -171,12 +185,13 @@ function validateOrderPlan(s, side, notional, entryPrice, stopPrice, takePrice) 
     throw new Error('下单金额加手续费不能超过可用余额');
 }
 
-function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, index, orderId = null) {
+function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, index, orderId = null, entryReason = undefined) {
   const entryFee = notional * FEE;
   const position = {side, entry: fillPrice, qty: notional / fillPrice, notional, entryFee, entryIndex: index,
     stop: stopPrice, take: takePrice,
     stopPct: stopPrice === null ? null : Math.abs((fillPrice - stopPrice) / fillPrice * 100),
     takePct: takePrice === null ? null : Math.abs((takePrice - fillPrice) / fillPrice * 100), orderId};
+  if (entryReason !== undefined) position.entryReason = entryReason;
   s.position = position;
   s.balance -= entryFee;
   return position;
@@ -191,7 +206,8 @@ function recordFilledOrder(s, order, fillIndex, fillPrice) {
 
 // Market orders fill at the already disclosed close. Limit orders stay pending
 // until a future observed 15m candle touches their price.
-export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takePrice, orderType = 'market') {
+export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takePrice, orderType = 'market', entryReason = '') {
+  const normalizedReason = normalizeEntryReason(entryReason);
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
   if (s.position || s.pending) throw new Error('请先处理当前仓位或挂单');
   if (s.cursor >= s.end) throw new Error('本轮已结束，请开启新一轮');
@@ -200,7 +216,7 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
   const planPrice = orderType === 'market' ? currentPrice : entryPrice;
   validateOrderPlan(s, side, notional, planPrice, stopPrice, takePrice);
   const order = {id: crypto.randomUUID(), side, notional, entryPrice: planPrice, stop: stopPrice, take: takePrice,
-    type: orderType, placedIndex: s.cursor};
+    type: orderType, placedIndex: s.cursor, entryReason: normalizedReason};
   const marketableLimit = orderType === 'limit' && (side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice);
   if (orderType === 'market' || marketableLimit) {
     const slippedMarket = currentPrice * (1 + side * SLIP);
@@ -208,7 +224,7 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
       side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
     // Immediate fills must leave both protections on the correct side of fill.
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
-    const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, s.cursor, order.id);
+    const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, s.cursor, order.id, normalizedReason);
     const filled = recordFilledOrder(s, order, s.cursor, fillPrice);
     return {status: 'filled', order: filled, position};
   }
@@ -239,7 +255,7 @@ export function updatePendingOrder(s, data, entryPrice, stopPrice, takePrice) {
     const fillPrice = side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
     s.pending = null;
-    const position = positionAtPrice(s, data, side, updated.notional, fillPrice, stopPrice, takePrice, s.cursor, updated.id);
+    const position = positionAtPrice(s, data, side, updated.notional, fillPrice, stopPrice, takePrice, s.cursor, updated.id, updated.entryReason);
     const filled = recordFilledOrder(s, updated, s.cursor, fillPrice);
     return {status: 'filled', order: filled, position};
   }
@@ -333,7 +349,7 @@ export function advance(s, data) {
       const fillPrice = pendingFillPrice(pending, c);
       if (fillPrice !== null) {
         s.pending = null;
-        positionAtPrice(s, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, i, pending.id);
+        positionAtPrice(s, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, i, pending.id, pending.entryReason);
         orderFilled = recordFilledOrder(s, pending, i, fillPrice);
         entryBar = true;
       }

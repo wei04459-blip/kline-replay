@@ -19,6 +19,18 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .protection-remove{position:absolute;z-index:6;right:190px;transform:translateY(-50%);width:20px;height:20px;border:1px solid #596367;border-radius:50%;background:#202629;color:#e2e8e9;line-height:16px;padding:0;font-size:16px;pointer-events:auto;cursor:pointer}
 .protection-remove.stop{border-color:#75454a;color:#ffabb2}.protection-remove.take{border-color:#34715c;color:#77e2ba}
 .protection-add-marker:focus-visible,.protection-remove:focus-visible{outline:2px solid #edf6f7;outline-offset:2px}
+.order-reason-window{position:fixed;z-index:20;left:0;top:0;width:min(430px,calc(100vw - 24px));max-height:calc(100vh - 24px);overflow:auto;padding:16px;background:#1a2023;border:1px solid #526064;border-radius:8px;box-shadow:0 16px 55px #000a;color:var(--text);pointer-events:auto}
+.order-reason-window[hidden]{display:none}.order-reason-drag{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:-2px -2px 12px;padding:2px;cursor:move;touch-action:none;user-select:none}
+.order-reason-drag h2{margin:0;font-size:16px}.order-reason-drag span{display:block;margin-top:3px;color:var(--muted);font-size:12px}
+.order-reason-summary{margin:0 0 12px;padding:9px 10px;border:1px solid var(--line);border-radius:4px;background:#131719;color:#dce4e6;font:12px/1.6 var(--mono);overflow-wrap:anywhere}
+.entry-reason-label{display:block;color:#dce4e6;font-size:14px;font-weight:600}.entry-reason-label textarea{display:block;width:100%;min-height:96px;max-height:36vh;resize:vertical;margin-top:7px;padding:9px 10px;border:1px solid #424d51;border-radius:4px;background:#111517;color:var(--text);font-size:14px;line-height:1.5;outline:0;touch-action:auto;user-select:text}
+.entry-reason-label textarea:focus{border-color:#8ca2a6;box-shadow:0 0 0 2px #8ca2a622}.entry-reason-error{min-height:20px;margin:5px 0;color:#ff9ba3;font-size:12px}
+.reason-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}.reason-actions .primary,.reason-actions .quiet{min-width:92px}
+@media(max-width:600px){.order-reason-window{width:calc(100vw - 20px);max-height:calc(100dvh - 20px);padding:14px}.order-reason-drag{cursor:move}.entry-reason-label textarea{min-height:110px;max-height:32dvh}}
+.price-line-overlay.reason-frozen,.price-line-overlay.reason-frozen *{pointer-events:none!important}
+.entry-reason-view{margin:8px 0 0;color:#cbd5d7;font-size:13px;line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap}
+.history-card .entry-reason-view{display:block;color:#cbd5d7;white-space:pre-wrap;overflow-wrap:anywhere}
+.entry-reason-cell{width:220px;max-width:260px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;vertical-align:top}
 .trade-buttons button{border:1px solid transparent;transition:background-color .12s ease,border-color .12s ease,box-shadow .12s ease}
 .trade-buttons .buy.selected{background:#1d7759;color:#f2fff9;border-color:#6be4b4;box-shadow:inset 0 0 0 1px #6be4b444}
 .trade-buttons .sell.selected{background:#803b45;color:#fff5f6;border-color:#ff9aa3;box-shadow:inset 0 0 0 1px #ff9aa344}
