@@ -35,3 +35,4 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .trade-buttons .buy.selected{background:#1d7759;color:#f2fff9;border-color:#6be4b4;box-shadow:inset 0 0 0 1px #6be4b444}
 .trade-buttons .sell.selected{background:#803b45;color:#fff5f6;border-color:#ff9aa3;box-shadow:inset 0 0 0 1px #ff9aa344}
 .trade-buttons button:disabled{box-shadow:none}
+.chart-options .ma10-option input{accent-color:#65a9ff}.chart-options .ma10-option{color:#9cc8ff}.chart-options .ma20-option input{accent-color:#e6ba69}

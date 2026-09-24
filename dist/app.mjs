@@ -2,7 +2,7 @@ import {createChart, CandlestickSeries, LineSeries, CrosshairMode, ColorType} fr
 import {INITIAL, FEE, SLIP, BASE, WARMUP, createSession, validateSession, aggregate, openPosition, closePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, advance, metrics} from './engine.mjs';
 
 const $ = id => document.getElementById(id);
-const els = Object.fromEntries(['save-status','new-session','equity','pnl','unreal','trade-count','win-rate','symbol','coin-mark','ma','blind','recenter','last-price','last-change','ohlc','loading','play','step','speed','replay-status','progress-text','progress-bar','balance','notional','risk-preview','long','short','order-hint','position-badge','position','journal-count','history-count','journal-content','notes','current-tab','history-tab','order-form','toast','new-dialog','confirm-new','info-dialog','export','rules','source-details','source-label','size-range','size-readout','plan-actions','plan-hint','confirm-plan','cancel-plan','locate-plan','session-badge','order-reason-window','order-reason-drag','order-reason-summary','entry-reason','entry-reason-error','reason-cancel','reason-close','reason-confirm'].map(id=>[id,$(id)]));
+const els = Object.fromEntries(['save-status','new-session','equity','pnl','unreal','trade-count','win-rate','symbol','coin-mark','ma','ma10','blind','recenter','last-price','last-change','ohlc','loading','play','step','speed','replay-status','progress-text','progress-bar','balance','notional','risk-preview','long','short','order-hint','position-badge','position','journal-count','history-count','journal-content','notes','current-tab','history-tab','order-form','toast','new-dialog','confirm-new','info-dialog','export','rules','source-details','source-label','size-range','size-readout','plan-actions','plan-hint','confirm-plan','cancel-plan','locate-plan','session-badge','order-reason-window','order-reason-drag','order-reason-summary','entry-reason','entry-reason-error','reason-cancel','reason-close','reason-confirm'].map(id=>[id,$(id)]));
 const STORE_KEY = 'replay-lab-v1';
 const TF_LABELS = new Map([[900,'15分'],[1800,'30分'],[2700,'45分'],[3600,'1小时'],[14400,'4小时'],[86400,'1日'],[604800,'1周']]);
 const datasets = new Map();
@@ -20,6 +20,7 @@ let invalidSavedActive = false;
 let currentPayload = null;
 let activePriceLines = [];
 let maDataKey = null;
+let ma10DataKey = null;
 let uiPlan = null;
 let dragState = null;
 let dragDraft = null;
@@ -33,7 +34,7 @@ let reasonWindowDrag = null;
 let reasonFocusReturn = null;
 let reasonSubmitting = false;
 let reasonWindowPosition = null;
-let chart, candleSeries, maSeries, resizeObserver;
+let chart, candleSeries, maSeries, ma10Series, resizeObserver;
 
 function toast(message) {
   els.toast.textContent = message;
@@ -221,7 +222,7 @@ function disclosedBars(){
   if(!active)return [];
   return aggregate(currentData(),active.cursor,active.tf,Math.max(0,active.start-Math.ceil(WARMUP/BASE)));
 }
-function computeMa(bars){let sum=0;return bars.map((bar,i)=>{sum+=bar.close;if(i>=20)sum-=bars[i-20].close;return i>=19?{time:bar.time,value:sum/20}:null;}).filter(Boolean);}
+function computeMa(bars,period=20){let sum=0;return bars.map((bar,i)=>{sum+=bar.close;if(i>=period)sum-=bars[i-period].close;return i>=period-1?{time:bar.time,value:sum/period}:null;}).filter(Boolean);}
 function maSignature(){return active?`${active.id}|${active.symbol}|${active.tf}|${active.cursor}`:'';}
 function effectivePlan(){return dragDraft||uiPlan||active?.pending||active?.position||null;}
 function getPlanLevels(){if(frozenPlanLevels)return frozenPlanLevels;const p=effectivePlan();return p?[p.entryPrice??p.entry,p.stop,p.take].filter(Number.isFinite):[];}
@@ -331,6 +332,7 @@ function initChart(){
   chart=createChart(host,{width:host.clientWidth||800,height:host.clientHeight||418,layout:{background:{type:ColorType.Solid,color:'#171b1e'},textColor:'#879397',fontFamily:'Inter, -apple-system, sans-serif',fontSize:12},grid:{vertLines:{color:'#22292c'},horzLines:{color:'#22292c'}},crosshair:{mode:CrosshairMode.Normal,vertLine:{color:'#566469',labelBackgroundColor:'#39474b'},horzLine:{color:'#566469',labelBackgroundColor:'#39474b'}},rightPriceScale:{borderColor:'#313a3d',scaleMargins:{top:.12,bottom:.1}},timeScale:{borderColor:'#313a3d',timeVisible:true,secondsVisible:false,tickMarkFormatter:(time)=>formatChartTime(time),rightOffset:4,barSpacing:7},localization:{locale:'zh-CN',timeFormatter:(time)=>formatChartTime(time),priceFormatter:(price)=>pretty(price,2)}});
   candleSeries=chart.addSeries(CandlestickSeries,{upColor:'#22c58b',downColor:'#f06d78',borderUpColor:'#22c58b',borderDownColor:'#f06d78',wickUpColor:'#22c58b',wickDownColor:'#f06d78',priceLineVisible:false,autoscaleInfoProvider:original=>{const info=original?.();if(!info?.priceRange)return info;const levels=getPlanLevels();if(!levels.length)return info;return {...info,priceRange:{minValue:Math.min(info.priceRange.minValue,...levels),maxValue:Math.max(info.priceRange.maxValue,...levels)}};}});
   maSeries=chart.addSeries(LineSeries,{color:'#e6ba69',lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,autoscaleInfoProvider:()=>null});
+  ma10Series=chart.addSeries(LineSeries,{color:'#65a9ff',lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,autoscaleInfoProvider:()=>null});
   chart.subscribeCrosshairMove(param=>{if(!active||!param.time)return;const bar=param.seriesData.get(candleSeries);if(!bar)return;els['ohlc'].textContent=`${showTime(Number(param.time))}  O ${pretty(bar.open)}  H ${pretty(bar.high)}  L ${pretty(bar.low)}  C ${pretty(bar.close)}`;});
   chart.subscribeClick(param=>{if(pendingOrderRequest||!uiPlan||uiPlan.orderType!=='limit'||!param.point||!chartOverlay)return;const rect=host.getBoundingClientRect(),y=param.point.y;if(y<0||y>rect.height-28)return;const price=candleSeries.coordinateToPrice(y);if(Number.isFinite(price)&&price>0)setPlanEntry(price);});
   chartOverlay=document.createElement('div');chartOverlay.className='price-line-overlay';chartOverlay.setAttribute('aria-label','入场与风险价格线');host.append(chartOverlay);
@@ -349,7 +351,9 @@ function renderChart(fit=false,resetRange=false){
   candleSeries.setData(bars.map(b=>({time:b.time,open:b.open,high:b.high,low:b.low,close:b.close})));
   const key=maSignature();
   if(maDataKey!==key){maSeries.setData(computeMa(bars));maDataKey=key;}
+  if(ma10DataKey!==key){ma10Series.setData(computeMa(bars,10));ma10DataKey=key;}
   maSeries.applyOptions({visible:!!active.ma});
+  ma10Series.applyOptions({visible:!!active.ma10});
   chart.applyOptions({localization:{timeFormatter:time=>formatChartTime(time)}});
   if(fit)chart.timeScale().fitContent();
   else if(resetRange&&bars.length){const visible=active.tf===604800?52:120;chart.timeScale().setVisibleLogicalRange({from:Math.max(0,bars.length-visible),to:bars.length+3});}
@@ -431,7 +435,7 @@ function render(resetRange=false,updateChart=true){
   els.unreal.textContent=pretty(m.unreal);els.unreal.className=m.unreal>=0?'positive':'negative';els['trade-count'].textContent=`${active.trades.length} 笔成交`;els['win-rate'].textContent=m.winRate===null?'—':`${pretty(m.winRate,1)}%`;
   els.balance.textContent=`${pretty(active.balance)} USDT`;els['coin-mark'].textContent=active.symbol.startsWith('BTC')?'₿':'◆';els.symbol.value=active.symbol;els['session-badge'].textContent=`${active.symbol.replace('USDT','')} · ${TF_LABELS.get(active.tf)} · ${active.position?'持仓中':active.pending?'限价待成交':'盲回放'}`;
   document.querySelectorAll('[data-tf]').forEach(button=>button.classList.toggle('active',Number(button.dataset.tf)===active.tf));
-  els.blind.checked=!!active.blind;els.ma.checked=!!active.ma;
+  els.blind.checked=!!active.blind;els.ma.checked=!!active.ma;els.ma10.checked=!!active.ma10;
   const span=Math.max(1,(data[active.end]?.[0]||0)-(data[active.start]?.[0]||0));const elapsed=Math.max(0,(data[active.cursor]?.[0]||0)-(data[active.start]?.[0]||0));const progressPct=Math.max(0,Math.min(100,elapsed/span*100));els['progress-bar'].style.width=`${progressPct}%`;
   els['progress-text'].textContent=`已回放 ${Math.min(180,Math.floor(elapsed/86400))} / 180 天 · ${TF_LABELS.get(active.tf)||''}`;
   const hasOrder=!!active.position||!!active.pending,ended=active.cursor>=active.end,reasonOpen=!!pendingOrderRequest;els.play.disabled=ended||!!uiPlan||reasonOpen;els.step.disabled=ended||!!uiPlan||reasonOpen;els.long.disabled=ended||hasOrder||reasonOpen;els.short.disabled=ended||hasOrder||reasonOpen;els['size-range'].disabled=hasOrder||reasonOpen;syncDirectionSelection();
@@ -471,7 +475,7 @@ async function startRound(symbol=active?.symbol||els.symbol.value){
     pause();
     const data=await loadSymbol(symbol);
     const candidate=createSession(symbol,data);
-    archiveActive();candidate.startTime=data[candidate.start][0]+BASE;candidate.sizePercent=10;active=candidate;selectedOrderType='market';pendingSymbol=null;journalMode='positions';selectedHistoryId=null;els.symbol.value=symbol;hideLoading();render(true);persist();return true;
+    archiveActive();candidate.startTime=data[candidate.start][0]+BASE;candidate.sizePercent=10;candidate.ma10=false;active=candidate;selectedOrderType='market';pendingSymbol=null;journalMode='positions';selectedHistoryId=null;els.symbol.value=symbol;hideLoading();render(true);persist();return true;
   }catch(error){
     toast(`新一轮暂未开始：${error.message}。现有练习和往期记录已保留。`);els.symbol.value=active?.symbol||'BTCUSDT';if(invalidSavedActive)showSavedRecordRecovery(error.message);else{hideLoading();if(active)render();}return false;
   }finally{transitionPending=false;els.symbol.disabled=false;if(active&&!invalidSavedActive)els['new-session'].disabled=false;else if(!active)els['new-session'].disabled=false;}
@@ -488,7 +492,8 @@ function wireEvents(){
   els.symbol.addEventListener('change',()=>{maybeStart(els.symbol.value);});
   document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>$(button.dataset.close).close()));
   document.querySelectorAll('[data-tf]').forEach(button=>button.addEventListener('click',()=>{if(!active||transitionPending)return;pause();active.tf=Number(button.dataset.tf);render(true);persist();}));
-  els.ma.addEventListener('change',()=>{if(active){pause(false);active.ma=els.ma.checked;if(maDataKey!==maSignature()){maSeries.setData(computeMa(disclosedBars()));maDataKey=maSignature();}maSeries.applyOptions({visible:active.ma});els.play.textContent='▶';els.play.setAttribute('aria-label','自动播放');els['replay-status'].textContent=active.cursor>=active.end?'本轮结束':active.position?'持仓中':'盲回放';persist();}});
+  els.ma.addEventListener('change',()=>{if(active){pause(false);active.ma=els.ma.checked;if(maDataKey!==maSignature()){maSeries.setData(computeMa(disclosedBars()));maDataKey=maSignature();}maSeries.applyOptions({visible:active.ma});els.play.textContent='▶';els.play.setAttribute('aria-label','自动播放');els['replay-status'].textContent=active.cursor>=active.end?'本轮结束':active.position?'持仓中':active.pending?'限价待成交':'盲回放';persist();}});
+  els.ma10.addEventListener('change',()=>{if(active){pause(false);active.ma10=els.ma10.checked;if(ma10DataKey!==maSignature()){ma10Series.setData(computeMa(disclosedBars(),10));ma10DataKey=maSignature();}ma10Series.applyOptions({visible:active.ma10});els.play.textContent='▶';els.play.setAttribute('aria-label','自动播放');els['replay-status'].textContent=active.cursor>=active.end?'本轮结束':active.position?'持仓中':active.pending?'限价待成交':'盲回放';persist();}});
   els.blind.addEventListener('change',()=>{if(active){active.blind=els.blind.checked;render();persist();}});
   els.play.addEventListener('click',togglePlay);els.step.addEventListener('click',()=>{if(transitionPending)return;pause();advanceOne();});
   els.speed.addEventListener('change',()=>{if(isPlaying){pause();togglePlay();}});
@@ -526,7 +531,7 @@ function wireEvents(){
 async function boot(){
   readSaved();initChart();wireEvents();
   if(active){
-    try{const data=await loadSymbol(active.symbol);if(!validateSession(active,active.symbol,data))throw new Error('保存的练习状态校验失败，记录已保留');invalidSavedActive=false;if(!active.startTime)active.startTime=data[active.start][0]+BASE;selectedOrderType=active.selectedOrderType||'market';if(active.draftPlan){uiPlan=clone(active.draftPlan);selectedOrderType=uiPlan.orderType||selectedOrderType;els['plan-actions'].hidden=false;}hideLoading();render(true);persist();return;}
+    try{const data=await loadSymbol(active.symbol);if(!validateSession(active,active.symbol,data))throw new Error('保存的练习状态校验失败，记录已保留');invalidSavedActive=false;if(!active.startTime)active.startTime=data[active.start][0]+BASE;active.ma10=active.ma10===true;selectedOrderType=active.selectedOrderType||'market';if(active.draftPlan){uiPlan=clone(active.draftPlan);selectedOrderType=uiPlan.orderType||selectedOrderType;els['plan-actions'].hidden=false;}hideLoading();render(true);persist();return;}
     catch(error){invalidSavedActive=true;showSavedRecordRecovery(error.message);return;}
   }
   const symbol=active?.symbol||'BTCUSDT';
