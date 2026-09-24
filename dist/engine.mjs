@@ -167,6 +167,7 @@ export function validateSession(session, symbol, data) {
       optionalSavedEntryReason(o.entryReason) &&
       (o.placedTime === undefined || timeMatchesIndex(o.placedTime, o.placedIndex, data) && o.placedTime <= replayTime(session, data)) &&
       (o.fillTime === undefined || timeMatchesIndex(o.fillTime, o.fillIndex, data) && o.fillTime <= replayTime(session, data)) &&
+      (o.modifiedTime === undefined || Number.isInteger(o.modifiedIndex) && timeMatchesIndex(o.modifiedTime, o.modifiedIndex, data) && o.modifiedTime <= replayTime(session, data)) &&
       [1, -1].includes(o.side) && o.notional > 0 && o.entryPrice > 0 && (o.status !== 'filled' ||
         [o.fillIndex, o.fillPrice].every(Number.isFinite) && o.fillIndex >= session.start && o.fillIndex <= visibleIndex && o.fillPrice > 0) &&
       (o.status !== 'cancelled' || Number.isInteger(o.cancelledIndex) && o.cancelledIndex >= session.start && o.cancelledIndex <= visibleIndex &&
@@ -432,10 +433,55 @@ export function updateProtection(s, data, stopPrice, takePrice) {
   if (!optionalPrice(stopPrice) || !optionalPrice(takePrice)) throw new Error('保护价格无效；关闭保护请传null');
   const price = replayPrice(s, data), p = s.position;
   if (!protectionsBracket(p.side, price, stopPrice, takePrice)) throw new Error('止盈止损必须分列在当前价格两侧');
+  const modifiedIndex = visibleUpperIndex(s, data), modifiedTime = replayTime(s, data);
+  let matchedOrder = null;
+  if (typeof p.orderId === 'string' && p.orderId.trim() && Array.isArray(s.orderHistory)) {
+    const matches = s.orderHistory.filter(order => order?.id === p.orderId && order.status === 'filled');
+    if (matches.length > 1) throw new Error('成交订单关联不唯一，无法同步保护价格');
+    matchedOrder = matches[0] ?? null;
+  }
   p.stop = stopPrice; p.take = takePrice;
   p.stopPct = stopPrice === null ? null : Math.abs((p.entry - stopPrice) / p.entry * 100);
   p.takePct = takePrice === null ? null : Math.abs((takePrice - p.entry) / p.entry * 100);
+  if (matchedOrder) {
+    matchedOrder.stop = stopPrice;
+    matchedOrder.take = takePrice;
+    matchedOrder.modifiedIndex = modifiedIndex;
+    matchedOrder.modifiedTime = modifiedTime;
+  }
   return p;
+}
+
+/** Repair legacy snapshots where an active position or closed trade has newer protection than its filled order record. */
+export function reconcileOrderProtections(session) {
+  if (!session || !Array.isArray(session.orderHistory)) return false;
+  const sources = new Map();
+  const addSource = (source, priority) => {
+    if (!source || typeof source.orderId !== 'string' || !source.orderId.trim() ||
+        !Object.hasOwn(source, 'stop') || !Object.hasOwn(source, 'take') ||
+        !optionalPrice(source.stop) || !optionalPrice(source.take)) return;
+    const current = sources.get(source.orderId);
+    if (!current || priority < current.priority) sources.set(source.orderId, {source, priority});
+    else if (priority === current.priority && !current.ambiguous &&
+        (current.source.stop !== source.stop || current.source.take !== source.take))
+      sources.set(source.orderId, {ambiguous: true, priority});
+  };
+  addSource(session.position, 0);
+  if (Array.isArray(session.trades)) for (const trade of session.trades) addSource(trade, 1);
+
+  let changed = false;
+  for (const [id, candidate] of sources) {
+    if (candidate.ambiguous) continue;
+    const records = session.orderHistory.filter(order => order?.id === id && order.status === 'filled');
+    if (records.length !== 1) continue;
+    const order = records[0], {source} = candidate;
+    if (order.stop !== source.stop || order.take !== source.take) {
+      order.stop = source.stop;
+      order.take = source.take;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function pendingFillPrice(order, candle) {

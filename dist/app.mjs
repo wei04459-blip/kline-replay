@@ -1,5 +1,5 @@
 import {createChart, CandlestickSeries, LineSeries, CrosshairMode, ColorType} from './vendor/charts.mjs';
-import {INITIAL, FEE, SLIP, BASE, WARMUP, createSession, validateSession, aggregateReplay, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, closePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, metrics} from './engine.mjs';
+import {INITIAL, FEE, SLIP, BASE, WARMUP, createSession, validateSession, aggregateReplay, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, closePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, metrics} from './engine.mjs';
 import {nextMinute} from './minute-data.mjs';
 
 const $ = id => document.getElementById(id);
@@ -28,6 +28,7 @@ let activePriceLines = [];
 let maDataKey = null;
 let ma10DataKey = null;
 let uiPlan = null;
+let modificationDraft = null;
 let dragState = null;
 let dragDraft = null;
 let frozenPlanLevels = null;
@@ -40,6 +41,7 @@ let reasonWindowDrag = null;
 let reasonFocusReturn = null;
 let reasonSubmitting = false;
 let reasonWindowPosition = null;
+let reasonResumePlayback = false;
 let chart, candleSeries, maSeries, ma10Series, resizeObserver;
 
 function toast(message) {
@@ -68,6 +70,10 @@ function readSaved() {
   if(!saved || saved.version!==1 || !Array.isArray(saved.history)) return null;
   history=saved.history.filter(x=>x&&x.session&&typeof x.id==='string');
   if(saved.active&&saved.active.version===1&&typeof saved.active.symbol==='string') active=saved.active;
+  let repaired=false;
+  if(active)repaired=reconcileOrderProtections(active)||repaired;
+  for(const item of history)repaired=reconcileOrderProtections(item.session)||repaired;
+  if(repaired)persist();
   return saved;
 }
 function persist() {
@@ -108,6 +114,40 @@ function currentData(){return datasets.get(active?.symbol)||[];}
 function replayMark(session=active,data=currentData()){return engineReplayPrice(session,data);}
 function replayClock(session=active,data=currentData()){return engineReplayTime(session,data);}
 function replayIsEnded(session=active,data=currentData()){return replayEnded(session,data);}
+function managedTarget(){
+  if(!active)return null;
+  if(active.pending)return {kind:'pending',id:String(active.pending.id),order:active.pending};
+  if(active.position){const p=active.position,id=p.orderId?String(p.orderId):`${p.entryIndex??''}|${p.entryTime??''}|${p.side}|${p.entry}`;return {kind:'position',id,order:p};}
+  return null;
+}
+function modificationIsCurrent(draft=modificationDraft){
+  const current=managedTarget();return !!(draft&&current&&active?.id===draft._edit?.sessionId&&current.kind===draft._edit?.kind&&current.id===draft._edit?.id);
+}
+function ensureModificationDraft(){
+  const target=managedTarget();if(!target)return null;
+  if(modificationIsCurrent())return modificationDraft;
+  const source=target.order,copy=clone(source);copy.stop=source.stop??null;copy.take=source.take??null;
+  modificationDraft={...copy,_edit:{sessionId:active.id,kind:target.kind,id:target.id,base:{entryPrice:source.entryPrice??source.entry,stop:source.stop??null,take:source.take??null}}};
+  return modificationDraft;
+}
+function modificationChanged(draft=modificationDraft){
+  if(!modificationIsCurrent(draft))return false;
+  const base=draft._edit.base,entry=draft.entryPrice??draft.entry;
+  return entry!==base.entryPrice||draft.stop!==base.stop||draft.take!==base.take;
+}
+function clearModificationDraft(){modificationDraft=null;dragDraft=null;dragState=null;frozenPlanLevels=null;}
+function syncDraftsAfterMinute(){
+  let changed=false;
+  if(uiPlan?.orderType==='market'&&active){const price=replayMark();if(Number.isFinite(price)&&uiPlan.entryPrice!==price){uiPlan.entryPrice=price;if(dragDraft?.orderType==='market')dragDraft.entryPrice=price;active.draftPlan=clone(uiPlan);changed=true;}}
+  if(modificationDraft&&!modificationIsCurrent()){clearModificationDraft();changed=true;}
+  return changed;
+}
+function modifiedParts(base,next){
+  const out=[];
+  for(const [key,label] of [['stop','止损'],['take','止盈']])if(base[key]!==next[key])out.push(next[key]===null?`移除${label}`:base[key]===null?`新增${label} ${pretty(next[key])}`:`${label} ${pretty(base[key])}→${pretty(next[key])}`);
+  if((base.entryPrice??base.entry)!==(next.entryPrice??next.entry))out.push(`入场价 ${pretty(base.entryPrice??base.entry)}→${pretty(next.entryPrice??next.entry)}`);
+  return out;
+}
 function calcNotional(percent){const balance=active?.balance??INITIAL;return Math.floor((balance/(1+FEE))*(percent/100)*100)/100;}
 function syncSize(percent,persistNow=true){
   percent=Math.max(0,Math.min(100,Number(percent)||0));const amount=calcNotional(percent);
@@ -117,12 +157,11 @@ function syncSize(percent,persistNow=true){
 }
 function beginPlan(side){
   if(pendingOrderRequest||!active||active.position||active.pending||transitionPending)return;
-  pause(false);render();els.play.textContent='▶';els.play.setAttribute('aria-label','自动播放');
   const entry=replayMark(),notional=calcNotional(active.sizePercent??10),previous=uiPlan;
   const stopDistance=previous&&Number.isFinite(previous.stop)?Math.abs(previous.entryPrice-previous.stop)/previous.entryPrice:null;
   const takeDistance=previous&&Number.isFinite(previous.take)?Math.abs(previous.take-previous.entryPrice)/previous.entryPrice:null;
   uiPlan={side,orderType:selectedOrderType,entryPrice:entry,stop:stopDistance===null?null:entry*(1-side*stopDistance),take:takeDistance===null?null:entry*(1+side*takeDistance),notional};
-  active.draftPlan=clone(uiPlan);els['plan-actions'].hidden=false;els.play.disabled=true;els.step.disabled=true;chart.priceScale('right').applyOptions({autoScale:true});renderPlanOverlay();renderPosition();syncPlanSummary();syncDirectionSelection();persist();
+  active.draftPlan=clone(uiPlan);els['plan-actions'].hidden=false;chart.priceScale('right').applyOptions({autoScale:true});renderPlanOverlay();renderPosition();syncPlanSummary();syncDirectionSelection();syncPlaybackControls();persist();
 }
 function syncDirectionSelection(){
   const hasOrder=!!active?.position||!!active?.pending;
@@ -150,12 +189,12 @@ function chooseOrderType(type){
 }
 function confirmPlan(){
   if(pendingOrderRequest||!uiPlan||!active||Number(els.notional.value)<=0){if(Number(els.notional.value)<=0)toast('请选择大于0%的仓位比例');return;}
-  pause(false);pendingOrderRequest=clone(uiPlan);reasonSubmitting=false;reasonFocusReturn=els['confirm-plan'];els['reason-confirm'].disabled=false;
+  reasonResumePlayback=!!isPlaying;pause(false);pendingOrderRequest=clone(uiPlan);reasonSubmitting=false;reasonFocusReturn=els['confirm-plan'];els['reason-confirm'].disabled=false;
   els['entry-reason'].value=String(uiPlan.entryReason||'');els['entry-reason'].removeAttribute('aria-invalid');els['entry-reason-error'].textContent='';
   els['reason-confirm'].disabled=!els['entry-reason'].value.trim();
   els['order-reason-summary'].textContent=reasonOrderSummary(pendingOrderRequest);
   els['reason-confirm'].textContent=`${pendingOrderRequest.orderType==='limit'?'提交限价':'确认市价'} · ${pendingOrderRequest.side===1?'买入 / 做多':'卖出 / 做空'}`;
-  els['order-reason-window'].hidden=false;syncReasonControls();positionReasonWindow();requestAnimationFrame(()=>els['entry-reason'].focus());
+  els['order-reason-window'].hidden=false;syncReasonControls();syncPlaybackControls();els.play.textContent='▶';els.play.setAttribute('aria-label','自动播放');positionReasonWindow();requestAnimationFrame(()=>els['entry-reason'].focus());
 }
 function reasonOrderSummary(p){
   const entry=p.entryPrice??p.entry,stop=Number.isFinite(p.stop)?pretty(p.stop):'未设置',take=Number.isFinite(p.take)?pretty(p.take):'未设置';
@@ -196,7 +235,9 @@ function closeOrderReason(returnFocus=true){
   if(active&&!invalidSavedActive)render(false,false);
   if(returnFocus&&reasonFocusReturn?.isConnected&&!reasonFocusReturn.hidden)reasonFocusReturn.focus();
   reasonFocusReturn=null;
+  resumeReasonPlayback();
 }
+function resumeReasonPlayback(){const shouldResume=reasonResumePlayback;reasonResumePlayback=false;if(shouldResume&&active&&!replayIsEnded()&&!invalidSavedActive&&!isPlaying)togglePlay();}
 function submitOrderReason(){
   if(!pendingOrderRequest||reasonSubmitting)return;
   const entryReason=els['entry-reason'].value.trim();
@@ -206,7 +247,11 @@ function submitOrderReason(){
   try{
     const result=placeOrder(active,currentData(),p.side,p.notional,p.entryPrice,p.stop,p.take,p.orderType,entryReason);
     pendingOrderRequest=null;reasonSubmitting=false;uiPlan=null;active.draftPlan=null;els['plan-actions'].hidden=true;els['order-reason-window'].hidden=true;syncReasonControls();chart.priceScale('right').applyOptions({autoScale:true});render();persist();reasonFocusReturn=null;
-    if(result.status==='pending')toast('限价单已提交，等待后续行情触价');else toast(p.orderType==='limit'?'限价单已按指定价或更优价格成交':`市价${p.side===1?'买入 / 做多':'卖出 / 做空'}已成交`);
+    const coin=active.symbol.replace('USDT',''),direction=p.side===1?'做多':'做空',fill=result.position?.entry??result.order?.fillPrice??p.entryPrice;
+    if(result.status==='pending')toast(`限价单已挂单 · ${coin} ${direction} · 限价 ${pretty(p.entryPrice)}`);
+    else if(p.orderType==='limit')toast(`限价单已成交 · ${coin} ${direction} · 成交 ${pretty(fill)}`);
+    else toast(`市价单已成交 · ${coin} ${direction} · 成交 ${pretty(fill)}`);
+    resumeReasonPlayback();
   }catch(error){reasonSubmitting=false;els['reason-confirm'].disabled=false;els['entry-reason-error'].textContent=error.message||'订单未提交，请检查计划后重试。';els['entry-reason'].setAttribute('aria-invalid','true');els['entry-reason'].focus();syncReasonControls();}
 }
 function entryReasonText(value){return typeof value==='string'&&value.trim()?value:'未记录';}
@@ -233,7 +278,7 @@ function disclosedBars(){
 }
 function computeMa(bars,period=20){let sum=0;return bars.map((bar,i)=>{sum+=bar.close;if(i>=period)sum-=bars[i-period].close;return i>=period-1?{time:bar.time,value:sum/period}:null;}).filter(Boolean);}
 function maSignature(){return active?`${active.id}|${active.symbol}|${active.tf}|${active.cursor}|${active.minuteCursorTime??''}`:'';}
-function effectivePlan(){return dragDraft||uiPlan||active?.pending||active?.position||null;}
+function effectivePlan(){return dragDraft||uiPlan||modificationDraft||active?.pending||active?.position||null;}
 function getPlanLevels(){if(frozenPlanLevels)return frozenPlanLevels;const p=effectivePlan();return p?[p.entryPrice??p.entry,p.stop,p.take].filter(Number.isFinite):[];}
 function syncPlanSummary(){
   const p=effectivePlan(),isDraft=!!uiPlan;
@@ -253,6 +298,7 @@ function renderPlanOverlayNow(){
   if(!chartOverlay||!chart||!candleSeries)return;
   chartOverlay.replaceChildren();const p=effectivePlan();if(!p){syncPlanSummary();return;}
   const movableEntry=uiPlan?.orderType==='limit'||!!active?.pending;
+  const editingExisting=!!modificationDraft&&!uiPlan;
   const entry=p.entryPrice??p.entry,prices=[['entry',entry,'入场价',movableEntry]];
   for(const [kind,label] of [['stop','止损'],['take','止盈']])if(Number.isFinite(p[kind]))prices.push([kind,p[kind],label,true]);
   const host=$('chart'),plotWidth=Math.max(0,host.clientWidth-66);
@@ -260,10 +306,11 @@ function renderPlanOverlayNow(){
     if(!Number.isFinite(price))continue;
     const y=candleSeries.priceToCoordinate(price);const initialY=Number.isFinite(y)?y:0;
     const previewing=dragState?.adding&&dragState.kind===key;
-    const line=document.createElement('div');line.className=`plan-price-line ${key}${movable?'':' locked'}${previewing?' preview':''}`;line.dataset.kind=key;line.style.top=`${initialY}px`;line.style.right='66px';line.hidden=!Number.isFinite(y);
-    const tag=document.createElement('span');tag.className=`plan-price-label ${key}${movable?'':' locked'}${previewing?' preview':''}`;tag.dataset.kind=key;tag.textContent=`${label}  ${pretty(price)}`;tag.style.top=`${Math.max(1,initialY-13)}px`;tag.style.right='70px';tag.hidden=!Number.isFinite(y);
+    const baseValue=modificationDraft?._edit?.base?.[key==='entry'?'entryPrice':key];const valueChanged=editingExisting&&price!==baseValue;
+    const line=document.createElement('div');line.className=`plan-price-line ${key}${movable?'':' locked'}${previewing?' preview':''}${valueChanged?' modification-preview':''}`;line.dataset.kind=key;line.style.top=`${initialY}px`;line.style.right='66px';line.hidden=!Number.isFinite(y);
+    const tag=document.createElement('span');tag.className=`plan-price-label ${key}${movable?'':' locked'}${previewing?' preview':''}${valueChanged?' modification-preview':''}`;tag.dataset.kind=key;tag.textContent=`${label}  ${pretty(price)}${valueChanged?' · 待确认':''}`;tag.style.top=`${Math.max(1,initialY-13)}px`;tag.style.right='70px';tag.hidden=!Number.isFinite(y);
     if(movable){const handle=document.createElement('button');handle.type='button';handle.className='plan-price-handle';handle.dataset.kind=key;handle.style.top=`${initialY}px`;handle.style.left=`${Math.max(4,plotWidth-11)}px`;handle.setAttribute('role','slider');handle.setAttribute('aria-label',`拖动${label}价格线`);handle.setAttribute('aria-valuenow',String(price));handle.title=`${label} ${pretty(price)} · 方向键微调`;handle.hidden=!Number.isFinite(y);handle.disabled=!!pendingOrderRequest;handle.setAttribute('aria-disabled',String(!!pendingOrderRequest));
-      handle.addEventListener('keydown',event=>{if(pendingOrderRequest||!['ArrowUp','ArrowDown'].includes(event.key))return;event.preventDefault();pauseForChartEdit();dragState={kind:key};dragDraft=clone(effectivePlan());const step=Math.max(price*0.0001,0.01);updatePlanDraft(key,price+(event.key==='ArrowUp'?step:-step));commitPlanDraft();});chartOverlay.append(line,tag,handle);
+      handle.addEventListener('keydown',event=>{if(pendingOrderRequest||!['ArrowUp','ArrowDown'].includes(event.key))return;event.preventDefault();pauseForChartEdit();if(!uiPlan){ensureModificationDraft();renderPosition();}dragState={kind:key};dragDraft=clone(effectivePlan());const step=Math.max(price*0.0001,0.01);updatePlanDraft(key,price+(event.key==='ArrowUp'?step:-step));commitPlanDraft();});chartOverlay.append(line,tag,handle);
       if(key!=='entry'){
         const remove=document.createElement('button');remove.type='button';remove.className=`protection-remove ${key}`;remove.dataset.kind=key;remove.textContent='×';remove.setAttribute('aria-label',`取消${label}`);remove.title=`取消${label}`;remove.style.top=`${initialY}px`;remove.hidden=!Number.isFinite(y);remove.disabled=!!pendingOrderRequest;remove.setAttribute('aria-disabled',String(!!pendingOrderRequest));chartOverlay.append(remove);
       }
@@ -285,8 +332,8 @@ function syncPlanOverlayCoordinates(){
     const handle=chartOverlay.querySelector(`.plan-price-handle[data-kind="${kind}"]`);
     for(const el of [line,tag,handle])if(el)el.hidden=y===null||!Number.isFinite(y);
     if(y===null||!Number.isFinite(y))continue;
-    if(line)line.style.top=`${y}px`;
-    if(tag){tag.style.top=`${Math.max(1,y-13)}px`;tag.textContent=`${kind==='entry'?'入场价':kind==='stop'?'止损':'止盈'}  ${pretty(price)}`;}
+    if(line){line.style.top=`${y}px`;const keyName=kind==='entry'?'entryPrice':kind,based=modificationDraft?._edit?.base?.[keyName],changed=!!modificationDraft&&!uiPlan&&price!==based;line.classList.toggle('modification-preview',changed);}
+    if(tag){tag.style.top=`${Math.max(1,y-13)}px`;const key=kind==='entry'?'entryPrice':kind,based=modificationDraft?._edit?.base?.[key],changed=!!modificationDraft&&!uiPlan&&price!==based;tag.textContent=`${kind==='entry'?'入场价':kind==='stop'?'止损':'止盈'}  ${pretty(price)}${changed?' · 待确认':''}`;tag.classList.toggle('modification-preview',changed);}
     if(handle){handle.style.top=`${y}px`;handle.setAttribute('aria-valuenow',String(price));}
     const remove=chartOverlay.querySelector(`.protection-remove[data-kind="${kind}"]`);if(remove){remove.hidden=y===null||!Number.isFinite(y);remove.style.top=`${y}px`;}
   }
@@ -297,13 +344,13 @@ function schedulePlanProjection(){
   projectionFrame=requestAnimationFrame(()=>{projectionFrame=0;syncPlanOverlayCoordinates();if(effectivePlan())schedulePlanProjection();});
 }
 function setupPlanOverlayEvents(){
-  chartOverlay.addEventListener('pointerdown',event=>{if(pendingOrderRequest)return;if(event.target.closest('.protection-remove')){event.preventDefault();event.stopPropagation();return;}const target=event.target.closest('.plan-price-handle,.plan-price-label,.plan-price-line,.protection-add-marker');if(!target||target.classList.contains('locked'))return;event.preventDefault();event.stopPropagation();pauseForChartEdit();dragDraft=clone(effectivePlan());frozenPlanLevels=getPlanLevels();dragState={kind:target.dataset.kind,adding:target.classList.contains('protection-add-marker'),startY:event.clientY};chartOverlay.setPointerCapture(event.pointerId);});
-  chartOverlay.addEventListener('pointermove',event=>{if(pendingOrderRequest||!dragState)return;event.preventDefault();event.stopPropagation();const rect=$('chart').getBoundingClientRect(),value=candleSeries.coordinateToPrice(event.clientY-rect.top);if(!Number.isFinite(value)||value<=0)return;if(dragState.adding){const moved=Math.abs(event.clientY-dragState.startY)>=6;dragDraft[dragState.kind]=moved&&protectionPreviewValid(dragState.kind,value,dragDraft)?value:null;renderPlanOverlay();}else updatePlanDraft(dragState.kind,value);});
-  chartOverlay.addEventListener('pointerup',event=>{if(pendingOrderRequest||!dragState)return;event.preventDefault();event.stopPropagation();if(chartOverlay.hasPointerCapture(event.pointerId))chartOverlay.releasePointerCapture(event.pointerId);if(dragState.adding&&!Number.isFinite(dragDraft?.[dragState.kind])){dragState=null;dragDraft=null;frozenPlanLevels=null;renderPlanOverlay();return;}commitPlanDraft();});
-  chartOverlay.addEventListener('pointercancel',()=>{dragState=null;dragDraft=null;frozenPlanLevels=null;chart.priceScale('right').applyOptions({autoScale:true});renderPlanOverlay();});
+  chartOverlay.addEventListener('pointerdown',event=>{if(pendingOrderRequest)return;if(event.target.closest('.protection-remove')){event.preventDefault();event.stopPropagation();return;}const target=event.target.closest('.plan-price-handle,.plan-price-label,.plan-price-line,.protection-add-marker');if(!target||target.classList.contains('locked'))return;event.preventDefault();event.stopPropagation();pauseForChartEdit();if(!uiPlan){ensureModificationDraft();syncPlaybackControls();}dragDraft=clone(effectivePlan());frozenPlanLevels=getPlanLevels();dragState={kind:target.dataset.kind,adding:target.classList.contains('protection-add-marker'),startY:event.clientY};chartOverlay.setPointerCapture(event.pointerId);});
+  chartOverlay.addEventListener('pointermove',event=>{if(pendingOrderRequest||!dragState)return;event.preventDefault();event.stopPropagation();const rect=$('chart').getBoundingClientRect(),value=candleSeries.coordinateToPrice(event.clientY-rect.top);if(!Number.isFinite(value)||value<=0)return;if(dragState.adding){const moved=Math.abs(event.clientY-dragState.startY)>=6;dragDraft[dragState.kind]=moved&&protectionPreviewValid(dragState.kind,value,dragDraft)?value:null;renderPlanOverlay();}else updatePlanDraft(dragState.kind,value);if(modificationDraft&&els.position.querySelector('.modification-confirmation'))renderModificationPanel(els.position,false);});
+  chartOverlay.addEventListener('pointerup',event=>{if(pendingOrderRequest||!dragState)return;event.preventDefault();event.stopPropagation();if(chartOverlay.hasPointerCapture(event.pointerId))chartOverlay.releasePointerCapture(event.pointerId);if(dragState.adding&&!Number.isFinite(dragDraft?.[dragState.kind])){dragState=null;dragDraft=null;frozenPlanLevels=null;if(!modificationChanged())modificationDraft=null;renderPlanOverlay();renderPosition();syncPlaybackControls();return;}commitPlanDraft();});
+  chartOverlay.addEventListener('pointercancel',()=>{dragState=null;dragDraft=null;frozenPlanLevels=null;if(!modificationChanged())modificationDraft=null;chart.priceScale('right').applyOptions({autoScale:true});renderPlanOverlay();renderPosition();syncPlaybackControls();});
   chartOverlay.addEventListener('click',event=>{if(pendingOrderRequest)return;const target=event.target.closest('.protection-remove');if(!target)return;event.preventDefault();event.stopPropagation();removeProtection(target.dataset.kind);});
 }
-function pauseForChartEdit(){if(isPlaying||fastForwarding||minuteActionPending){pause();els.play.textContent='▶';els.play.setAttribute('aria-label','自动播放');}}
+function pauseForChartEdit(){}
 function setPlanEntry(price){if(pendingOrderRequest||!uiPlan)return;const old=uiPlan.entryPrice,stopPct=Number.isFinite(uiPlan.stop)?Math.abs(old-uiPlan.stop)/old:null,takePct=Number.isFinite(uiPlan.take)?Math.abs(uiPlan.take-old)/old:null;uiPlan.entryPrice=price;uiPlan.stop=stopPct===null?null:price*(1-uiPlan.side*stopPct);uiPlan.take=takePct===null?null:price*(1+uiPlan.side*takePct);active.draftPlan=clone(uiPlan);chart.priceScale('right').applyOptions({autoScale:true});renderPlanOverlay();persist();}
 function updatePlanDraft(kind,value){
   if(pendingOrderRequest)return;
@@ -319,21 +366,18 @@ function removeProtection(kind){
   const p=effectivePlan();if(!p||!Number.isFinite(p[kind]))return;
   pauseForChartEdit();
   try{
-    if(uiPlan){uiPlan[kind]=null;active.draftPlan=clone(uiPlan);}
-    else if(active.pending)updatePendingOrder(active,currentData(),active.pending.entryPrice,kind==='stop'?null:active.pending.stop,kind==='take'?null:active.pending.take);
-    else if(active.position)updateProtection(active,currentData(),kind==='stop'?null:active.position.stop,kind==='take'?null:active.position.take);
-    chart.priceScale('right').applyOptions({autoScale:true});render(false,false);persist();
+    if(uiPlan){uiPlan[kind]=null;active.draftPlan=clone(uiPlan);persist();}
+    else{const draft=ensureModificationDraft();if(!draft)return;draft[kind]=null;renderPosition();syncPlaybackControls();}
+    chart.priceScale('right').applyOptions({autoScale:true});render(false,false);
   }catch(error){toast(error.message||`无法取消${kind==='stop'?'止损':'止盈'}`);render(false,false);}
 }
 function commitPlanDraft(){
   if(pendingOrderRequest||!dragState)return;
   dragState=null;let updateResult=null;frozenPlanLevels=null;
   try{
-    if(uiPlan){uiPlan=clone(dragDraft);active.draftPlan=clone(uiPlan);}
-    else if(active?.pending){updateResult=updatePendingOrder(active,currentData(),dragDraft.entryPrice??dragDraft.entry,dragDraft.stop,dragDraft.take);}
-    else if(active?.position){updateResult=updateProtection(active,currentData(),dragDraft.stop,dragDraft.take);}
-    dragDraft=null;chart.priceScale('right').applyOptions({autoScale:true});render(false,false);persist();
-    if(updateResult?.status==='filled')toast('限价单改价后立即成交，模拟持仓已建立');
+    if(uiPlan){uiPlan=clone(dragDraft);active.draftPlan=clone(uiPlan);dragDraft=null;persist();}
+    else if(active?.pending||active?.position){const candidate=clone(dragDraft);dragDraft=null;if(!modificationChanged(candidate)){modificationDraft=null;}else modificationDraft=candidate;renderPosition();syncPlaybackControls();}
+    chart.priceScale('right').applyOptions({autoScale:true});render(false,false);
   }catch(error){dragDraft=null;toast(error.message||'价格线调整未通过校验');renderPlanOverlay();}
 }
 function initChart(){
@@ -395,12 +439,12 @@ function renderJournal(){
   $('position-count').textContent=String(active?.position?1:0);$('order-count').textContent=String((active?.pending?1:0)+(active?.orderHistory?.length||0));
   for(const [id,mode] of [['positions-tab','positions'],['orders-tab','orders'],['current-tab','current'],['history-tab','history']])$(id).classList.toggle('selected',journalMode===mode);
   if(journalMode==='positions'){
-    const p=active?.position;if(!p){const empty=document.createElement('div');empty.className='empty-journal';empty.textContent='当前没有持仓。已提交的限价订单会显示在“订单”中。';els['journal-content'].append(empty);}else{const box=document.createElement('div');box.className='table-wrap';const row=document.createElement('div');row.className='order-row';const text=document.createElement('span');text.textContent=`${active.symbol.replace('USDT','')} ${p.side===1?'买入 / 做多':'卖出 / 做空'} · 入场 ${pretty(p.entry)} · 止损 ${protectionText(p.stop)} · 止盈 ${protectionText(p.take)} · ${pretty(p.notional)} USDT`;const close=document.createElement('button');close.textContent='市价平仓';close.addEventListener('click',()=>{pause();closePosition(active,currentData(),replayMark());render();persist();});row.append(text,close);const reason=document.createElement('p');reason.className='entry-reason-view';reason.textContent=`入场理由：${entryReasonText(p.entryReason)}`;box.append(row,reason);els['journal-content'].append(box);}els.notes.disabled=!active;els.notes.value=active?.notes||'';return;
+    const p=active?.position;if(!p){const empty=document.createElement('div');empty.className='empty-journal';empty.textContent='当前没有持仓。已提交的限价订单会显示在“订单”中。';els['journal-content'].append(empty);}else{const box=document.createElement('div');box.className='table-wrap';const row=document.createElement('div');row.className='order-row';const text=document.createElement('span');text.textContent=`${active.symbol.replace('USDT','')} ${p.side===1?'买入 / 做多':'卖出 / 做空'} · 入场 ${pretty(p.entry)} · 止损 ${protectionText(p.stop)} · 止盈 ${protectionText(p.take)} · ${pretty(p.notional)} USDT`;const close=document.createElement('button');close.textContent='市价平仓';close.addEventListener('click',()=>{const trade=closePosition(active,currentData(),replayMark());clearModificationDraft();render();persist();if(trade)toast(`市价平仓 · ${active.symbol.replace('USDT','')} ${p.side===1?'做多':'做空'} · ${pretty(trade.exit)}`);});row.append(text,close);const reason=document.createElement('p');reason.className='entry-reason-view';reason.textContent=`入场理由：${entryReasonText(p.entryReason)}`;box.append(row,reason);els['journal-content'].append(box);}els.notes.disabled=!active;els.notes.value=active?.notes||'';return;
   }
   if(journalMode==='orders'){
     const orders=[...(active?.orderHistory||[])].reverse();if(active?.pending)orders.unshift({...active.pending,status:'pending'});
     if(!orders.length){const empty=document.createElement('div');empty.className='empty-journal';empty.textContent='本轮还没有待成交或已处理订单。';els['journal-content'].append(empty);}
-    else{const list=document.createElement('div');list.className='history-list';for(const order of orders){const row=document.createElement('div');row.className='history-card';const title=document.createElement('strong');title.textContent=`${order.side===1?'买入 / 做多':'卖出 / 做空'} · ${order.type==='limit'?'限价':'市价'} · ${order.status==='pending'?'等待触价':order.status==='filled'?'已成交':'已撤销'}`;const detail=document.createElement('span');detail.textContent=`入场 ${pretty(order.entryPrice)} · 止损 ${protectionText(order.stop)} · 止盈 ${protectionText(order.take)} · ${pretty(order.notional)} U`;const entryReason=document.createElement('span');entryReason.className='entry-reason-view';entryReason.textContent=`入场理由：${entryReasonText(order.entryReason)}`;row.append(title,detail,entryReason);if(order.reason){const outcome=document.createElement('span');outcome.textContent=`处理原因：${order.reason}`;row.append(outcome);}if(order.status==='pending'){const cancel=document.createElement('button');cancel.textContent='撤销';cancel.addEventListener('click',()=>{cancelOrder(active,'用户撤单');render();persist();});row.append(cancel);}list.append(row);}els['journal-content'].append(list);}els.notes.disabled=true;els.notes.value='';return;
+    else{const list=document.createElement('div');list.className='history-list';for(const order of orders){const row=document.createElement('div');row.className='history-card';const title=document.createElement('strong');title.textContent=`${order.side===1?'买入 / 做多':'卖出 / 做空'} · ${order.type==='limit'?'限价':'市价'} · ${order.status==='pending'?'等待触价':order.status==='filled'?'已成交':'已撤销'}`;const detail=document.createElement('span');detail.textContent=`入场 ${pretty(order.entryPrice)} · 止损 ${protectionText(order.stop)} · 止盈 ${protectionText(order.take)} · ${pretty(order.notional)} U`;const entryReason=document.createElement('span');entryReason.className='entry-reason-view';entryReason.textContent=`入场理由：${entryReasonText(order.entryReason)}`;row.append(title,detail,entryReason);if(order.reason){const outcome=document.createElement('span');outcome.textContent=`处理原因：${order.reason}`;row.append(outcome);}if(order.status==='pending'){const cancel=document.createElement('button');cancel.textContent='撤销';cancel.addEventListener('click',()=>{clearModificationDraft();const cancelled=cancelOrder(active,'用户撤单');render();persist();if(cancelled)toast(`限价单已撤销 · ${active.symbol.replace('USDT','')} ${cancelled.side===1?'做多':'做空'} · ${pretty(cancelled.entryPrice)}`);});row.append(cancel);}list.append(row);}els['journal-content'].append(list);}els.notes.disabled=true;els.notes.value='';return;
   }
   if(journalMode==='current'){
     renderTradeTable(active?.trades||[],active?.symbol||'BTCUSDT',active);
@@ -419,7 +463,41 @@ function renderJournal(){
   const selected=history.find(x=>x.id===selectedHistoryId);
   if(selected)renderTradeTable(selected.session.trades||[],selected.session.symbol,selected.session);
 }
+function renderModificationPanel(container=els.position,createIfMissing=true){
+  const oldPanel=container.querySelector('.modification-confirmation');if(!oldPanel&&!createIfMissing)return;
+  container.querySelector('.modification-confirmation')?.remove();
+  if(!modificationDraft||!modificationIsCurrent()){if(modificationDraft)modificationDraft=null;return;}
+  const preview=dragDraft||modificationDraft,base=modificationDraft._edit.base,changed=modificationChanged(preview),panel=document.createElement('section');panel.className='modification-confirmation';
+  const title=document.createElement('strong');title.textContent='待确认修改';panel.append(title);
+  const actual=document.createElement('p');actual.className='modification-values';actual.textContent=`实际：入场 ${pretty(base.entryPrice)} · 止损 ${protectionText(base.stop)} · 止盈 ${protectionText(base.take)}`;
+  const next=document.createElement('p');next.className='modification-values preview';next.textContent=`预览：入场 ${pretty(preview.entryPrice??preview.entry)} · 止损 ${protectionText(preview.stop)} · 止盈 ${protectionText(preview.take)}`;panel.append(actual,next);
+  const actions=document.createElement('div');actions.className='modification-actions';const confirm=document.createElement('button');confirm.type='button';confirm.className='primary';confirm.textContent='确认修改';confirm.disabled=!changed||!!dragState||!modificationIsCurrent(preview);confirm.addEventListener('click',confirmModification);
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='quiet';cancel.textContent='取消';cancel.disabled=!!dragState;cancel.addEventListener('click',cancelModification);actions.append(confirm,cancel);panel.append(actions);container.append(panel);
+}
+function cancelModification(){
+  if(!modificationDraft)return;
+  clearModificationDraft();chart.priceScale('right').applyOptions({autoScale:true});render();
+}
+function confirmModification(){
+  if(!modificationDraft||dragState)return;
+  const draft=modificationDraft;
+  if(!modificationIsCurrent(draft)){clearModificationDraft();render();toast('订单状态已变化，修改预览已取消');return;}
+  if(!modificationChanged(draft)){cancelModification();return;}
+  const target=managedTarget(),base=draft._edit.base,changes=modifiedParts(base,draft),side=draft.side,kind=draft._edit.kind;
+  try{
+    let result=null;
+    if(kind==='pending')result=updatePendingOrder(active,currentData(),draft.entryPrice??draft.entry,draft.stop,draft.take);
+    else updateProtection(active,currentData(),draft.stop,draft.take);
+    clearModificationDraft();chart.priceScale('right').applyOptions({autoScale:true});render();persist();
+    const coin=active.symbol.replace('USDT',''),direction=side===1?'做多':'做空';
+    if(result?.status==='filled')toast(`限价改单成交 · ${coin} ${direction} · ${pretty(result.position?.entry??result.order?.fillPrice)}`);
+    else if(kind==='pending')toast(`限价单已修改 · ${coin} ${direction} · ${pretty(result?.order?.entryPrice??draft.entryPrice)} · ${changes.join('，')||'订单参数'}`);
+    else toast(`保护价已修改 · ${coin} ${direction} · ${changes.join('，')}`);
+  }catch(error){toast(error.message||'修改未生效，请调整后重试');renderModificationPanel(els.position);}
+}
 function renderPosition(){
+  if(modificationDraft&&!modificationIsCurrent())modificationDraft=null;
+  if(modificationDraft&&dragState&&modificationIsCurrent())return;
   const p=active?.position,pending=active?.pending;
   els.position.replaceChildren();
   if(!p&&!pending){els.position.className='position-empty';const plus=document.createElement('span');plus.className='empty-cross';plus.textContent='＋';const line=document.createElement('p');line.textContent='等待你的判断';const hint=document.createElement('span');hint.textContent='市价单立即成交；限价按指定价或更优成交，否则挂起等待';els.position.append(plus,line,hint);els['position-badge'].textContent='空仓';return;}
@@ -428,14 +506,14 @@ function renderPosition(){
     const top=document.createElement('div');top.className='pos-top';const side=document.createElement('span');side.textContent=`${active.symbol.replace('USDT','')} ${pending.side===1?'买入 / 做多':'卖出 / 做空'}`;const amount=document.createElement('span');amount.textContent=`${pretty(pending.notional)} U`;top.append(side,amount);
     const dl=document.createElement('dl');for(const [label,value] of [['限价',pretty(pending.entryPrice)],['止损价',protectionText(pending.stop)],['止盈价',protectionText(pending.take)]]){const dt=document.createElement('dt');dt.textContent=label;const dd=document.createElement('dd');dd.textContent=value;dl.append(dt,dd);}const entryReason=document.createElement('p');entryReason.className='entry-reason-view';entryReason.textContent=`入场理由：${entryReasonText(pending.entryReason)}`;
     const locate=document.createElement('button');locate.className='cancel-pending';locate.textContent='定位订单线';locate.addEventListener('click',locatePlanPrices);
-    const cancel=document.createElement('button');cancel.className='cancel-pending';cancel.textContent='撤销限价单';cancel.addEventListener('click',()=>{pause();cancelOrder(active,'用户撤单');chart.priceScale('right').applyOptions({autoScale:true});render();persist();toast('限价单已撤销');});els.position.append(top,dl,entryReason,locate,cancel);return;
+    const cancel=document.createElement('button');cancel.className='cancel-pending';cancel.textContent='撤销限价单';cancel.addEventListener('click',()=>{clearModificationDraft();cancelOrder(active,'用户撤单');chart.priceScale('right').applyOptions({autoScale:true});render();persist();toast('限价单已撤销');});els.position.append(top,dl,entryReason,locate,cancel);renderModificationPanel(els.position);return;
   }
   els.position.className='position-live';els['position-badge'].textContent=p.side===1?'做多持仓':'做空持仓';els['position-badge'].className=p.side===1?'positive':'negative';
   const top=document.createElement('div');top.className='pos-top';const side=document.createElement('span');side.textContent=`${active.symbol.replace('USDT','')} ${p.side===1?'买入 / 做多':'卖出 / 做空'}`;const amount=document.createElement('span');amount.textContent=`${pretty(p.notional)} U`;top.append(side,amount);
   const dl=document.createElement('dl');for(const [label,value] of [['入场价',pretty(p.entry)],['止损价',protectionText(p.stop)],['止盈价',protectionText(p.take)],['数量',pretty(p.qty,6)]]){const dt=document.createElement('dt');dt.textContent=label;const dd=document.createElement('dd');dd.textContent=value;dl.append(dt,dd);}const entryReason=document.createElement('p');entryReason.className='entry-reason-view';entryReason.textContent=`入场理由：${entryReasonText(p.entryReason)}`;
   const locate=document.createElement('button');locate.className='cancel-pending';locate.textContent='定位持仓线';locate.addEventListener('click',locatePlanPrices);
-  const close=document.createElement('button');close.type='button';close.className='close-position';close.textContent='市价平仓';close.addEventListener('click',()=>{pause();const trade=closePosition(active,currentData(),replayMark());if(trade){chart.priceScale('right').applyOptions({autoScale:true});render();persist();toast(`已市价平仓，盈亏 ${pretty(trade.pnl)} USDT`);}});
-  els.position.append(top,dl,entryReason,locate,close);
+  const close=document.createElement('button');close.type='button';close.className='close-position';close.textContent='市价平仓';close.addEventListener('click',()=>{const trade=closePosition(active,currentData(),replayMark());clearModificationDraft();if(trade){chart.priceScale('right').applyOptions({autoScale:true});render();persist();toast(`市价平仓 · ${active.symbol.replace('USDT','')} ${p.side===1?'做多':'做空'} · ${pretty(trade.exit)}`);}});
+  els.position.append(top,dl,entryReason,locate,close);renderModificationPanel(els.position);
 }
 function render(resetRange=false,updateChart=true){
   if(!active)return;
@@ -446,9 +524,9 @@ function render(resetRange=false,updateChart=true){
   document.querySelectorAll('[data-tf]').forEach(button=>button.classList.toggle('active',Number(button.dataset.tf)===active.tf));
   els.blind.checked=!!active.blind;els.ma.checked=!!active.ma;els.ma10.checked=!!active.ma10;
   syncReplayProgress(data);
-  const hasOrder=!!active.position||!!active.pending,ended=replayIsEnded(active,data),reasonOpen=!!pendingOrderRequest;els.play.disabled=ended||!!uiPlan||reasonOpen||fastForwarding||minuteActionPending&&!isPlaying;els['step-minute'].disabled=ended||!!uiPlan||reasonOpen||minuteActionPending||fastForwarding;els.step.disabled=ended||!!uiPlan||reasonOpen||minuteActionPending||fastForwarding;els['cancel-advance'].hidden=!fastForwarding;els['retry-minute'].hidden=!minuteRetryAction;els.long.disabled=ended||hasOrder||reasonOpen;els.short.disabled=ended||hasOrder||reasonOpen;els['size-range'].disabled=hasOrder||reasonOpen;syncDirectionSelection();
+  const hasOrder=!!active.position||!!active.pending,ended=replayIsEnded(active,data),reasonOpen=!!pendingOrderRequest;els.play.disabled=ended||reasonOpen||fastForwarding||minuteActionPending&&!isPlaying;els['step-minute'].disabled=ended||reasonOpen||minuteActionPending||fastForwarding;els.step.disabled=ended||reasonOpen||minuteActionPending||fastForwarding;els['cancel-advance'].hidden=!fastForwarding;els['retry-minute'].hidden=!minuteRetryAction;els.long.disabled=ended||hasOrder||reasonOpen;els.short.disabled=ended||hasOrder||reasonOpen;els['size-range'].disabled=hasOrder||reasonOpen;syncDirectionSelection();
   els.play.textContent=isPlaying?'Ⅱ':'▶';els.play.setAttribute('aria-label',isPlaying?'暂停回放':'自动播放');els['replay-status'].textContent=ended?'本轮结束':fastForwarding?'快进中':active.position?'持仓中':active.pending?'限价待成交':'盲回放';
-  els['new-session'].disabled=reasonOpen;els.symbol.disabled=reasonOpen;els['order-hint'].textContent=active.position?'持仓期间不能重复下单':active.pending?'限价单等待后续行情满足价格条件':'市价立即成交；限价按指定价或更优成交，否则挂起等待';
+  els['new-session'].disabled=reasonOpen;els.symbol.disabled=reasonOpen;els['order-hint'].textContent=modificationDraft?'图上线位修改仅为预览；在右侧确认修改后生效，取消可恢复':active.position?'持仓期间不能重复下单':active.pending?'限价单等待后续行情满足价格条件':'市价立即成交；限价按指定价或更优成交，否则挂起等待';
   const sizePct=Number.isFinite(active.sizePercent)?active.sizePercent:10;els['size-range'].value=String(sizePct);syncSize(sizePct,false);
   $('market-type').classList.toggle('active',selectedOrderType==='market');$('limit-type').classList.toggle('active',selectedOrderType==='limit');$('market-type').disabled=hasOrder||reasonOpen;$('limit-type').disabled=hasOrder||reasonOpen;document.querySelectorAll('[data-size]').forEach(button=>button.disabled=hasOrder||reasonOpen);els['confirm-plan'].disabled=reasonOpen||els['confirm-plan'].disabled;els['cancel-plan'].disabled=reasonOpen;syncPlanSummary();
   if(reasonOpen){els['reason-confirm'].disabled=reasonSubmitting||!els['entry-reason'].value.trim();}
@@ -464,7 +542,7 @@ function syncReplayProgress(data=currentData()){
 }
 function syncPlaybackControls(){
   if(!active)return;
-  const ended=replayIsEnded(),locked=!!pendingOrderRequest||!!uiPlan||transitionPending;
+  const ended=replayIsEnded(),locked=!!pendingOrderRequest||transitionPending;
   els.play.disabled=ended||locked||fastForwarding||minuteActionPending&&!isPlaying;
   els['step-minute'].disabled=ended||locked||minuteActionPending||fastForwarding;
   els.step.disabled=ended||locked||minuteActionPending||fastForwarding;
@@ -474,29 +552,32 @@ function invalidateMinuteWork(){
   minuteGeneration++;minuteRequestId++;minuteActionPending=false;fastForwarding=false;clearTimeout(playTimer);playTimer=0;isPlaying=false;
 }
 function pause(renderAfter=true){const interruptedFastForward=fastForwarding;invalidateMinuteWork();if(renderAfter&&active&&!invalidSavedActive)render();else if(active&&!invalidSavedActive)syncPlaybackControls();if(interruptedFastForward&&active)persist();}
-function minuteResultMessage(result){
+function minuteResultMessage(result,session=active){
   const messages=[];
-  if(result.orderFilled)messages.push('限价单已成交，模拟持仓已建立');
-  if(result.orderCancelled)messages.push(`限价单已结束：${result.orderCancelled.reason||'本轮结束'}`);
-  if(result.trade)messages.push(`${result.trade.reason}，本笔 ${pretty(result.trade.pnl)} USDT`);
+  const coin=session?.symbol?.replace(/USDT$/,'')||session?.symbol||'订单';
+  const direction=side=>side===1?'做多':'做空';
+  if(result.orderFilled)messages.push(`限价单已成交 · ${coin} ${direction(result.orderFilled.side)} · 成交 ${pretty(result.orderFilled.fillPrice)}`);
+  if(result.orderCancelled)messages.push(`限价单已结束 · ${coin} ${direction(result.orderCancelled.side)} · ${result.orderCancelled.reason||'本轮结束'}`);
+  if(result.trade)messages.push(`${result.trade.reason} · ${coin} ${direction(result.trade.side)} · 平仓 ${pretty(result.trade.exit)} · 盈亏 ${pretty(result.trade.pnl)} USDT`);
   if(result.ended)messages.push('本轮行情已走完');
   return messages;
 }
-async function advanceOneMinuteCore(generation,{draw=true,action='minute'}={}){
-  if(minuteActionPending||!active||pendingOrderRequest||transitionPending||uiPlan||replayIsEnded())return null;
+async function advanceOneMinuteCore(generation,{draw=true,announce=true}={}){
+  if(minuteActionPending||!active||pendingOrderRequest||transitionPending||replayIsEnded())return null;
   const session=active,data=currentData(),beforeTime=replayClock(session,data),beforeCursor=session.cursor;
   if(!Number.isFinite(beforeTime))return null;
   const requestId=++minuteRequestId;minuteActionPending=true;minuteRetryAction=null;
   els['progress-text'].textContent='正在读取下一根真实分钟行情…';syncPlaybackControls();
   try{
     const candle=await nextMinute(session.symbol,beforeTime-60);
-    if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session||session.cursor!==beforeCursor||replayClock(session,data)!==beforeTime||pendingOrderRequest||uiPlan)return null;
+    if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session||session.cursor!==beforeCursor||replayClock(session,data)!==beforeTime||pendingOrderRequest)return null;
     const result=advanceMinute(session,candle,data);
-    const messages=minuteResultMessage(result),stop=!!(result.ended||result.trade||result.orderFilled||result.orderCancelled);
+    syncDraftsAfterMinute();
+    const messages=minuteResultMessage(result,session),stop=!!result.ended;
     if(stop)invalidateMinuteWork();
     if(draw||stop){render();persist();}else syncReplayProgress(data);
-    if(messages.length)toast(messages.join(' · '));
-    return {...result,stop};
+    if((announce||result.ended)&&messages.length)toast(messages.join(' · '));
+    return {...result,stop,messages};
   }catch(error){
     if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session)return null;
     const failedAction=fastForwarding?'boundary':'minute';
@@ -508,33 +589,37 @@ async function advanceOneMinuteCore(generation,{draw=true,action='minute'}={}){
   }
 }
 async function runAutomaticMinute(generation){
-  const result=await advanceOneMinuteCore(generation,{draw:true,action:'play'});
+  const result=await advanceOneMinuteCore(generation,{draw:true});
   if(result?.failed||result?.stop||generation!==minuteGeneration||!isPlaying||pendingOrderRequest)return;
   playTimer=setTimeout(()=>runAutomaticMinute(generation),Number(els.speed.value));
 }
 function advanceOneMinute(){
-  if(minuteActionPending||fastForwarding||pendingOrderRequest||transitionPending||uiPlan||!active)return;
+  if(minuteActionPending||fastForwarding||pendingOrderRequest||transitionPending||!active)return;
   minuteRetryAction=null;return advanceOneMinuteCore(minuteGeneration,{draw:true,action:'minute'});
 }
 async function advanceToTfBoundary(){
-  if(minuteActionPending||fastForwarding||pendingOrderRequest||transitionPending||uiPlan||!active||replayIsEnded())return;
+  if(minuteActionPending||fastForwarding||pendingOrderRequest||transitionPending||!active||replayIsEnded())return;
   const generation=minuteGeneration,session=active,startTime=replayClock(),target=intervalStart(startTime,active.tf)+active.tf;
   fastForwarding=true;minuteRetryAction=null;syncPlaybackControls();
-  let steps=0;
+  let steps=0,failed=false;const eventMessages=[];
   try{
-    while(generation===minuteGeneration&&active===session&&!pendingOrderRequest&&!uiPlan&&!replayIsEnded()){
+    while(generation===minuteGeneration&&active===session&&!pendingOrderRequest&&!transitionPending&&!replayIsEnded()){
       if(replayClock()>=target)break;
-      const result=await advanceOneMinuteCore(generation,{draw:false,action:'boundary'});
-      if(!result||result.failed||result.stop)break;
+      const result=await advanceOneMinuteCore(generation,{draw:false,announce:false});
+      if(!result||result.failed||result.stop){failed=!!result?.failed;eventMessages.push(...(result?.messages||[]));break;}
+      eventMessages.push(...(result.messages||[]));
       steps++;
       if(steps%15===0){render();persist();await new Promise(resolve=>setTimeout(resolve,0));}
     }
   }finally{
-    if(generation===minuteGeneration&&active===session){fastForwarding=false;render();persist();if(steps)toast(`已快进 ${steps} 分钟`);}
+    if(generation===minuteGeneration&&active===session){fastForwarding=false;render();persist();if(!failed&&steps){
+      if(eventMessages.length)toast(eventMessages.join(' · '));
+      else toast(`已快进 ${steps} 分钟`);
+    }}
   }
 }
 function togglePlay(){
-  if(pendingOrderRequest||transitionPending||uiPlan||fastForwarding)return;
+  if(pendingOrderRequest||transitionPending||fastForwarding)return;
   if(isPlaying){pause();return;}
   if(!active||replayIsEnded()||minuteActionPending)return;
   minuteRetryAction=null;isPlaying=true;const generation=minuteGeneration;render();playTimer=setTimeout(()=>runAutomaticMinute(generation),Number(els.speed.value));
@@ -549,16 +634,17 @@ function archiveActive(){
 }
 async function startRound(symbol=active?.symbol||els.symbol.value){
   if(pendingOrderRequest||transitionPending)return false;
+  const resumeAfterTransition=!!isPlaying;
   transitionPending=true;
   els['new-session'].disabled=true;els.play.disabled=true;els.step.disabled=true;els['step-minute'].disabled=true;els.long.disabled=true;els.short.disabled=true;els.symbol.disabled=true;
   try{
     pause();
     const data=await loadSymbol(symbol);
     const candidate=createSession(symbol,data);
-    archiveActive();candidate.startTime=data[candidate.start][0]+BASE;candidate.sizePercent=10;candidate.ma10=false;active=candidate;selectedOrderType='market';pendingSymbol=null;journalMode='positions';selectedHistoryId=null;els.symbol.value=symbol;hideLoading();render(true);persist();return true;
+    clearModificationDraft();archiveActive();candidate.startTime=data[candidate.start][0]+BASE;candidate.sizePercent=10;candidate.ma10=false;active=candidate;selectedOrderType='market';pendingSymbol=null;journalMode='positions';selectedHistoryId=null;els.symbol.value=symbol;hideLoading();render(true);persist();return true;
   }catch(error){
     toast(`新一轮暂未开始：${error.message}。现有练习和往期记录已保留。`);els.symbol.value=active?.symbol||'BTCUSDT';if(invalidSavedActive)showSavedRecordRecovery(error.message);else{hideLoading();if(active)render();}return false;
-  }finally{transitionPending=false;els.symbol.disabled=false;if(active&&!invalidSavedActive)els['new-session'].disabled=false;else if(!active)els['new-session'].disabled=false;}
+  }finally{transitionPending=false;els.symbol.disabled=false;if(active&&!invalidSavedActive)els['new-session'].disabled=false;else if(!active)els['new-session'].disabled=false;if(resumeAfterTransition&&active&&!replayIsEnded()&&!invalidSavedActive&&!isPlaying)togglePlay();}
 }
 function maybeStart(symbol){if(pendingOrderRequest)return;pendingSymbol=symbol;if(active?.position||active?.pending){$('new-dialog').showModal();return;}startRound(symbol);}
 function downloadExport(){
@@ -571,9 +657,9 @@ function wireEvents(){
   $('new-dialog').addEventListener('close',()=>{if(pendingSymbol&&pendingSymbol!==active?.symbol)els.symbol.value=active?.symbol||'BTCUSDT';pendingSymbol=null;});
   els.symbol.addEventListener('change',()=>{maybeStart(els.symbol.value);});
   document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>$(button.dataset.close).close()));
-  document.querySelectorAll('[data-tf]').forEach(button=>button.addEventListener('click',()=>{if(!active||transitionPending)return;pause();active.tf=Number(button.dataset.tf);render(true);persist();}));
-  els.ma.addEventListener('change',()=>{if(active){const enabled=els.ma.checked;pause(false);active.ma=enabled;if(maDataKey!==maSignature()){maSeries.setData(computeMa(disclosedBars()));maDataKey=maSignature();}maSeries.applyOptions({visible:active.ma});render();persist();}});
-  els.ma10.addEventListener('change',()=>{if(active){const enabled=els.ma10.checked;pause(false);active.ma10=enabled;if(ma10DataKey!==maSignature()){ma10Series.setData(computeMa(disclosedBars(),10));ma10DataKey=maSignature();}ma10Series.applyOptions({visible:active.ma10});render();persist();}});
+  document.querySelectorAll('[data-tf]').forEach(button=>button.addEventListener('click',()=>{if(!active||transitionPending)return;active.tf=Number(button.dataset.tf);render(true);persist();}));
+  els.ma.addEventListener('change',()=>{if(active){const enabled=els.ma.checked;active.ma=enabled;if(maDataKey!==maSignature()){maSeries.setData(computeMa(disclosedBars()));maDataKey=maSignature();}maSeries.applyOptions({visible:active.ma});render();persist();}});
+  els.ma10.addEventListener('change',()=>{if(active){const enabled=els.ma10.checked;active.ma10=enabled;if(ma10DataKey!==maSignature()){ma10Series.setData(computeMa(disclosedBars(),10));ma10DataKey=maSignature();}ma10Series.applyOptions({visible:active.ma10});render();persist();}});
   els.blind.addEventListener('change',()=>{if(active){active.blind=els.blind.checked;render();persist();}});
   els.play.addEventListener('click',togglePlay);
   els['step-minute'].addEventListener('click',()=>{if(transitionPending||pendingOrderRequest)return;pause();minuteRetryAction=null;advanceOneMinute();});

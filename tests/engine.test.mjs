@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, FEE, INITIAL, intervalStart, LENGTH, metrics, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, FEE, INITIAL, intervalStart, LENGTH, metrics, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
 
 const TEST_ENTRY_REASON = '测试入场理由';
 function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
@@ -382,6 +382,128 @@ test('live protection can lock profit but must bracket the current disclosed pri
   assert.equal(p.stop, 105); // Above entry is allowed when it remains below current price.
   assert.throws(() => updateProtection(s, data, 111, 120), /当前价格两侧/);
   assert.throws(() => updateProtection(s, data, 105, 110), /当前价格两侧/);
+});
+
+test('live protection updates the exact filled order record through stop, bracket, and removal', () => {
+  const data = bars(5), s = session(data);
+  const result = placeOrder(s, data, 1, 1000, 100, null, null, 'market');
+  const order = s.orderHistory[0], id = order.id, original = {...order};
+  assert.equal(order.stop, null);
+  assert.equal(order.take, null); // Before a protection edit is confirmed, its filled-order record stays unchanged.
+
+  updateProtection(s, data, 95, null);
+  assert.equal(order.id, id);
+  assert.equal(order.status, 'filled');
+  assert.equal(order.stop, 95);
+  assert.equal(order.take, null);
+  assert.equal(order.modifiedIndex, 0);
+  assert.equal(order.modifiedTime, 900);
+
+  updateProtection(s, data, 95, 105);
+  assert.equal(order.stop, 95);
+  assert.equal(order.take, 105);
+  updateProtection(s, data, null, null);
+  assert.equal(order.stop, null);
+  assert.equal(order.take, null);
+  assert.equal(order.id, original.id);
+  assert.equal(order.fillPrice, original.fillPrice);
+  assert.equal(order.fillTime, original.fillTime);
+  assert.equal(order.entryReason, original.entryReason);
+  assert.equal(order.notional, original.notional);
+  assert.equal(order.entryPrice, original.entryPrice);
+  assert.equal(order.status, original.status);
+  assert.equal(s.position.orderId, id);
+  assert.equal(s.orderHistory.length, 1);
+  assert.equal(s.balance, INITIAL - result.position.entryFee);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+});
+
+test('protection synchronization changes only the filled order linked to the current position', () => {
+  const data = bars(5), s = session(data);
+  const first = placeOrder(s, data, 1, 1000, 100, null, null, 'market');
+  closePosition(s, data, undefined, 'finish first');
+  const second = placeOrder(s, data, -1, 1000, 100, null, null, 'market');
+  const beforeFirst = {...s.orderHistory[0]}, secondId = second.order.id;
+  updateProtection(s, data, null, 95);
+  assert.equal(s.position.orderId, secondId);
+  assert.equal(s.orderHistory[0].id, first.order.id);
+  assert.equal(s.orderHistory[0].stop, beforeFirst.stop);
+  assert.equal(s.orderHistory[0].take, beforeFirst.take);
+  assert.equal(s.orderHistory[0].modifiedTime, beforeFirst.modifiedTime);
+  assert.equal(s.orderHistory[1].id, secondId);
+  assert.equal(s.orderHistory[1].stop, null);
+  assert.equal(s.orderHistory[1].take, 95);
+  assert.equal(s.orderHistory[1].modifiedIndex, 0);
+  assert.equal(s.orderHistory[1].modifiedTime, 900);
+});
+
+test('invalid or ambiguous protection edits leave position and all order records unchanged', () => {
+  const data = bars(5), s = session(data);
+  placeOrder(s, data, 1, 1000, 100, null, null, 'market');
+  const beforeInvalid = JSON.stringify(s);
+  assert.throws(() => updateProtection(s, data, 101, null), /当前价格两侧/);
+  assert.equal(JSON.stringify(s), beforeInvalid);
+
+  s.orderHistory.push({...s.orderHistory[0]});
+  const beforeAmbiguous = JSON.stringify(s);
+  assert.throws(() => updateProtection(s, data, 95, null), /关联不唯一/);
+  assert.equal(JSON.stringify(s), beforeAmbiguous);
+});
+
+test('legacy positions without a matching filled order remain editable without creating history', () => {
+  const data = bars(5), s = session(data);
+  openPosition(s, data, 1, 1000, null, null);
+  updateProtection(s, data, 95, null);
+  assert.equal(s.position.stop, 95);
+  assert.equal(s.position.take, null);
+  assert.equal(s.orderHistory.length, 0);
+
+  s.position.orderId = 'missing-order';
+  updateProtection(s, data, null, 105);
+  assert.equal(s.position.stop, null);
+  assert.equal(s.position.take, 105);
+  assert.equal(s.orderHistory.length, 0);
+});
+
+test('reconcileOrderProtections repairs only unambiguous filled-order links and is idempotent', () => {
+  const data = bars(5), s = session(data);
+  const closed = placeOrder(s, data, 1, 1000, 100, null, null, 'market');
+  closePosition(s, data, undefined, 'close first');
+  const active = placeOrder(s, data, -1, 1000, 100, null, null, 'market');
+  // Simulate old saved records where the live position and closed trade had later protection edits.
+  s.trades[0].stop = 90; s.trades[0].take = 110;
+  s.position.stop = null; s.position.take = 105;
+  const firstRecord = s.orderHistory.find(order => order.id === closed.order.id);
+  const activeRecord = s.orderHistory.find(order => order.id === active.order.id);
+  const closedStable = Object.fromEntries(['id', 'status', 'entryPrice', 'fillPrice', 'fillIndex', 'fillTime', 'entryReason', 'placedTime'].map(key => [key, firstRecord?.[key]]));
+  const activeStable = Object.fromEntries(['id', 'status', 'entryPrice', 'fillPrice', 'fillIndex', 'fillTime', 'entryReason', 'placedTime'].map(key => [key, activeRecord?.[key]]));
+  assert.equal(firstRecord.stop, null);
+  assert.equal(activeRecord.take, null);
+
+  assert.equal(reconcileOrderProtections(s), true);
+  assert.equal(firstRecord.stop, 90);
+  assert.equal(firstRecord.take, 110);
+  assert.equal(activeRecord.stop, null);
+  assert.equal(activeRecord.take, 105);
+  assert.equal(Object.hasOwn(firstRecord, 'modifiedTime'), false);
+  assert.equal(Object.hasOwn(activeRecord, 'modifiedTime'), false);
+  for (const [key, value] of Object.entries(closedStable)) assert.equal(firstRecord[key], value);
+  for (const [key, value] of Object.entries(activeStable)) assert.equal(activeRecord[key], value);
+  activeRecord.stop = 96; activeRecord.take = 110;
+  assert.equal(reconcileOrderProtections(s), true);
+  assert.equal(activeRecord.stop, null); // A saved null is an intentional protection removal.
+  assert.equal(activeRecord.take, 105);
+  assert.equal(reconcileOrderProtections(s), false);
+
+  const ambiguous = session(data);
+  ambiguous.position = {...s.position, orderId: 'duplicate'};
+  ambiguous.orderHistory = [
+    {...activeRecord, id: 'duplicate', status: 'filled', stop: 1, take: 2},
+    {...activeRecord, id: 'duplicate', status: 'filled', stop: 3, take: 4}
+  ];
+  const before = JSON.stringify(ambiguous.orderHistory);
+  assert.equal(reconcileOrderProtections(ambiguous), false);
+  assert.equal(JSON.stringify(ambiguous.orderHistory), before);
 });
 
 test('market orders allow independent stop/take protection, including both disabled, for long and short', () => {
