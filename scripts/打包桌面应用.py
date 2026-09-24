@@ -18,6 +18,7 @@ DIST_FILES = (
     "app.mjs",
     "style.css",
     "engine.mjs",
+    "minute-data.mjs",
     "data/BTCUSDT.json",
     "data/ETHUSDT.json",
     "vendor/charts.mjs",
@@ -51,7 +52,11 @@ def main():
     app = temporary_parent / "K线回放.app"
     try:
         contents = app / "Contents"
-        shutil.copytree(templates, contents)
+        shutil.copytree(
+            templates,
+            contents,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
+        )
         shutil.copy2(ROOT / "README.md", contents / "Resources" / "README.md")
         for name in DIST_FILES:
             target = contents / "Resources" / "dist" / name

@@ -24,9 +24,68 @@ function assertCandle(data, index, message = '当前行情数据无效') {
   return c;
 }
 
-function intervalStart(timestamp, seconds) {
+export function intervalStart(timestamp, seconds) {
   if (seconds === WEEK) return Math.floor((timestamp - MONDAY_OFFSET) / WEEK) * WEEK + MONDAY_OFFSET;
   return Math.floor(timestamp / seconds) * seconds;
+}
+
+function formingIndex(session, data) {
+  if (!session?.forming15m) return -1;
+  const timestamp = session.forming15m[0];
+  let low = 0, high = data.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (data[mid]?.[0] < timestamp) low = mid + 1;
+    else high = mid;
+  }
+  return data[low]?.[0] === timestamp ? low : -1;
+}
+
+function visibleUpperIndex(session, data) {
+  const partialIndex = formingIndex(session, data);
+  return partialIndex >= 0 ? partialIndex : session?.cursor;
+}
+
+function timeMatchesIndex(time, index, data) {
+  return Number.isInteger(time) && time >= 0 && Number.isInteger(index) && index >= 0 && index < data.length &&
+    intervalStart(time - 1, BASE) === data[index][0];
+}
+
+function indexAtOpen(data, timestamp) {
+  let low = 0, high = data.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (data[mid]?.[0] < timestamp) low = mid + 1;
+    else high = mid;
+  }
+  return data[low]?.[0] === timestamp ? low : -1;
+}
+
+function latestCompletedIndex(data, start, end, beforeTime) {
+  let low = start, high = end + 1;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (data[mid][0] + BASE <= beforeTime) low = mid + 1;
+    else high = mid;
+  }
+  return Math.max(start - 1, low - 1);
+}
+
+export function replayPrice(session, data) {
+  if (Number.isFinite(session?.minuteCursorTime)) return session.currentPrice;
+  const c = candleAt(data, session?.cursor);
+  return c?.[4] ?? null;
+}
+
+export function replayTime(session, data) {
+  if (Number.isFinite(session?.minuteCursorTime)) return session.minuteCursorTime + 60;
+  const c = candleAt(data, session?.cursor);
+  return c ? c[0] + BASE : null;
+}
+
+export function replayEnded(session, data) {
+  if (!validIndexTriplet(session, data)) return true;
+  return session.cursor >= session.end && !session.forming15m;
 }
 
 function validIndexTriplet(s, data) {
@@ -70,11 +129,28 @@ export function validateSession(session, symbol, data) {
   if (!Object.hasOwn(session, 'position')) return false;
   if (!Number.isFinite(session.balance) || !Array.isArray(session.trades) || !VALID_TFS.has(session.tf)) return false;
   if (![session.start, session.cursor, session.end].every(i => candleAt(data, i))) return false;
+  if (Object.hasOwn(session, 'minuteCursorTime')) {
+    if (!Number.isInteger(session.minuteCursorTime) || session.minuteCursorTime < 0 || session.minuteCursorTime % 60 !== 0 ||
+        !Number.isFinite(session.currentPrice) || session.currentPrice <= 0 || !Object.hasOwn(session, 'forming15m')) return false;
+    if (session.forming15m !== null) {
+      const forming = session.forming15m, partialIndex = formingIndex(session, data);
+      if (!Array.isArray(forming) || !candleAt([forming], 0) || forming[0] % BASE !== 0 || partialIndex !== session.cursor + 1 || partialIndex > session.end ||
+          intervalStart(session.minuteCursorTime, BASE) !== forming[0] || session.minuteCursorTime < forming[0] ||
+          session.minuteCursorTime + 60 >= forming[0] + BASE || session.currentPrice !== forming[4]) return false;
+    } else {
+      const current = data[session.cursor];
+      if (intervalStart(session.minuteCursorTime, BASE) !== current[0] || session.minuteCursorTime + 60 < current[0] + BASE) return false;
+    }
+  } else if (session.forming15m !== undefined || session.currentPrice !== undefined) return false;
+  const visibleIndex = visibleUpperIndex(session, data);
+  if (!Number.isInteger(visibleIndex) || visibleIndex < session.cursor || visibleIndex > session.end) return false;
   const pending = session.pending ?? null;
   if (pending && (session.position || ![1, -1].includes(pending.side) || pending.type !== 'limit' ||
       ![pending.notional, pending.entryPrice].every(Number.isFinite) || !optionalPrice(pending.stop) || !optionalPrice(pending.take) || pending.notional <= 0 ||
       pending.entryPrice <= 0 || !Number.isInteger(pending.placedIndex) ||
-      pending.placedIndex < session.start || pending.placedIndex > session.cursor || typeof pending.id !== 'string' ||
+      pending.placedIndex < session.start || pending.placedIndex > visibleIndex || typeof pending.id !== 'string' ||
+      (pending.placedTime !== undefined && (!timeMatchesIndex(pending.placedTime, pending.placedIndex, data) || pending.placedTime > replayTime(session, data))) ||
+      (pending.modifiedTime !== undefined && (!timeMatchesIndex(pending.modifiedTime, pending.modifiedIndex, data) || pending.modifiedTime > replayTime(session, data))) ||
       !optionalSavedEntryReason(pending.entryReason) ||
       pending.notional * (1 + FEE) > session.balance + 1e-8 ||
       !protectionsBracket(pending.side, pending.entryPrice, pending.stop, pending.take))) return false;
@@ -83,17 +159,23 @@ export function validateSession(session, symbol, data) {
     if (!p || ![1, -1].includes(p.side) || ![p.entry, p.qty, p.notional, p.entryFee].every(Number.isFinite) ||
         !optionalPrice(p.stop) || !optionalPrice(p.take) || !storedPercent(p.stopPct) || !storedPercent(p.takePct) ||
         !optionalSavedEntryReason(p.entryReason) || p.entry <= 0 || p.qty <= 0 || p.notional <= 0 || p.entryFee < 0 ||
-        !Number.isInteger(p.entryIndex) || p.entryIndex < session.start || p.entryIndex > session.cursor || p.entryIndex > session.end || !candleAt(data, p.entryIndex)) return false;
+        !Number.isInteger(p.entryIndex) || p.entryIndex < session.start || p.entryIndex > visibleIndex || p.entryIndex > session.end || !candleAt(data, p.entryIndex) ||
+        (p.entryTime !== undefined && (!timeMatchesIndex(p.entryTime, p.entryIndex, data) || p.entryTime > replayTime(session, data)))) return false;
   }
   if (session.orderHistory !== undefined && (!Array.isArray(session.orderHistory) || !session.orderHistory.every(o => o &&
       ['filled', 'cancelled'].includes(o.status) && ['limit', 'market'].includes(o.type) && typeof o.id === 'string' && [o.side, o.notional, o.entryPrice].every(Number.isFinite) &&
       optionalSavedEntryReason(o.entryReason) &&
+      (o.placedTime === undefined || timeMatchesIndex(o.placedTime, o.placedIndex, data) && o.placedTime <= replayTime(session, data)) &&
+      (o.fillTime === undefined || timeMatchesIndex(o.fillTime, o.fillIndex, data) && o.fillTime <= replayTime(session, data)) &&
       [1, -1].includes(o.side) && o.notional > 0 && o.entryPrice > 0 && (o.status !== 'filled' ||
-        [o.fillIndex, o.fillPrice].every(Number.isFinite) && o.fillIndex >= session.start && o.fillIndex <= session.cursor && o.fillPrice > 0) &&
-      (o.status !== 'cancelled' || Number.isInteger(o.cancelledIndex) && o.cancelledIndex >= session.start && o.cancelledIndex <= session.cursor)))) return false;
+        [o.fillIndex, o.fillPrice].every(Number.isFinite) && o.fillIndex >= session.start && o.fillIndex <= visibleIndex && o.fillPrice > 0) &&
+      (o.status !== 'cancelled' || Number.isInteger(o.cancelledIndex) && o.cancelledIndex >= session.start && o.cancelledIndex <= visibleIndex &&
+        (o.cancelledTime === undefined || timeMatchesIndex(o.cancelledTime, o.cancelledIndex, data) && o.cancelledTime <= replayTime(session, data)))))) return false;
   return session.trades.every(t => t && optionalSavedEntryReason(t.entryReason) && [t.pnl, t.fees, t.entry, t.exit, t.qty].every(Number.isFinite) &&
+    (t.entryTime === undefined || timeMatchesIndex(t.entryTime, t.entryIndex, data) && t.entryTime <= replayTime(session, data)) &&
+    (t.exitTime === undefined || timeMatchesIndex(t.exitTime, t.exitIndex, data) && t.exitTime <= replayTime(session, data)) &&
     t.entry > 0 && t.exit > 0 && t.qty > 0 && Number.isInteger(t.entryIndex) && Number.isInteger(t.exitIndex) &&
-    t.entryIndex >= session.start && t.entryIndex <= t.exitIndex && t.exitIndex <= session.cursor &&
+    t.entryIndex >= session.start && t.entryIndex <= t.exitIndex && t.exitIndex <= visibleIndex &&
     !!candleAt(data, t.entryIndex) && !!candleAt(data, t.exitIndex));
 }
 
@@ -155,6 +237,84 @@ export function aggregate(data, cursor, seconds, from = 0) {
   return out;
 }
 
+export function aggregateReplay(session, data, seconds, from = 0) {
+  if (!session || !Array.isArray(data) || !VALID_TFS.has(seconds) || !validIndexTriplet(session, data)) return [];
+  const out = aggregate(data, session.cursor, seconds, from);
+  const forming = session.forming15m;
+  if (!forming) return out;
+  const time = intervalStart(forming[0], seconds), last = out.at(-1);
+  if (last?.time === time) {
+    last.high = Math.max(last.high, forming[2]);
+    last.low = Math.min(last.low, forming[3]);
+    last.close = forming[4];
+    last.volume += forming[5];
+  } else out.push({time, open: forming[1], high: forming[2], low: forming[3], close: forming[4], volume: forming[5]});
+  return out;
+}
+
+export function advanceMinute(session, minuteBar, data) {
+  if (!validateSession(session, session?.symbol, data)) throw new Error('本轮行情范围无效');
+  if (replayEnded(session, data)) return {ended: true, trade: null, orderFilled: null, orderCancelled: null};
+  if (!Array.isArray(minuteBar) || !candleAt([minuteBar], 0) || !Number.isInteger(minuteBar[0]) || minuteBar[0] % 60 !== 0)
+    throw new Error('分钟行情无效');
+
+  const time = minuteBar[0], previousCloseTime = replayTime(session, data), previousMinute = session.minuteCursorTime;
+  if (!Number.isFinite(previousCloseTime) || time < previousCloseTime || (previousMinute !== undefined && time < previousMinute + 60))
+    throw new Error('分钟行情重复、逆序或早于已披露时刻');
+  const endTime = data[session.end][0] + BASE;
+  if (time + 60 > endTime) throw new Error('分钟行情超出本轮范围');
+
+  const parentTime = intervalStart(time, BASE), parentIndex = indexAtOpen(data, parentTime);
+  if (parentIndex < session.start || parentIndex > session.end) throw new Error('分钟行情缺少对应15分钟K线');
+
+  // Work on a clone so a bad minute or failed match can never leave half-updated cash/order/cursor state.
+  const next = structuredClone(session);
+  const beforeIndex = next.cursor;
+  const completedBefore = latestCompletedIndex(data, next.start, next.end, time);
+  if (completedBefore > next.cursor) next.cursor = completedBefore;
+  if (next.forming15m && next.forming15m[0] !== parentTime) next.forming15m = null;
+  if (next.cursor >= parentIndex) throw new Error('分钟行情已落在完整K线范围内');
+
+  const oldPartial = next.forming15m;
+  next.forming15m = oldPartial
+    ? [parentTime, oldPartial[1], Math.max(oldPartial[2], minuteBar[2]), Math.min(oldPartial[3], minuteBar[3]), minuteBar[4], oldPartial[5] + minuteBar[5]]
+    : [parentTime, minuteBar[1], minuteBar[2], minuteBar[3], minuteBar[4], minuteBar[5]];
+  next.minuteCursorTime = time;
+  next.currentPrice = minuteBar[4];
+  const eventTime = time + 60, eventIndex = parentIndex;
+  const minuteCandle = [...minuteBar];
+  const completed15m = time + 60 >= parentTime + BASE;
+  if (completed15m) {
+    next.cursor = parentIndex;
+    next.forming15m = null;
+  }
+  let trade = null, orderFilled = null, orderCancelled = null, entryBar = false;
+
+  if (next.pending) {
+    const pending = next.pending;
+    const fillPrice = pendingFillPrice(pending, minuteCandle);
+    if (fillPrice !== null) {
+      next.pending = null;
+      positionAtPrice(next, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, eventIndex,
+        pending.id, pending.entryReason, eventTime);
+      orderFilled = recordFilledOrder(next, pending, eventIndex, fillPrice, eventTime);
+      entryBar = true;
+    }
+  }
+  if (next.position) trade = exitPositionOnBar(next, data, minuteCandle, eventIndex, entryBar);
+
+  if (next.cursor >= next.end && !next.forming15m) {
+    if (next.position) trade = closePosition(next, data, next.currentPrice, '本轮结束', next.cursor);
+    if (next.pending) orderCancelled = cancelOrder(next, '本轮结束未成交');
+  }
+  if (!validateSession(next, next.symbol, data)) throw new Error('分钟推进后状态校验失败');
+  Object.assign(session, next);
+  const currentTimeframeBoundary = intervalStart(previousCloseTime, session.tf) !== intervalStart(eventTime, session.tf);
+  return {ended: replayEnded(session, data), minuteTime: time, replayTime: eventTime, currentPrice: minuteBar[4],
+    forming15m: session.forming15m, completed15m, currentTimeframeBoundary, advanced15m: session.cursor - beforeIndex,
+    trade, orderFilled, orderCancelled};
+}
+
 export function openPosition(s, data, side, notional, stopPct, takePct, entryReason = '') {
   const normalizedReason = normalizeEntryReason(entryReason);
   if (!validIndexTriplet(s, data)) throw new Error('本轮行情范围无效');
@@ -166,12 +326,13 @@ export function openPosition(s, data, side, notional, stopPct, takePct, entryRea
   if (!Number.isFinite(notional) || notional <= 0 || !optionalPercent(stopPct) || !optionalPercent(takePct))
     throw new Error('请输入有效金额和止盈止损距离（0到50%）；关闭保护请传null');
   if (!Number.isFinite(s.balance) || s.balance < 0 || notional * (1 + FEE) > s.balance) throw new Error('下单金额加手续费不能超过可用余额');
-  const c = assertCandle(data, s.cursor);
-  const entry = c[4] * (1 + side * SLIP);
+  const c = assertCandle(data, s.cursor), currentPrice = replayPrice(s, data), entry = currentPrice * (1 + side * SLIP);
   const entryFee = notional * FEE;
-  s.position = {side, entry, qty: notional / entry, notional, entryFee, entryIndex: s.cursor,
+  const entryIndex = visibleUpperIndex(s, data);
+  s.position = {side, entry, qty: notional / entry, notional, entryFee, entryIndex,
     stop: stopPct === null ? null : entry * (1 - side * stopPct / 100),
-    take: takePct === null ? null : entry * (1 + side * takePct / 100), stopPct, takePct, entryReason: normalizedReason};
+    take: takePct === null ? null : entry * (1 + side * takePct / 100), stopPct, takePct, entryReason: normalizedReason,
+    entryTime: replayTime(s, data)};
   s.balance -= entryFee;
   return s.position;
 }
@@ -185,20 +346,21 @@ function validateOrderPlan(s, side, notional, entryPrice, stopPrice, takePrice) 
     throw new Error('下单金额加手续费不能超过可用余额');
 }
 
-function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, index, orderId = null, entryReason = undefined) {
+function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, index, orderId = null, entryReason = undefined, entryTime = undefined) {
   const entryFee = notional * FEE;
   const position = {side, entry: fillPrice, qty: notional / fillPrice, notional, entryFee, entryIndex: index,
     stop: stopPrice, take: takePrice,
     stopPct: stopPrice === null ? null : Math.abs((fillPrice - stopPrice) / fillPrice * 100),
-    takePct: takePrice === null ? null : Math.abs((takePrice - fillPrice) / fillPrice * 100), orderId};
+    takePct: takePrice === null ? null : Math.abs((takePrice - fillPrice) / fillPrice * 100), orderId,
+    entryTime: entryTime ?? (data[index]?.[0] + BASE)};
   if (entryReason !== undefined) position.entryReason = entryReason;
   s.position = position;
   s.balance -= entryFee;
   return position;
 }
 
-function recordFilledOrder(s, order, fillIndex, fillPrice) {
-  const record = {...order, status: 'filled', fillIndex, fillPrice};
+function recordFilledOrder(s, order, fillIndex, fillPrice, fillTime = undefined) {
+  const record = {...order, status: 'filled', fillIndex, fillPrice, ...(fillTime === undefined ? {} : {fillTime})};
   s.orderHistory ??= [];
   s.orderHistory.push(record);
   return record;
@@ -212,11 +374,11 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
   if (s.position || s.pending) throw new Error('请先处理当前仓位或挂单');
   if (s.cursor >= s.end) throw new Error('本轮已结束，请开启新一轮');
   if (!['market', 'limit'].includes(orderType)) throw new Error('订单类型无效');
-  const currentPrice = assertCandle(data, s.cursor)[4];
+  const currentPrice = replayPrice(s, data), eventIndex = visibleUpperIndex(s, data), eventTime = replayTime(s, data);
   const planPrice = orderType === 'market' ? currentPrice : entryPrice;
   validateOrderPlan(s, side, notional, planPrice, stopPrice, takePrice);
   const order = {id: crypto.randomUUID(), side, notional, entryPrice: planPrice, stop: stopPrice, take: takePrice,
-    type: orderType, placedIndex: s.cursor, entryReason: normalizedReason};
+    type: orderType, placedIndex: eventIndex, placedTime: eventTime, entryReason: normalizedReason};
   const marketableLimit = orderType === 'limit' && (side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice);
   if (orderType === 'market' || marketableLimit) {
     const slippedMarket = currentPrice * (1 + side * SLIP);
@@ -224,8 +386,8 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
       side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
     // Immediate fills must leave both protections on the correct side of fill.
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
-    const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, s.cursor, order.id, normalizedReason);
-    const filled = recordFilledOrder(s, order, s.cursor, fillPrice);
+    const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, eventIndex, order.id, normalizedReason, eventTime);
+    const filled = recordFilledOrder(s, order, eventIndex, fillPrice, eventTime);
     return {status: 'filled', order: filled, position};
   }
   const pending = {...order};
@@ -236,7 +398,9 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
 
 export function cancelOrder(s, reason = '用户撤单') {
   if (!s?.pending) return null;
-  const cancelled = {...s.pending, status: 'cancelled', reason, cancelledIndex: s.cursor};
+  const cancelledIndex = s.forming15m ? s.cursor + 1 : s.cursor;
+  const cancelled = {...s.pending, status: 'cancelled', reason, cancelledIndex,
+    ...(Number.isInteger(s.minuteCursorTime) ? {cancelledTime: s.minuteCursorTime + 60} : {})};
   s.orderHistory ??= [];
   s.orderHistory.push(cancelled);
   s.pending = null;
@@ -247,16 +411,16 @@ export function updatePendingOrder(s, data, entryPrice, stopPrice, takePrice) {
   if (!validateSession(s, s?.symbol, data) || !s.pending) throw new Error('当前没有有效挂单');
   if (s.cursor >= s.end) throw new Error('本轮已结束，请开启新一轮');
   validateOrderPlan(s, s.pending.side, s.pending.notional, entryPrice, stopPrice, takePrice);
-  const currentPrice = assertCandle(data, s.cursor)[4], side = s.pending.side;
-  const updated = {...s.pending, entryPrice, stop: stopPrice, take: takePrice, modifiedIndex: s.cursor};
+  const currentPrice = replayPrice(s, data), side = s.pending.side, eventIndex = visibleUpperIndex(s, data), eventTime = replayTime(s, data);
+  const updated = {...s.pending, entryPrice, stop: stopPrice, take: takePrice, modifiedIndex: eventIndex, modifiedTime: eventTime};
   const marketable = side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice;
   if (marketable) {
     const slippedMarket = currentPrice * (1 + side * SLIP);
     const fillPrice = side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
     s.pending = null;
-    const position = positionAtPrice(s, data, side, updated.notional, fillPrice, stopPrice, takePrice, s.cursor, updated.id, updated.entryReason);
-    const filled = recordFilledOrder(s, updated, s.cursor, fillPrice);
+    const position = positionAtPrice(s, data, side, updated.notional, fillPrice, stopPrice, takePrice, eventIndex, updated.id, updated.entryReason, eventTime);
+    const filled = recordFilledOrder(s, updated, eventIndex, fillPrice, eventTime);
     return {status: 'filled', order: filled, position};
   }
   s.pending = updated;
@@ -266,7 +430,7 @@ export function updatePendingOrder(s, data, entryPrice, stopPrice, takePrice) {
 export function updateProtection(s, data, stopPrice, takePrice) {
   if (!validateSession(s, s?.symbol, data) || !s.position) throw new Error('当前没有有效持仓');
   if (!optionalPrice(stopPrice) || !optionalPrice(takePrice)) throw new Error('保护价格无效；关闭保护请传null');
-  const price = assertCandle(data, s.cursor)[4], p = s.position;
+  const price = replayPrice(s, data), p = s.position;
   if (!protectionsBracket(p.side, price, stopPrice, takePrice)) throw new Error('止盈止损必须分列在当前价格两侧');
   p.stop = stopPrice; p.take = takePrice;
   p.stopPct = stopPrice === null ? null : Math.abs((p.entry - stopPrice) / p.entry * 100);
@@ -309,18 +473,22 @@ function exitPositionOnBar(s, data, c, index, entryBar = false) {
   return null;
 }
 
-export function closePosition(s, data, price, reason = '手动平仓', index = s?.cursor) {
+export function closePosition(s, data, price, reason = '手动平仓', index = undefined) {
   if (!s?.position) return null;
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
-  if (price === undefined) price = assertCandle(data, index)[4];
-  if (!Number.isFinite(price) || !Number.isInteger(index) || index < s.position.entryIndex || index > s.cursor || index >= data.length || price <= 0) throw new Error('平仓价格或行情索引无效');
+  index ??= visibleUpperIndex(s, data);
+  if (price === undefined) price = replayPrice(s, data);
+  if (!Number.isFinite(price) || !Number.isInteger(index) || index < s.position.entryIndex || index > visibleUpperIndex(s, data) || index >= data.length || price <= 0) throw new Error('平仓价格或行情索引无效');
   const c = assertCandle(data, index);
   const p = s.position;
   const exit = price * (1 - p.side * SLIP);
   const exitFee = exit * p.qty * FEE;
   const gross = (exit - p.entry) * p.qty * p.side;
-  const trade = {...p, id: crypto.randomUUID(), exit, exitIndex: index, exitTime: c[0] + BASE,
-    entryTime: assertCandle(data, p.entryIndex)[0] + BASE, pnl: gross - p.entryFee - exitFee, fees: p.entryFee + exitFee, reason};
+  const legacyExitTime = c[0] + BASE;
+  const trade = {...p, id: crypto.randomUUID(), exit, exitIndex: index,
+    exitTime: Number.isInteger(s.minuteCursorTime) ? replayTime(s, data) : legacyExitTime,
+    entryTime: p.entryTime ?? assertCandle(data, p.entryIndex)[0] + BASE,
+    pnl: gross - p.entryFee - exitFee, fees: p.entryFee + exitFee, reason};
   s.balance += gross - exitFee;
   s.trades.push(trade);
   s.position = null;
@@ -331,6 +499,7 @@ export function closePosition(s, data, price, reason = '手动平仓', index = s
 // gaps fill from the bar open. Playback pauses at the exit for review.
 export function advance(s, data) {
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
+  if (Object.hasOwn(s, 'minuteCursorTime')) throw new Error('分钟回放状态请使用advanceMinute推进');
   if (s.cursor >= s.end) {
     const orderCancelled = s.pending ? cancelOrder(s, '本轮结束未成交') : null;
     return {ended: true, trade: null, orderFilled: null, orderCancelled};
@@ -349,8 +518,9 @@ export function advance(s, data) {
       const fillPrice = pendingFillPrice(pending, c);
       if (fillPrice !== null) {
         s.pending = null;
-        positionAtPrice(s, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, i, pending.id, pending.entryReason);
-        orderFilled = recordFilledOrder(s, pending, i, fillPrice);
+        const fillTime = c[0] + BASE;
+        positionAtPrice(s, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, i, pending.id, pending.entryReason, fillTime);
+        orderFilled = recordFilledOrder(s, pending, i, fillPrice, fillTime);
         entryBar = true;
       }
     }
@@ -365,7 +535,8 @@ export function advance(s, data) {
 export function metrics(s, data) {
   if (!validIndexTriplet(s, data)) throw new Error('本轮行情范围无效');
   const p = s.position;
-  const price = assertCandle(data, s.cursor)[4];
+  const price = replayPrice(s, data);
+  if (!Number.isFinite(price) || price <= 0) throw new Error('当前披露价格无效');
   const estimatedExit = price * (1 - (p?.side ?? 1) * SLIP);
   const unreal = p ? (estimatedExit - p.entry) * p.qty * p.side - estimatedExit * p.qty * FEE : 0;
   const equity = s.balance + unreal;

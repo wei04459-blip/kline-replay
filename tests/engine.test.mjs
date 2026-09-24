@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, aggregate, cancelOrder, closePosition, createSession, FEE, INITIAL, LENGTH, metrics, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, FEE, INITIAL, intervalStart, LENGTH, metrics, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
 
 const TEST_ENTRY_REASON = '测试入场理由';
 function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
@@ -647,4 +647,200 @@ test('legacy trades and pending orders without entryReason remain manageable and
   assert.equal(Object.hasOwn(closed, 'entryReason'), false);
   assert.equal(closed.reason, 'legacy manual close');
   assert.equal(validateSession(JSON.parse(JSON.stringify(legacy)), 'BTCUSDT', data), true);
+});
+
+test('minute replay grows partial OHLCV without leaking the official future 15m candle across all timeframes', () => {
+  const monday = 4 * 86400, data = [
+    [monday - 900, 100, 101, 99, 100, 10],
+    [monday, 100, 999, 1, 900, 9999],
+    [monday + 900, 100, 101, 99, 100, 10]
+  ];
+  const s = session(data, {end: 2});
+  const firstMinute = [monday, 100, 110, 95, 108, 3];
+  const step = advanceMinute(s, firstMinute, data);
+  assert.equal(step.completed15m, false);
+  assert.equal(s.cursor, 0);
+  assert.equal(s.minuteCursorTime, monday);
+  assert.equal(s.currentPrice, 108);
+  assert.deepEqual(s.forming15m, [monday, 100, 110, 95, 108, 3]);
+  assert.equal(replayPrice(s, data), 108);
+  assert.equal(replayTime(s, data), monday + 60);
+  for (const tf of [900, 1800, 2700, 3600, 14400, 86400, 604800]) {
+    const out = aggregateReplay(s, data, tf, 0);
+    assert.equal(out.at(-1).time, intervalStart(monday, tf));
+    assert.equal(out.at(-1).close, 108);
+    assert.ok(out.at(-1).high < 999);
+    assert.ok(out.at(-1).low > 1);
+    assert.equal(out.at(-1).volume, 3);
+  }
+  const sameMinute = JSON.stringify(s);
+  assert.throws(() => advanceMinute(s, firstMinute, data), /重复|逆序/);
+  assert.equal(JSON.stringify(s), sameMinute);
+  assert.throws(() => advance(s, data), /advanceMinute/);
+});
+
+test('15m boundary finalizes only after minute close and records same-minute exit exactly', () => {
+  const data = bars(4), s = session(data, {end: 3, tf: 900});
+  const opened = placeOrder(s, data, 1, 1000, 100, 95, 105, 'market');
+  assert.equal(opened.position.entryTime, data[0][0] + 900);
+  let result;
+  for (let i = 0; i < 14; i++) {
+    result = advanceMinute(s, [900 + i * 60, 100, 101, 99, 100, 1], data);
+    assert.equal(result.trade, null);
+    assert.equal(result.completed15m, false);
+  }
+  result = advanceMinute(s, [1740, 100, 106, 90, 96, 1], data);
+  assert.equal(result.completed15m, true);
+  assert.equal(result.currentTimeframeBoundary, true);
+  assert.equal(s.cursor, 1);
+  assert.equal(s.forming15m, null);
+  assert.equal(result.trade.reason, '双触发，按止损');
+  assert.equal(result.trade.entryIndex, 0);
+  assert.equal(result.trade.exitIndex, 1);
+  assert.equal(result.trade.entryTime, 900);
+  assert.equal(result.trade.exitTime, 1800);
+  assert.equal(replayTime(s, data), 1800);
+});
+
+test('15m final minute can fill a pending limit and conservatively stop it on the same minute', () => {
+  const data = bars(4), s = session(data, {end: 3, tf: 900});
+  const placed = placeOrder(s, data, 1, 1000, 95, 92, null, 'limit');
+  assert.equal(placed.status, 'pending');
+  for (let i = 0; i < 14; i++) advanceMinute(s, [900 + i * 60, 100, 101, 99, 100, 1], data);
+  const result = advanceMinute(s, [1740, 90, 95, 89, 92, 1], data);
+  assert.equal(result.completed15m, true);
+  assert.ok(result.orderFilled);
+  assert.equal(result.orderFilled.fillIndex, 1);
+  assert.equal(result.orderFilled.fillTime, 1800);
+  assert.equal(result.trade.reason, '跳空止损');
+  assert.equal(result.trade.entryIndex, 1);
+  assert.equal(result.trade.exitIndex, 1);
+  assert.equal(result.trade.entryTime, 1800);
+  assert.equal(result.trade.exitTime, 1800);
+  assert.equal(s.position, null);
+});
+
+test('one-minute limit entry that touches both protections exits at the stop conservatively', () => {
+  const data = bars(4), s = session(data, {end: 3, tf: 900});
+  placeOrder(s, data, 1, 1000, 95, 90, 105, 'limit');
+  const result = advanceMinute(s, [900, 100, 110, 89, 100, 5], data);
+  assert.ok(result.orderFilled);
+  assert.equal(result.trade.reason, '双触发，按止损');
+  assert.equal(result.trade.exit, s.trades[0].stop * (1 - SLIP));
+  assert.equal(result.trade.entryTime, 960);
+  assert.equal(result.trade.exitTime, 960);
+  assert.equal(s.position, null);
+});
+
+test('minute market orders, metrics, protection and manual close use the latest disclosed minute price and time', () => {
+  const data = bars(4), s = session(data, {end: 3});
+  advanceMinute(s, [900, 100, 110, 95, 108, 3], data);
+  assert.equal(replayPrice(s, data), 108);
+  const placed = enginePlaceOrder(s, data, 1, 1000, 108, null, null, 'market', 'minute close');
+  assert.equal(placed.position.entry, 108 * (1 + SLIP));
+  assert.equal(placed.position.entryIndex, 1);
+  assert.equal(placed.position.entryTime, 960);
+  assert.ok(metrics(s, data).unreal < 0);
+  assert.equal(updateProtection(s, data, 100, null).stop, 100);
+  const trade = closePosition(s, data, undefined, 'manual minute close');
+  assert.equal(trade.exit, 108 * (1 - SLIP));
+  assert.equal(trade.exitIndex, 1);
+  assert.equal(trade.exitTime, 960);
+  assert.equal(trade.entryTime, 960);
+});
+
+test('crossing a missing 1m tail finalizes the closed 15m once then gaps to next real minute open', () => {
+  const t = Date.UTC(2023, 2, 24, 12, 15) / 1000;
+  const data = [
+    [t, 100, 101, 99, 100, 10],
+    [t + 900, 100, 101, 99, 100, 100],
+    [t + 105 * 60, 80, 85, 75, 82, 20]
+  ];
+  const s = session(data, {end: 2, tf: 900});
+  placeOrder(s, data, 1, 1000, 100, 95, null, 'market');
+  for (let i = 0; i < 10; i++) advanceMinute(s, [t + 900 + i * 60, 100, 101, 99, 100, 10], data);
+  assert.equal(s.cursor, 0);
+  assert.equal(s.forming15m[0], t + 900);
+  const result = advanceMinute(s, [t + 105 * 60, 80, 85, 75, 82, 20], data);
+  assert.equal(s.cursor, 1); // The known 12:30 15m row is now complete.
+  assert.equal(s.forming15m[0], t + 105 * 60); // Start a new partial at 14:00; do not fabricate the gap.
+  assert.equal(result.advanced15m, 1);
+  assert.equal(result.trade.reason, '跳空止损');
+  assert.equal(result.trade.exit, 80 * (1 - SLIP));
+  assert.equal(result.trade.exitIndex, 2);
+  assert.equal(result.trade.exitTime, t + 105 * 60 + 60);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+  const nextRealMinute = advanceMinute(s, [t + 105 * 60 + 60, 82, 84, 81, 83, 5], data);
+  assert.equal(nextRealMinute.advanced15m, 0);
+  assert.equal(nextRealMinute.trade, null);
+  assert.equal(s.cursor, 1);
+  const saved = JSON.stringify(s);
+  assert.throws(() => advanceMinute(s, [t + 105 * 60, 80, 85, 75, 82, 20], data), /重复|逆序/);
+  assert.equal(JSON.stringify(s), saved);
+});
+
+test('cancelling a pending order during a partial 15m candle records visible index and exact time', () => {
+  const data = bars(4), s = session(data, {end: 3, tf: 900});
+  advanceMinute(s, [900, 100, 101, 99, 100, 1], data);
+  const placed = placeOrder(s, data, 1, 1000, 90, null, null, 'limit');
+  assert.equal(placed.order.placedIndex, 1);
+  assert.equal(placed.order.placedTime, 960);
+  const cancelled = cancelOrder(s, '撤销计划');
+  assert.equal(cancelled.cancelledIndex, 1);
+  assert.equal(cancelled.cancelledTime, 960);
+  assert.equal(cancelled.reason, '撤销计划');
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+  const afterCancel = advanceMinute(s, [960, 100, 110, 80, 90, 1], data);
+  assert.equal(afterCancel.orderFilled, null);
+  assert.equal(s.pending, null);
+  assert.equal(s.orderHistory.at(-1).cancelledIndex, 1);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+});
+
+test('old 15m sessions start minute replay after the disclosed close and minute restore remains valid', () => {
+  const data = bars(5), legacy = session(data, {end: 4, tf: 900});
+  assert.equal(Object.hasOwn(legacy, 'minuteCursorTime'), false);
+  assert.equal(replayTime(legacy, data), data[0][0] + 900);
+  assert.equal(replayPrice(legacy, data), data[0][4]);
+  const first = advanceMinute(legacy, [900, 100, 102, 99, 101, 5], data);
+  assert.equal(first.minuteTime, 900);
+  assert.equal(first.replayTime, 960);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(legacy)), 'BTCUSDT', data), true);
+  assert.equal(replayEnded(legacy, data), false);
+});
+
+test('minute replay settles once on the final completed 15m and then remains ended', () => {
+  const data = bars(3), s = session(data, {end: 1, tf: 900});
+  placeOrder(s, data, 1, 1000, 100, null, null, 'market');
+  let result;
+  for (let i = 0; i < 15; i++) result = advanceMinute(s, [900 + i * 60, 100, 103, 99, 100 + i / 10, 1], data);
+  assert.equal(result.ended, true);
+  assert.equal(result.completed15m, true);
+  assert.equal(s.cursor, 1);
+  assert.equal(s.forming15m, null);
+  assert.equal(s.position, null);
+  assert.equal(s.trades.length, 1);
+  assert.equal(s.trades[0].reason, '本轮结束');
+  assert.equal(s.trades[0].exitTime, 1800);
+  assert.equal(replayEnded(s, data), true);
+  const snapshot = JSON.stringify(s);
+  assert.equal(advanceMinute(s, [1800, 101, 102, 100, 101, 1], data).ended, true);
+  assert.equal(JSON.stringify(s), snapshot);
+});
+
+test('pending minute order is cancelled exactly once when the final 15m completes', () => {
+  const data = bars(3), s = session(data, {end: 1, tf: 900});
+  placeOrder(s, data, 1, 1000, 90, 85, null, 'limit');
+  let result;
+  for (let i = 0; i < 15; i++) result = advanceMinute(s, [900 + i * 60, 100, 103, 99, 100, 1], data);
+  assert.equal(result.ended, true);
+  assert.equal(result.orderFilled, null);
+  assert.equal(result.orderCancelled.status, 'cancelled');
+  assert.equal(result.orderCancelled.cancelledIndex, 1);
+  assert.equal(result.orderCancelled.cancelledTime, 1800);
+  assert.equal(s.orderHistory.length, 1);
+  assert.equal(s.pending, null);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+  assert.equal(advanceMinute(s, null, data).ended, true);
+  assert.equal(s.orderHistory.length, 1);
 });

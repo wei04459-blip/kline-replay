@@ -36,3 +36,4 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .trade-buttons .sell.selected{background:#803b45;color:#fff5f6;border-color:#ff9aa3;box-shadow:inset 0 0 0 1px #ff9aa344}
 .trade-buttons button:disabled{box-shadow:none}
 .chart-options .ma10-option input{accent-color:#65a9ff}.chart-options .ma10-option{color:#9cc8ff}.chart-options .ma20-option input{accent-color:#e6ba69}
+.minute-note{flex-shrink:0;padding:4px 14px 7px;color:#829094;font-size:12px;border-top:1px solid #202629}.cancel-advance,.retry-minute{padding:4px 7px;font-size:12px;white-space:nowrap}.cancel-advance{color:#f0cf88}.retry-minute{color:#a9d2ff}.cancel-advance[hidden],.retry-minute[hidden]{display:none}

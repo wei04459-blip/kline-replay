@@ -4,6 +4,8 @@ set -eu
 cd "$(dirname "$0")"
 KLINE_PORT=8765
 KLINE_PID_FILE="/tmp/kline-practice-$(id -u)-${KLINE_PORT}.pid"
+SERVE_SCRIPT="$PWD/macos/Contents/Resources/serve.py"
+DIST_DIR="$PWD/dist"
 
 if [ ! -f "$KLINE_PID_FILE" ]; then
   echo "没有找到启动器记录的练习场服务。手动在终端启动的服务请回到该终端按 Control-C。"
@@ -18,18 +20,15 @@ if ! [[ "$KLINE_SERVER_PID" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-if python3 - "$KLINE_SERVER_PID" "$KLINE_PORT" "$PWD/dist" "$KLINE_PID_FILE" <<'PY'
+if /usr/bin/python3 - "$KLINE_SERVER_PID" "$SERVE_SCRIPT" "$KLINE_PORT" "$DIST_DIR" "$KLINE_PID_FILE" <<'PY'
 import os
 import signal
 import subprocess
 import sys
 import time
 
-pid = int(sys.argv[1])
-port = sys.argv[2]
-directory = sys.argv[3]
-pid_file = sys.argv[4]
-expected = f"-m http.server {port} --bind 127.0.0.1 --directory {directory}"
+pid, script, port, directory, pid_file = int(sys.argv[1]), *sys.argv[2:]
+expected = f"{script} --bind 127.0.0.1 --port {port} --directory {directory}"
 
 def command_line():
     result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
