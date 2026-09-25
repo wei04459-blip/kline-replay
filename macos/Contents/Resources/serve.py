@@ -42,7 +42,7 @@ class Handler(SimpleHTTPRequestHandler):
                 body = body.replace(b"./style.css", f"./style.css?v={self.asset_version}".encode())
                 body = body.replace(b"./app.mjs", f"./app.mjs?v={self.asset_version}".encode())
             else:
-                pattern = re.compile(rb"(['\"])[.]\/(engine|minute-data)[.]mjs\1")
+                pattern = re.compile(rb"(['\"])[.]\/(engine|minute-data|drawings)[.]mjs\1")
                 body = pattern.sub(lambda match: match.group(1) + b"./" + match.group(2) + b".mjs?v=" + self.asset_version.encode() + match.group(1), body)
             self.send_response(200)
             self.send_header("Content-Type", self.guess_type(file_name))
@@ -94,6 +94,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Expires", "0")
 
         self.send_header("X-Kline-Replay-App", APP_ID)
+        self.send_header("X-Kline-Replay-Version", self.asset_version)
         super().end_headers()
 
 
@@ -106,7 +107,7 @@ def create_server(bind: str, port: int, directory: str | Path, cache_directory: 
     if bind_address != ipaddress.IPv4Address("127.0.0.1"):
         raise ValueError("服务只允许绑定 127.0.0.1。")
     version_digest = hashlib.sha256()
-    for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs"):
+    for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs", "drawings.mjs"):
         path = Path(directory) / name
         if path.is_file():
             version_digest.update(name.encode())

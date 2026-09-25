@@ -54,3 +54,20 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .leverage-estimates strong{font:11px var(--mono);font-variant-numeric:tabular-nums;color:#dce4e6;overflow-wrap:anywhere}
 .leverage-estimates .liquidation-value{color:#ed9299}
 @media(max-width:600px){.leverage-presets{gap:3px}.leverage-presets button{font-size:10px;padding:6px 0}.leverage-estimates{padding:8px;gap:6px 8px}}
+
+/* Chart geometry is viewport-driven; order content scrolls independently. */
+.workspace{align-items:start}
+.chart-panel{height:auto;align-self:start}
+.chart-wrap{flex:0 0 clamp(600px,75vh,1000px);height:clamp(600px,75vh,1000px);min-height:600px}
+.order-panel{height:calc(clamp(600px,75vh,1000px) + 225px);max-height:calc(clamp(600px,75vh,1000px) + 225px);align-self:start;overflow-y:auto;overscroll-behavior:contain}
+.drawing-toolbar{height:37px;flex:0 0 37px;display:flex;align-items:center;gap:6px;padding:0 12px;border-bottom:1px solid var(--line);background:#151a1c;color:#889497;font-size:11px}
+.drawing-toolbar>span{margin-right:3px;color:#a8b2b5;font-weight:600}
+.drawing-toolbar button{border:1px solid #30393d;border-radius:3px;background:#1d2427;color:#b8c1c3;padding:4px 8px;font-size:11px;white-space:nowrap}
+.drawing-toolbar button.active{border-color:#4c8e78;background:#20372f;color:#9ee3c7}
+.drawing-toolbar button:disabled{opacity:.4;cursor:not-allowed}
+.drawing-toolbar small{margin-left:auto;color:#778488;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.exit-reason-cell{width:220px;max-width:260px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;vertical-align:top}
+.drawing-overlay{z-index:7;pointer-events:none;touch-action:none}
+.drawing-overlay line,.drawing-overlay circle{vector-effect:non-scaling-stroke}
+.price-line-overlay.drawing-disabled,.price-line-overlay.drawing-disabled *{pointer-events:none!important}
+@media(max-width:760px){.workspace{align-items:stretch}.chart-wrap{flex:0 0 330px;height:330px;min-height:330px}.order-panel{height:auto;max-height:none;overflow:visible}.drawing-toolbar{padding:0 8px;gap:4px}.drawing-toolbar button{padding:4px 6px;font-size:10px}.drawing-toolbar small{display:none}}

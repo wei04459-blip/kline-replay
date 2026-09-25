@@ -19,6 +19,7 @@ DIST_FILES = (
     "style.css",
     "engine.mjs",
     "minute-data.mjs",
+    "drawings.mjs",
     "data/BTCUSDT.json",
     "data/ETHUSDT.json",
     "vendor/charts.mjs",

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
 
 const TEST_ENTRY_REASON = '测试入场理由';
 function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
@@ -1206,4 +1206,80 @@ test('short intrabar liquidation caps isolated loss, while minute liquidation is
   assert.ok(event.trade.isolatedAdjustment > 0);
   assert.ok(Math.abs(saved.balance - (INITIAL - margin - entryFee)) < 1e-7);
   assert.equal(validateSession(JSON.parse(JSON.stringify(saved)), 'BTCUSDT', minuteData), true);
+});
+
+test('manual close requires a trimmed explanation and preserves exit, entry, and system reasons separately', () => {
+  for (const side of [1, -1]) {
+    const data = bars(3), s = session(data);
+    enginePlaceOrder(s, data, side, 1800, 100, null, null, 'market', `entry-${side}`, 4);
+    const trade = manualClosePosition(s, data, '  结构失效，按计划退出  ', side === 1 ? 110 : 90, 0);
+    assert.equal(trade.reason, '手动平仓');
+    assert.equal(trade.exitReason, '结构失效，按计划退出');
+    assert.equal(trade.entryReason, `entry-${side}`);
+    assert.equal(trade.leverage, 4);
+    assert.equal(trade.isolatedAdjustment, 0);
+    assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+  }
+});
+
+test('invalid manual close reasons fail atomically without changing position or ledger', () => {
+  const data = bars(3), s = session(data);
+  enginePlaceOrder(s, data, 1, 1200, 100, null, null, 'market', TEST_ENTRY_REASON, 2);
+  for (const reason of ['', '  \n ', null, 123, 'x'.repeat(2001)]) {
+    const before = structuredClone(s);
+    assert.throws(() => manualClosePosition(s, data, reason));
+    assert.deepEqual(s, before);
+  }
+});
+
+test('manual exit reasons validate when present while legacy trades without the field still restore', () => {
+  const data = bars(3), s = session(data);
+  enginePlaceOrder(s, data, -1, 1000, 100, null, null, 'market', TEST_ENTRY_REASON, 3);
+  manualClosePosition(s, data, '风控计划调整', 95, 0);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)), 'BTCUSDT', data), true);
+  for (const reason of ['', '   ', 1, 'x'.repeat(2001)]) {
+    const corrupt = structuredClone(s);
+    corrupt.trades[0].exitReason = reason;
+    assert.equal(validateSession(corrupt, 'BTCUSDT', data), false);
+  }
+  const legacy = structuredClone(s);
+  delete legacy.trades[0].exitReason;
+  assert.equal(validateSession(legacy, 'BTCUSDT', data), true);
+});
+
+test('legacy positions can use required manual close reasons without acquiring leverage metadata', () => {
+  const data = bars(3), s = session(data);
+  enginePlaceOrder(s, data, -1, 900, 100, null, null, 'market', TEST_ENTRY_REASON, 1);
+  for (const record of [s.position, ...s.orderHistory])
+    for (const key of ['marginMode', 'leverage', 'margin', 'liquidationPrice']) delete record[key];
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+  const trade = manualClosePosition(s, data, '旧仓位主动退出', 98, 0);
+  assert.equal(trade.exitReason, '旧仓位主动退出');
+  assert.equal(trade.reason, '手动平仓');
+  assert.equal(Object.hasOwn(trade, 'marginMode'), false);
+  const restored = structuredClone(s);
+  delete restored.trades[0].exitReason;
+  assert.equal(validateSession(restored, 'BTCUSDT', data), true);
+});
+
+test('automatic stop, liquidation, and end-of-session closes do not require or invent a manual exit reason', () => {
+  const stopData = bars(3), stop = session(stopData);
+  enginePlaceOrder(stop, stopData, 1, 1000, 100, 99, null, 'market', TEST_ENTRY_REASON, 2);
+  stopData[1] = [900, 100, 101, 98, 100, 1];
+  const stopped = advance(stop, stopData).trade;
+  assert.equal(stopped.reason, '止损');
+  assert.equal(Object.hasOwn(stopped, 'exitReason'), false);
+
+  const liqData = bars(3), liq = session(liqData);
+  enginePlaceOrder(liq, liqData, 1, 1000, 100, null, null, 'market', TEST_ENTRY_REASON, 2);
+  liqData[1] = [900, 100, 101, liq.position.liquidationPrice - 1, 100, 1];
+  const liquidated = advance(liq, liqData).trade;
+  assert.equal(liquidated.reason, '强平');
+  assert.equal(Object.hasOwn(liquidated, 'exitReason'), false);
+
+  const endData = bars(3), end = session(endData, {end: 1});
+  enginePlaceOrder(end, endData, -1, 1000, 100, null, null, 'market', TEST_ENTRY_REASON, 3);
+  const ended = advance(end, endData).trade;
+  assert.equal(ended.reason, '本轮结束');
+  assert.equal(Object.hasOwn(ended, 'exitReason'), false);
 });

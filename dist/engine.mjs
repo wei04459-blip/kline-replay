@@ -193,6 +193,17 @@ function optionalSavedEntryReason(value) {
   return value === undefined || (typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 2000);
 }
 
+function optionalSavedExitReason(value) {
+  return value === undefined || (typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 2000);
+}
+
+function normalizeExitReason(value) {
+  if (typeof value !== 'string') throw new Error('平仓理由必须是非空文本，最多2000字');
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 2000) throw new Error('平仓理由必须是非空文本，最多2000字');
+  return trimmed;
+}
+
 function protectionsBracket(side, anchor, stop, take) {
   if (!optionalPrice(stop) || !optionalPrice(take)) return false;
   return side === 1
@@ -252,7 +263,7 @@ export function validateSession(session, symbol, data) {
         [o.fillIndex, o.fillPrice].every(Number.isFinite) && o.fillIndex >= session.start && o.fillIndex <= visibleIndex && o.fillPrice > 0) &&
       (o.status !== 'cancelled' || Number.isInteger(o.cancelledIndex) && o.cancelledIndex >= session.start && o.cancelledIndex <= visibleIndex &&
         (o.cancelledTime === undefined || timeMatchesIndex(o.cancelledTime, o.cancelledIndex, data) && o.cancelledTime <= replayTime(session, data)))))) return false;
-  return session.trades.every(t => t && optionalSavedEntryReason(t.entryReason) && [t.pnl, t.fees, t.entry, t.exit, t.qty].every(Number.isFinite) &&
+  return session.trades.every(t => t && optionalSavedEntryReason(t.entryReason) && optionalSavedExitReason(t.exitReason) && [t.pnl, t.fees, t.entry, t.exit, t.qty].every(Number.isFinite) &&
     (t.entryTime === undefined || timeMatchesIndex(t.entryTime, t.entryIndex, data) && t.entryTime <= replayTime(session, data)) &&
     (t.exitTime === undefined || timeMatchesIndex(t.exitTime, t.exitIndex, data) && t.exitTime <= replayTime(session, data)) &&
     t.entry > 0 && t.exit > 0 && t.qty > 0 && Number.isInteger(t.entryIndex) && Number.isInteger(t.exitIndex) &&
@@ -636,6 +647,14 @@ export function closePosition(s, data, price, reason = '手动平仓', index = u
   s.balance += settlement;
   s.trades.push(trade);
   s.position = null;
+  return trade;
+}
+
+/** Close a position at the disclosed/manual execution price with a required user-supplied explanation. */
+export function manualClosePosition(s, data, exitReason, price = undefined, index = undefined) {
+  const normalizedReason = normalizeExitReason(exitReason);
+  const trade = closePosition(s, data, price, '手动平仓', index);
+  if (trade) trade.exitReason = normalizedReason;
   return trade;
 }
 
