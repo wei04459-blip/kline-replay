@@ -257,7 +257,7 @@ function chooseDrawingTool(tool){
   if(pendingOrderRequest||transitionPending)return;
   activeDrawingTool=tool;drawingTools?.setTool(tool);syncDrawingControls();
   chartOverlay?.classList.toggle('drawing-disabled',!!tool);
-  $('drawing-hint').textContent=tool==='horizontal'?'点图添加水平线':tool==='trendline'?'在图表中依次点两处绘制趋势线':'选择工具不会影响下单或图表浏览';
+  $('drawing-hint').textContent=tool==='horizontal'?'点图放置水平线，或悬停价格轴旁＋':tool==='trendline'?'点击起点，然后点击终点':'悬停价格轴旁＋绘制水平线；趋势线点两次完成后可直接拖动';
 }
 function deleteSelectedDrawing(){
   if(pendingOrderRequest||transitionPending)return;
@@ -479,9 +479,9 @@ function initChart(){
   maSeries=chart.addSeries(LineSeries,{color:'#e6ba69',lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,autoscaleInfoProvider:()=>null});
   ma10Series=chart.addSeries(LineSeries,{color:'#65a9ff',lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,autoscaleInfoProvider:()=>null});
   chart.subscribeCrosshairMove(param=>{if(!active||!param.time)return;const bar=param.seriesData.get(candleSeries);if(!bar)return;els['ohlc'].textContent=`${showTime(Number(param.time))}  O ${pretty(bar.open)}  H ${pretty(bar.high)}  L ${pretty(bar.low)}  C ${pretty(bar.close)}`;});
-  chart.subscribeClick(param=>{if(pendingOrderRequest||activeDrawingTool||!uiPlan||uiPlan.orderType!=='limit'||!param.point||!chartOverlay)return;const rect=host.getBoundingClientRect(),y=param.point.y;if(y<0||y>rect.height-28)return;const price=candleSeries.coordinateToPrice(y);if(Number.isFinite(price)&&price>0)setPlanEntry(price);});
+  chart.subscribeClick(param=>{if(drawingTools?.consumeChartClick())return;if(pendingOrderRequest||activeDrawingTool||!uiPlan||uiPlan.orderType!=='limit'||!param.point||!chartOverlay)return;const rect=host.getBoundingClientRect(),y=param.point.y;if(y<0||y>rect.height-28)return;const price=candleSeries.coordinateToPrice(y);if(Number.isFinite(price)&&price>0)setPlanEntry(price);});
   chartOverlay=document.createElement('div');chartOverlay.className='price-line-overlay';chartOverlay.setAttribute('aria-label','入场与风险价格线');host.append(chartOverlay);
-  drawingTools=createDrawingTools({chart,series:candleSeries,container:host,getSession:()=>active,getBars:()=>disclosedBars(),getInterval:()=>active?.tf??BASE,onChange:()=>{persist();syncDrawingControls();},onStateChange:state=>{activeDrawingTool=state.tool;selectedDrawingId=state.selectedId;chartOverlay?.classList.toggle('drawing-disabled',!!state.tool);syncDrawingControls();if($('drawing-hint'))$('drawing-hint').textContent=state.tool==='horizontal'?'点图添加水平线':state.tool==='trendline'?'在图表中依次点两处绘制趋势线':'选择工具不会影响下单或图表浏览';},isLocked:()=>!!pendingOrderRequest||!!transitionPending});
+  drawingTools=createDrawingTools({chart,series:candleSeries,container:host,getSession:()=>active,getBars:()=>disclosedBars(),getInterval:()=>active?.tf??BASE,formatPrice:price=>pretty(price),onChange:()=>{persist();syncDrawingControls();},onStateChange:state=>{activeDrawingTool=state.tool;selectedDrawingId=state.selectedId;chartOverlay?.classList.toggle('drawing-disabled',!!state.tool);syncDrawingControls();if($('drawing-hint'))$('drawing-hint').textContent=state.tool==='trendline'?(state.phase==='end'?'点击终点完成趋势线':'点击起点，然后移动鼠标预览并点击终点'):state.tool==='horizontal'?'点图放置水平线，或悬停价格轴旁＋':'悬停价格轴旁＋绘制水平线；趋势线点两次完成后可直接拖动';},isLocked:()=>!!pendingOrderRequest||!!transitionPending});
   setupPlanOverlayEvents();
   resizeObserver=new ResizeObserver(entries=>{const box=entries[0]?.contentRect;if(box){chart.applyOptions({width:box.width,height:box.height});renderPlanOverlay();}});resizeObserver.observe(host);
   chart.timeScale().subscribeVisibleLogicalRangeChange(syncPlanOverlayCoordinates);

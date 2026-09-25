@@ -67,6 +67,14 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .drawing-toolbar button:disabled{opacity:.4;cursor:not-allowed}
 .drawing-toolbar small{margin-left:auto;color:#778488;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .exit-reason-cell{width:220px;max-width:260px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;vertical-align:top}
+.drawing-price-labels{position:absolute;inset:0;z-index:10;pointer-events:none;overflow:visible}
+.drawing-price-label{position:absolute;min-width:62px;transform:translateY(-50%);padding:2px 5px;background:#2869b8;color:#f4f8ff;border:1px solid #6aa7f2;border-radius:2px;font:10px var(--mono);text-align:right;white-space:nowrap}
+.drawing-price-label.selected{background:#367fda;border-color:#9ac5ff}
+.drawing-axis-plus{position:absolute;z-index:12;width:20px;height:20px;transform:translateY(-50%);border:1px solid #65a5ef;border-radius:3px;background:#1d2c3b;color:#9bc9ff;font:600 17px/18px var(--mono);padding:0;cursor:pointer;box-shadow:0 1px 5px #0008}
+.drawing-axis-plus:hover,.drawing-axis-plus:focus-visible{background:#28588d;color:#fff;outline:1px solid #a7d0ff}
+.drawing-axis-menu{position:absolute;z-index:14;width:190px;padding:3px;border:1px solid #3d5062;border-radius:4px;background:#17212b;box-shadow:0 5px 18px #0009}
+.drawing-axis-menu-item{width:100%;border:0;border-radius:2px;background:#17212b;color:#d9eaff;text-align:left;padding:8px 9px;font-size:12px;white-space:nowrap;cursor:pointer}
+.drawing-axis-menu-item:hover,.drawing-axis-menu-item:focus-visible{background:#274968;color:#fff;outline:0}
 .drawing-overlay{z-index:7;pointer-events:none;touch-action:none}
 .drawing-overlay line,.drawing-overlay circle{vector-effect:non-scaling-stroke}
 .price-line-overlay.drawing-disabled,.price-line-overlay.drawing-disabled *{pointer-events:none!important}
