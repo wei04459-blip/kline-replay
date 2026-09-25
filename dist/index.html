@@ -9,7 +9,7 @@
 <body>
   <header class="app-header">
     <a class="brand" href="./"><span class="brand-mark" aria-hidden="true">↗</span><strong>K线回放</strong><span class="brand-en">REPLAY LAB</span></a>
-    <div class="header-actions"><span class="private-label">个人练习 · 模拟资金</span><button class="quiet" id="rules">使用说明</button><button class="quiet" id="export">导出记录 ↗</button></div>
+    <div class="header-actions"><span class="private-label">个人练习 · 模拟资金</span><button class="quiet" id="rules">使用说明</button><button class="quiet" id="export">导出JSON备份</button><button class="primary review-export-button" id="review-export">导出GPT复盘包</button></div>
   </header>
   <main>
     <section class="session-heading">
@@ -27,10 +27,10 @@
         <div class="chart-toolbar">
           <label class="market-picker"><span class="coin-mark" id="coin-mark">₿</span><select id="symbol" aria-label="交易品种"><option value="BTCUSDT">BTC / USDT</option><option value="ETHUSDT">ETH / USDT</option></select></label>
           <div class="timeframes" aria-label="K线周期"><button data-tf="900">15分</button><button data-tf="1800">30分</button><button data-tf="2700">45分</button><button data-tf="3600">1小时</button><button data-tf="14400" class="active">4小时</button><button data-tf="86400">1日</button><button data-tf="604800">1周</button></div>
-          <div class="chart-options"><label class="ma10-option"><input id="ma10" type="checkbox">MA10</label><label class="ma20-option"><input id="ma" type="checkbox">MA20</label><label><input id="blind" type="checkbox" checked>隐藏日期</label><button class="icon-btn" id="recenter" title="回到最新K线" aria-label="回到最新K线">⊙</button></div>
+          <div class="chart-options"><label class="ma10-option"><input id="ma10" type="checkbox">MA10</label><label class="ma20-option"><input id="ma" type="checkbox">MA20</label><label class="volume-option"><input id="volume" type="checkbox" checked>成交量</label><label><input id="blind" type="checkbox" checked>隐藏日期</label><button class="icon-btn" id="recenter" title="回到最新K线" aria-label="回到最新K线">⊙</button></div>
         </div>
         <div class="drawing-toolbar" role="toolbar" aria-label="图表绘图工具"><span>绘图</span><button id="drawing-select" type="button" class="active" aria-pressed="true" title="选择/取消绘图工具">选择</button><button id="drawing-horizontal" type="button" aria-pressed="false" title="在图表中添加水平线">水平线</button><button id="drawing-trendline" type="button" aria-pressed="false" title="在图表中添加趋势线">趋势线</button><button id="drawing-delete" type="button" disabled title="删除当前选中的绘图">删除选中</button><small id="drawing-hint">选择工具不会影响下单或图表浏览</small></div>
-        <div class="quote-line"><strong id="last-price">—</strong><span id="last-change">等待行情</span><span class="ohlc" id="ohlc">读取真实历史数据中</span></div>
+        <div class="quote-line"><strong id="last-price">—</strong><span id="last-change">等待行情</span><span id="volume-value" class="volume-value">VOL —</span><span class="ohlc" id="ohlc">读取真实历史数据中</span></div>
         <div class="chart-wrap"><div id="chart"></div><div class="chart-watermark" aria-hidden="true">REPLAY LAB<span>只看眼前，练习判断</span></div><div id="loading" role="status">正在准备历史行情…</div></div>
         <div class="playback">
           <div class="playback-left"><span class="replay-badge" id="replay-status">盲回放</span><span class="muted" id="progress-text">等待开始</span></div>
@@ -68,6 +68,7 @@
         <div class="fee-note">单边费率 0.04% · 滑点 0.02%<br>逐仓模拟 · 不含资金费与分档</div>
       </aside>
       </div>
+    <p id="review-export-status" class="review-export-status" role="status" aria-live="polite">本地复盘记录已就绪</p><a id="review-export-download" class="review-export-download" hidden>下载复盘包</a>
     <section class="journal">
       <div class="journal-heading"><div class="tabs"><button id="positions-tab" class="selected">持仓 <span id="position-count">0</span></button><button id="orders-tab">订单 <span id="order-count">0</span></button><button id="current-tab">成交历史 <span id="journal-count">0</span></button><button id="history-tab">往期练习 <span id="history-count">0</span></button></div><span id="source-label">Binance 历史行情 · UTC</span></div>
       <div id="journal-content"></div>

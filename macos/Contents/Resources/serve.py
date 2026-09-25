@@ -14,6 +14,9 @@ from urllib.parse import urlsplit
 from minute_data import MinuteDataError, MinuteDataService, MinuteDataUnavailable
 
 APP_ID = "com.yuwan.local.kline-replay"
+VERSIONED_MODULES = ("app.mjs", "engine.mjs", "minute-data.mjs", "drawings.mjs",
+                     "review-export.mjs", "review-report.mjs", "review-recorder.mjs")
+IMPORT_PATTERN = re.compile(rb"(['\"])[.]\/(engine|minute-data|drawings|review-export|review-report|review-recorder)[.]mjs\1")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -30,8 +33,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path.startswith("/api/"):
             self._handle_api(path, parsed_url.query)
             return
-        if path in ("/", "/index.html", "/app.mjs"):
-            file_name = "index.html" if path in ("/", "/index.html") else "app.mjs"
+        requested_name = path.lstrip("/")
+        if path in ("/", "/index.html") or requested_name in VERSIONED_MODULES:
+            file_name = "index.html" if path in ("/", "/index.html") else requested_name
             file_path = Path(self.directory) / file_name
             try:
                 body = file_path.read_bytes()
@@ -42,8 +46,7 @@ class Handler(SimpleHTTPRequestHandler):
                 body = body.replace(b"./style.css", f"./style.css?v={self.asset_version}".encode())
                 body = body.replace(b"./app.mjs", f"./app.mjs?v={self.asset_version}".encode())
             else:
-                pattern = re.compile(rb"(['\"])[.]\/(engine|minute-data|drawings)[.]mjs\1")
-                body = pattern.sub(lambda match: match.group(1) + b"./" + match.group(2) + b".mjs?v=" + self.asset_version.encode() + match.group(1), body)
+                body = IMPORT_PATTERN.sub(lambda match: match.group(1) + b"./" + match.group(2) + b".mjs?v=" + self.asset_version.encode() + match.group(1), body)
             self.send_response(200)
             self.send_header("Content-Type", self.guess_type(file_name))
             self.send_header("Content-Length", str(len(body)))
@@ -107,7 +110,8 @@ def create_server(bind: str, port: int, directory: str | Path, cache_directory: 
     if bind_address != ipaddress.IPv4Address("127.0.0.1"):
         raise ValueError("服务只允许绑定 127.0.0.1。")
     version_digest = hashlib.sha256()
-    for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs", "drawings.mjs"):
+    for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs", "drawings.mjs",
+                 "review-export.mjs", "review-report.mjs", "review-recorder.mjs"):
         path = Path(directory) / name
         if path.is_file():
             version_digest.update(name.encode())

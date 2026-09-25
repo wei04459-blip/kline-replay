@@ -7,6 +7,7 @@ const MAX_EMPTY_DAYS = 7;
 const FETCH_TIMEOUT_MS = 90_000;
 const dayCache = new Map();
 const pendingDays = new Map();
+const archiveMetaCache = new Map();
 
 function utcDay(seconds) {
   return new Date(seconds * 1000).toISOString().slice(0, 10);
@@ -16,6 +17,12 @@ function nextDay(day) {
   const next = new Date(`${day}T00:00:00Z`);
   next.setUTCDate(next.getUTCDate() + 1);
   return next.toISOString().slice(0, 10);
+}
+
+function rememberArchiveMeta(key, payload) {
+  archiveMetaCache.delete(key);
+  archiveMetaCache.set(key, {source: payload?.source ?? null});
+  while (archiveMetaCache.size > 180) archiveMetaCache.delete(archiveMetaCache.keys().next().value);
 }
 
 function validCandle(row, date) {
@@ -69,6 +76,7 @@ async function loadDay(symbol, date) {
       throw error;
     }
     const candles = validatePayload(payload, symbol, date);
+    rememberArchiveMeta(key, payload);
     dayCache.set(key, candles);
     while (dayCache.size > MAX_CACHED_DAYS) dayCache.delete(dayCache.keys().next().value);
     return candles;
@@ -79,6 +87,68 @@ async function loadDay(symbol, date) {
   } finally {
     pendingDays.delete(key);
   }
+}
+
+/** Read only real, checksum-validated daily archives in an explicit UTC interval.
+ * `throughExclusive` is a candle close-time cutoff: a row is included only if
+ * openTime + 60 <= throughExclusive. `dayCache` can deduplicate daily payloads
+ * across sessions in one export without widening any session's returned rows.
+ */
+export async function readMinuteRange(symbol, fromInclusive, throughExclusive, {
+  dayCache = new Map(), onProgress = () => {}, signal,
+} = {}) {
+  if (!ALLOWED.has(symbol)) throw new Error('分钟行情只支持 BTCUSDT 和 ETHUSDT。');
+  if (!Number.isFinite(fromInclusive) || !Number.isFinite(throughExclusive) || fromInclusive < EARLIEST ||
+      throughExclusive <= fromInclusive || throughExclusive > LATEST_EXCLUSIVE) {
+    throw new Error('分钟行情读取范围超出 2022–2025 UTC 数据范围。');
+  }
+  const firstOpen = Math.ceil(fromInclusive / 60) * 60;
+  const lastOpen = Math.floor((throughExclusive - 60) / 60) * 60;
+  if (lastOpen < firstOpen) return {candles: [], days: [], unavailable: [], stoppedAt: null};
+  const days = [];
+  let day = utcDay(firstOpen);
+  const finalDay = utcDay(lastOpen);
+  const candles = [];
+  const unavailable = [];
+  let stoppedAt = null;
+  while (day <= finalDay) {
+    if (signal?.aborted) throw new DOMException('导出已取消。', 'AbortError');
+    const key = `${symbol}/${day}`;
+    let payload;
+    try {
+      if (dayCache.has(key)) payload = await dayCache.get(key);
+      else {
+        const pending = loadDay(symbol, day);
+        const wrapper = pending.then(candles => ({candles, source: archiveMetaCache.get(key)?.source ?? null}));
+        dayCache.set(key, wrapper);
+        try { payload = await wrapper; dayCache.set(key, payload); }
+        catch (error) { dayCache.delete(key); throw error; }
+      }
+      const rows = Array.isArray(payload) ? payload : payload?.candles;
+      if (!Array.isArray(rows) || rows.some(row => !validCandle(row, day))) {
+        throw new Error(`本地服务返回的 ${symbol} ${day} 分钟数据格式无效。`);
+      }
+      const selected = rows.filter(row => row[0] >= firstOpen && row[0] <= lastOpen && row[0] + 60 <= throughExclusive);
+      candles.push(...selected);
+      const metadata = Array.isArray(payload) ? archiveMetaCache.get(key)?.source : payload.source;
+      days.push({symbol, date: day, ...(metadata ? {url: metadata.url, checksumUrl: metadata.checksum_url,
+        archiveSha256: metadata.sha256} : {}), rowCount: selected.length,
+        fullUtcDayVisible: throughExclusive >= Date.parse(`${nextDay(day)}T00:00:00Z`) / 1000,
+        firstOpen: selected[0]?.[0] ?? null, lastOpen: selected.at(-1)?.[0] ?? null});
+    } catch (error) {
+      const unavailableEntry = {symbol, date: day, reason: error?.message || '无法读取此日分钟数据。', httpStatus: error?.httpStatus ?? null};
+      unavailable.push(unavailableEntry);
+      if (error?.httpStatus === 404) {
+        days.push({symbol, date: day, unavailable: true, reason: unavailableEntry.reason, rowCount: 0});
+      } else {
+        stoppedAt = day;
+        break;
+      }
+    }
+    onProgress({symbol, date: day, rows: candles.length, unavailable: unavailable.length});
+    day = nextDay(day);
+  }
+  return {candles, days, unavailable, stoppedAt};
 }
 
 /** Return the next verified real 1m candle whose open time is after afterTime. */

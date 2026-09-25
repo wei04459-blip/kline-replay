@@ -36,6 +36,8 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .trade-buttons .sell.selected{background:#803b45;color:#fff5f6;border-color:#ff9aa3;box-shadow:inset 0 0 0 1px #ff9aa344}
 .trade-buttons button:disabled{box-shadow:none}
 .chart-options .ma10-option input{accent-color:#65a9ff}.chart-options .ma10-option{color:#9cc8ff}.chart-options .ma20-option input{accent-color:#e6ba69}
+.chart-options .volume-option input{accent-color:#7d9b9d}.chart-options .volume-option{color:#bdc8c9}.volume-value{font:11px var(--mono);color:#94a4a7!important;white-space:nowrap}.review-export-status{margin:4px 1px 0;color:#819093;font-size:11px;min-height:15px}.review-export-status.warning{color:#f0c978}.review-export-button{padding:8px 10px;font-size:12px;white-space:nowrap}
+.review-export-button:disabled{opacity:.6;cursor:progress}
 .minute-note{flex-shrink:0;padding:4px 14px 7px;color:#829094;font-size:12px;border-top:1px solid #202629}.cancel-advance,.retry-minute{padding:4px 7px;font-size:12px;white-space:nowrap}.cancel-advance{color:#f0cf88}.retry-minute{color:#a9d2ff}.cancel-advance[hidden],.retry-minute[hidden]{display:none}
 
 /* Pending edits remain a preview until the user confirms them. */
@@ -79,3 +81,7 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .drawing-overlay line,.drawing-overlay circle{vector-effect:non-scaling-stroke}
 .price-line-overlay.drawing-disabled,.price-line-overlay.drawing-disabled *{pointer-events:none!important}
 @media(max-width:760px){.workspace{align-items:stretch}.chart-wrap{flex:0 0 330px;height:330px;min-height:330px}.order-panel{height:auto;max-height:none;overflow:visible}.drawing-toolbar{padding:0 8px;gap:4px}.drawing-toolbar button{padding:4px 6px;font-size:10px}.drawing-toolbar small{display:none}}
+@media(max-width:760px){.header-actions{gap:2px}.header-actions .review-export-button{padding:7px 6px;font-size:10px}.header-actions #export{display:none}.chart-options{gap:8px}.chart-options label{font-size:10px}.volume-value{font-size:10px}.quote-line{flex-wrap:wrap}.quote-line .ohlc{min-width:100%;margin-left:0}}
+:root{--review-export-link:#84b8ff}
+.review-export-download{display:inline-block;margin:0 1px 6px;color:var(--review-export-link);font-size:12px;text-decoration:underline;cursor:pointer}
+.review-export-download[hidden]{display:none}

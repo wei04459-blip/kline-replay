@@ -147,6 +147,17 @@ class MinuteDataTests(unittest.TestCase):
                 with urllib.request.urlopen(url, timeout=2) as response:
                     self.assertIn("no-store", response.headers["Cache-Control"])
                     self.assertEqual(json.loads(response.read())["interval"], 60)
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                with urllib.request.urlopen(base + "/app.mjs", timeout=2) as response:
+                    version = response.headers["X-Kline-Replay-Version"]
+                    self.assertIn("no-store", response.headers["Cache-Control"])
+                    app_module = response.read().decode()
+                    self.assertIn(f"./review-export.mjs?v={version}", app_module)
+                    self.assertIn(f"./review-recorder.mjs?v={version}", app_module)
+                with urllib.request.urlopen(base + f"/review-export.mjs?v={version}", timeout=2) as response:
+                    export_module = response.read().decode()
+                    self.assertIn(f"./minute-data.mjs?v={version}", export_module)
+                    self.assertIn(f"./review-report.mjs?v={version}", export_module)
                 bad_symbol = url.replace("BTCUSDT", "LTCUSDT")
                 with self.assertRaises(urllib.error.HTTPError) as error:
                     urllib.request.urlopen(bad_symbol, timeout=2)

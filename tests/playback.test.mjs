@@ -8,10 +8,14 @@ const start = source.indexOf('function syncPlaybackControls(){');
 const end = source.indexOf('\nfunction archiveActive(){', start);
 assert.ok(start >= 0 && end > start, 'playback functions should remain in the expected app section');
 const playbackSource = source.slice(start, end);
+const playbackHelperStart = source.indexOf('function reviewPlaybackSnapshot(');
+const playbackHelperEnd = source.indexOf('\nasync function manualStep(', playbackHelperStart);
+assert.ok(playbackHelperStart >= 0 && playbackHelperEnd > playbackHelperStart, 'playback audit helpers should remain identifiable');
+const playbackHelperSource = source.slice(playbackHelperStart, playbackHelperEnd);
 const reasonResumeStart = source.indexOf('function resumeReasonPlayback(){');
 const reasonResumeEnd = source.indexOf('\nasync function submitOrderReason(){', reasonResumeStart);
 assert.ok(reasonResumeStart >= 0 && reasonResumeEnd > reasonResumeStart, 'reason resume helper should remain identifiable');
-const reasonResumeSource = source.slice(reasonResumeStart, reasonResumeEnd);
+const reasonResumeSource = `${source.slice(source.indexOf('function reviewPlaybackSnapshot('), source.indexOf('\nasync function manualStep(', source.indexOf('function reviewPlaybackSnapshot(')))}\n${source.slice(reasonResumeStart, reasonResumeEnd)}`;
 
 function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
   const timers = [], toasts = [];
@@ -22,19 +26,25 @@ function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
     isPlaying: false, reasonResumePlayback: false, fastForwarding: false, minuteActionPending: false, minuteRetryAction: null,
     minuteGeneration: 0, minuteRequestId: 0, playTimer: 0,
     advanceCount: 0, renderCount: 0, persistCount: 0, draftSyncCount: 0,
-    events: [...results], timers, toasts
+    events: [...results], timers, toasts, reviewEvents: [], minuteRows: []
   };
   const controls = {
     play: {disabled: false, textContent: '', setAttribute() {}},
     'step-minute': {disabled: false}, step: {disabled: false}, 'cancel-advance': {hidden: true},
     'retry-minute': {hidden: true}, 'progress-text': {textContent: ''}, 'progress-bar': {style: {width: ''}},
-    speed: {value: '1'}
+    speed: {value: '1500'}
   };
   const sandbox = {
     els: controls,
     replayIsEnded: (s = active) => !!s.ended,
     replayClock: (s = active) => s.time,
     currentData: () => data,
+    clone: value => value == null ? value : JSON.parse(JSON.stringify(value)),
+    reviewStateProjection: session => ({id: session.id, cursor: session.cursor, minuteCursorTime: session.minuteCursorTime ?? null, position: session.position ?? null, pending: session.pending ?? null, trades: session.trades ?? []}),
+    reviewView: session => ({visibleThrough: session.time + 60, tf: session.tf}),
+    reviewRecorder: {appendMinute: async (_session, row) => { state.minuteRows.push(row); }, observe: async (_session, options = {}) => { if (options.kind) state.reviewEvents.push(options.kind); }},
+    recordReviewEvent: (kind, details) => { state.reviewEvents.push({kind, details}); },
+    keyReviewKind: kind => /^(order-|position-|protection-|drawing-)/.test(kind),
     intervalStart: (value, seconds) => Math.floor(value / seconds) * seconds,
     nextMinute: nextMinute || (async (_symbol, afterTime) => [afterTime + 60, 100, 101, 99, 100, 1]),
     advanceMinute: (session, candle) => {
@@ -67,7 +77,7 @@ function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
   for (const key of Object.keys(state)) Object.defineProperty(sandbox, key, {
     enumerable: true, get: () => state[key], set: value => { state[key] = value; }
   });
-  vm.runInNewContext(`${playbackSource}\n${reasonResumeSource}\nglobalThis.playbackApi={syncPlaybackControls,pause,runAutomaticMinute,advanceOneMinuteCore,advanceOneMinute,advanceToTfBoundary,togglePlay,resumeReasonPlayback};`, sandbox);
+  vm.runInNewContext(`${playbackHelperSource}\n${playbackSource}\n${reasonResumeSource}\nglobalThis.playbackApi={syncPlaybackControls,pause,runAutomaticMinute,advanceOneMinuteCore,advanceOneMinute,advanceToTfBoundary,togglePlay,togglePlayWithAudit,resumeReasonPlayback};`, sandbox);
   return {api: sandbox.playbackApi, state, sandbox, controls, timers, toasts};
 }
 
@@ -92,6 +102,8 @@ test('automatic playback continues after limit fill and exit events, scheduling 
   assert.match(h.toasts[0], /BTC/);
   assert.match(h.toasts[0], /100\.25/);
   assert.match(h.toasts[0], /98\.5/);
+  assert.deepEqual(h.state.reviewEvents.map(event => event.kind), ['order-filled', 'position-auto-closed'], 'fill and same-minute exit are recorded as distinct events');
+  assert.equal(h.state.minuteRows.length, 1, 'the exact disclosed minute is persisted once');
 });
 
 test('automatic playback does not stop or invalidate after an order-cancel event', async () => {
@@ -156,6 +168,9 @@ test('manual timeframe advance continues past order events and keeps their notic
   assert.match(h.toasts[0], /100\.2/);
   assert.match(h.toasts[0], /105/);
   assert.doesNotMatch(h.toasts[0], /已快进/);
+  assert.deepEqual(h.state.reviewEvents.map(event => event.kind), ['order-filled', 'position-auto-closed'], 'fast-forward records intermediate order and exit events despite draw=false');
+  assert.equal(h.state.minuteRows.length, 3, 'every fast-forwarded disclosed minute is captured');
+  assert.equal(h.state.reviewEvents[0].details.view.fastForwarding, true, 'snapshots identify events reached by unattended fast-forward');
 });
 
 test('natural end remains a stop and still announces the final trade after invalidating playback generation', async () => {
@@ -227,6 +242,7 @@ function exitHarness({playing = true, startResult = false} = {}) {
   };
   controls['entry-reason'] = input;
   controls['reason-confirm'] = {disabled: false, textContent: ''};
+  controls.speed = {value: '1500'};
   controls['entry-reason-error'] = {textContent: ''};
   controls['order-reason-window'] = {hidden: true, offsetWidth: 400, offsetHeight: 250, style: {}, classList: {toggle() {}}};
   controls['order-reason-summary'] = {textContent: ''};
@@ -293,6 +309,8 @@ function exitHarness({playing = true, startResult = false} = {}) {
     startRound: async symbol => { state.startCalls.push(symbol); events.push('start'); return state.startResult; },
     replayIsEnded: () => false,
     togglePlay: () => { state.playing = true; sandbox.isPlaying = true; events.push('resume'); },
+    togglePlayWithAudit: () => { state.playing = true; sandbox.isPlaying = true; events.push('resume'); },
+    recordPlaybackTransition: (...args) => events.push(['playback', ...args]),
     toasts, events
   };
   controls['order-reason-title'] = {textContent: ''};
@@ -385,6 +403,7 @@ function roundTransitionHarness({loadFails = false} = {}) {
     overlayPointerEvents: 'auto', drawingDisabled: false
   };
   const controls = Object.fromEntries(['new-session','play','step','step-minute','long','short','symbol'].map(id => [id, {disabled: false, value: 'BTCUSDT'}]));
+  controls.speed = {value: '1500'};
   const drawingTools = {
     refresh() {
       state.refreshCount++;
@@ -398,17 +417,19 @@ function roundTransitionHarness({loadFails = false} = {}) {
     els: controls, active: state.active, transitionPending: false, isPlaying: false,
     pendingOrderRequest: null, invalidSavedActive: false, selectedOrderType: 'market',
     pendingSymbol: null, journalMode: 'positions', selectedHistoryId: null,
-    drawingTools, BASE: 900,
+    drawingTools, BASE: 900, FEE: 0.0004, SLIP: 0.0002, MAINTENANCE_MARGIN_RATE: 0.005,
     pause: () => { state.isPlaying = false; sandbox.isPlaying = false; },
     loadSymbol: async () => { if (loadFails) throw new Error('minute archive unavailable'); return data; },
     createSession: () => candidate,
     clearModificationDraft() {}, archiveActive() {}, hideLoading() {}, persist() {},
+    reviewStateProjection: session => ({id: session.id, cursor: session.cursor, drawings: session.drawings || []}),
+    recordReviewEvent() {},
     render() {
       drawingTools.refresh();
       state.drawingDisabled = state.transitionPending;
       sandbox.syncPlaybackControls();
     },
-    toast() {}, currentData: () => data, metrics: () => ({}), clone: value => JSON.parse(JSON.stringify(value)),
+    toast(message) { state.toast = message; }, currentData: () => data, metrics: () => ({}), clone: value => JSON.parse(JSON.stringify(value)),
     showSavedRecordRecovery() {}, replayIsEnded: () => false, togglePlay() {},
     syncDrawingControls() { for (const id of ['drawing-select','drawing-horizontal','drawing-trendline']) controls[id].disabled = state.transitionPending; },
     syncPlaybackControls() { for (const id of ['play','step','step-minute']) controls[id].disabled = state.transitionPending; },
@@ -424,7 +445,7 @@ function roundTransitionHarness({loadFails = false} = {}) {
 
 test('round transition refreshes drawing overlay and unlocks drawing controls after success', async () => {
   const h = roundTransitionHarness();
-  assert.equal(await h.api.startRound('ETHUSDT'), true);
+  assert.equal(await h.api.startRound('ETHUSDT'), true, h.state.toast);
   assert.equal(h.state.transitionPending, false);
   assert.equal(h.state.overlayPointerEvents, 'auto');
   assert.equal(h.state.drawingDisabled, false);
