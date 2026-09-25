@@ -100,7 +100,7 @@ test('SVG renderer creates visible selected horizontal and trend lines with mult
   try {
     const tools = createDrawingTools({chart, series, container, getSession: () => session,
       getBars: () => bars15, getInterval: () => 900});
-    assert.equal(container.children.length, 4);
+    assert.equal(container.children.length, 5);
     const overlay = container.children[0];
     const classes = overlay.children.map(node => node.attributes.class).filter(Boolean);
     assert.ok(classes.includes('drawing-line horizontal'));
@@ -235,7 +235,7 @@ test('price-axis plus freezes its price, draws one line, and isolates dismiss cl
   const tools = createDrawingTools({chart, series, container, getSession: () => session, getBars: () => bars15,
     getInterval: () => 900, formatPrice: value => value.toFixed(2)});
   const dispatch = (node, type, event) => { for (const fn of node.listeners[type] ?? []) fn(event); };
-  const plus = container.children[2], menu = container.children[3], item = menu.children[0];
+  const crosshair = container.children[2], plus = container.children[3], menu = container.children[4], item = menu.children[0];
   try {
     dispatch(container, 'pointermove', {target: container, clientX: 500, clientY: 100});
     assert.equal(plus.hidden, false, 'hovering the plot shows the axis plus');
@@ -244,9 +244,16 @@ test('price-axis plus freezes its price, draws one line, and isolates dismiss cl
     dispatch(container, 'pointermove', {target: container, clientX: 500, clientY: 390});
     assert.equal(plus.hidden, true, 'the time axis is not treated as a price area');
     dispatch(container, 'pointermove', {target: container, clientX: 500, clientY: 100});
+    dispatch(container, 'pointermove', {target: plus, clientX: 500, clientY: 100});
+    assert.equal(crosshair.children.length, 2, 'the last crosshair position remains visible over the plus');
+    assert.equal(crosshair.children[0].attributes.y1, '100');
+    assert.equal(crosshair.children[1].attributes.x1, '500', 'the vertical line retains the exact plot x even in future whitespace');
     dispatch(plus, 'click', {preventDefault() {}, stopPropagation() {}});
     const frozenText = item.textContent;
+    dispatch(container, 'pointermove', {target: menu, clientX: 700, clientY: 130});
+    assert.equal(crosshair.children[0].attributes.y1, '100', 'the menu retains the original crosshair position');
     dispatch(container, 'pointermove', {target: container, clientX: 500, clientY: 160});
+    assert.equal(crosshair.children.length, 0, 'returning to the plot releases the visual pin for the native crosshair');
     assert.equal(item.textContent, frozenText, 'menu retains the price chosen before moving onto it');
     dispatch(item, 'click', {preventDefault() {}, stopPropagation() {}});
     assert.equal(session.drawings.length, 1);

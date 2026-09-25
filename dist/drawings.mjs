@@ -135,6 +135,9 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     overflow: 'hidden', pointerEvents: 'none', zIndex: '7', touchAction: 'none'});
   const priceLabels = document.createElement('div');
   priceLabels.className = 'drawing-price-labels';
+  const crosshairOverlay = svgElement('svg', {class: 'drawing-hover-crosshair', 'aria-hidden': 'true'});
+  Object.assign(crosshairOverlay.style, {position: 'absolute', inset: '0', width: '100%', height: '100%',
+    overflow: 'hidden', pointerEvents: 'none', zIndex: '9'});
   const axisPlus = document.createElement('button');
   axisPlus.type = 'button'; axisPlus.className = 'drawing-axis-plus'; axisPlus.textContent = '+';
   axisPlus.setAttribute('aria-label', '在当前价格添加水平线'); axisPlus.title = '添加水平线'; axisPlus.hidden = true;
@@ -143,7 +146,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   const axisMenuItem = document.createElement('button'); axisMenuItem.type = 'button';
   axisMenuItem.className = 'drawing-axis-menu-item'; axisMenu.append(axisMenuItem);
   if (getComputedStyle(container).position === 'static') container.style.position = 'relative';
-  container.append(overlay, priceLabels, axisPlus, axisMenu);
+  container.append(overlay, priceLabels, crosshairOverlay, axisPlus, axisMenu);
 
   let tool = null;
   let selectedId = null;
@@ -151,7 +154,9 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   let drag = null;
   let gesture = null;
   let hoverPrice = null;
+  let hoverX = null;
   let hoverY = null;
+  let crosshairPinned = false;
   let axisMenuPrice = null;
   let axisMenuOpen = false;
   let suppressNextChartClick = false;
@@ -180,8 +185,30 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     const y = series.priceToCoordinate(price);
     return Number.isFinite(y) ? y : null;
   }
+  function renderPinnedCrosshair() {
+    crosshairOverlay.replaceChildren();
+    if (!crosshairPinned || !Number.isFinite(hoverX) || !Number.isFinite(hoverY)) return;
+    const width = plotWidth(), height = paneHeight();
+    crosshairOverlay.setAttribute('viewBox', `0 0 ${container.clientWidth} ${container.clientHeight}`);
+    const crosshairStyle = {class: 'drawing-hover-crosshair-line', stroke: '#566469', 'stroke-width': 1, 'stroke-dasharray': '4 4', opacity: 0.9,
+      'vector-effect': 'non-scaling-stroke'};
+    const horizontal = svgElement('line', {...crosshairStyle, x1: 0, x2: width, y1: hoverY, y2: hoverY});
+    const vertical = svgElement('line', {...crosshairStyle, x1: hoverX, x2: hoverX, y1: 0, y2: height});
+    crosshairOverlay.append(horizontal, vertical);
+  }
+  function pinCrosshairAtHover() {
+    if (!Number.isFinite(hoverPrice) || !Number.isFinite(hoverX) || !Number.isFinite(hoverY)) return;
+    crosshairPinned = true;
+    renderPinnedCrosshair();
+  }
+  function releaseCrosshairPin() {
+    if (!crosshairPinned) return;
+    crosshairPinned = false;
+    renderPinnedCrosshair();
+  }
   function positionAxisControls() {
     if (isLocked()) {
+      releaseCrosshairPin();
       axisPlus.hidden = true; axisMenu.hidden = true; axisMenuOpen = false; axisMenuPrice = null;
       return;
     }
@@ -212,14 +239,19 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     if (signature !== lastStateSignature) { lastStateSignature = signature; onStateChange(state); }
   }
   function handlePriceHover(event) {
-    if (isLocked()) { axisPlus.hidden = true; axisMenu.hidden = true; return; }
-    if (axisMenuOpen || event.target === axisPlus || axisMenu.contains(event.target)) return;
+    if (isLocked()) { releaseCrosshairPin(); axisPlus.hidden = true; axisMenu.hidden = true; return; }
+    if (event.target === axisPlus || axisMenu.contains(event.target)) {
+      pinCrosshairAtHover();
+      return;
+    }
+    if (axisMenuOpen) { releaseCrosshairPin(); return; }
     const rect = container.getBoundingClientRect();
     const x = event.clientX - rect.left, y = event.clientY - rect.top;
-    if (y < 0 || y >= paneHeight() || x < 0 || x > plotWidth()) { axisPlus.hidden = true; return; }
+    if (y < 0 || y >= paneHeight() || x < 0 || x > plotWidth()) { releaseCrosshairPin(); axisPlus.hidden = true; return; }
     const price = series.coordinateToPrice(y);
-    if (!Number.isFinite(price) || price <= 0) { axisPlus.hidden = true; return; }
-    hoverPrice = price; hoverY = y;
+    if (!Number.isFinite(price) || price <= 0) { releaseCrosshairPin(); axisPlus.hidden = true; return; }
+    releaseCrosshairPin();
+    hoverPrice = price; hoverX = x; hoverY = y;
     positionAxisControls();
   }
   function replaceDrawing(id, next) {
@@ -247,6 +279,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   }
   function finishDrawing(drawing) {
     if (!addDrawing(drawing)) return false;
+    releaseCrosshairPin();
     tool = null; draftStart = null; gesture = null; axisMenuOpen = false; axisMenuPrice = null;
     axisPlus.hidden = true; axisMenu.hidden = true;
     render();
@@ -394,7 +427,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
         if (oldIndex >= 0) drag.list[oldIndex] = drag.original;
       }
       tool = null; draftStart = null; drag = null; gesture = null; selectedId = null;
-      hoverPrice = null; hoverY = null; axisMenuOpen = false; axisMenuPrice = null;
+      releaseCrosshairPin(); hoverPrice = null; hoverX = null; hoverY = null; axisMenuOpen = false; axisMenuPrice = null;
       cachedDrawingRef = undefined;
     }
     const width = Math.max(0, plotWidth()), height = Math.max(0, container.clientHeight);
@@ -421,6 +454,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     renderDraft();
     overlay.style.pointerEvents = 'none';
     overlay.style.zIndex = '7';
+    renderPinnedCrosshair();
     positionAxisControls();
     emitState();
   }
@@ -509,6 +543,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     event.preventDefault(); event.stopPropagation();
     if (isLocked() || !Number.isFinite(hoverPrice)) return;
     axisMenuPrice = hoverPrice; axisMenuOpen = true;
+    pinCrosshairAtHover();
     positionAxisControls(); emitState();
   }
   function createAxisDrawing(event) {
@@ -526,6 +561,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     }
     if (!axisMenuOpen || isAxisControl(event.target)) return;
     axisMenuOpen = false; axisMenuPrice = null; axisMenu.hidden = true;
+    releaseCrosshairPin();
     dismissedPointerId = Number.isFinite(event.pointerId) ? event.pointerId : null;
     if (container.contains(event.target)) suppressNextChartClick = true;
     positionAxisControls(); emitState();
@@ -539,8 +575,9 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     return true;
   }
   function pointerLeaveContainer() {
-    if (axisMenuOpen) return;
-    hoverPrice = null; hoverY = null; axisPlus.hidden = true;
+    releaseCrosshairPin();
+    hoverPrice = null; hoverX = null; hoverY = null; axisPlus.hidden = true;
+    axisMenuOpen = false; axisMenuPrice = null; axisMenu.hidden = true;
   }
   function pointerUp(event) {
     if (drag) {
@@ -573,6 +610,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     if (isLocked()) return;
     if (event.key === 'Escape' && axisMenuOpen) {
       event.preventDefault(); axisMenuOpen = false; axisMenuPrice = null; axisMenu.hidden = true;
+      releaseCrosshairPin();
       positionAxisControls(); emitState();
     } else if (event.key === 'Escape' && (tool || draftStart || selectedId)) {
       event.preventDefault(); cancel();
@@ -588,6 +626,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     if (isLocked() && nextTool) return false;
     tool = nextTool;
     draftStart = null;
+    if (axisMenuOpen) releaseCrosshairPin();
     gesture = null; axisMenuOpen = false; axisMenuPrice = null;
     if (tool) selectedId = null;
     render();
@@ -605,6 +644,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     return true;
   }
   function cancel() {
+    releaseCrosshairPin();
     if (drag) {
       const index = drag.list.findIndex(item => item.id === drag.id);
       if (index >= 0) drag.list[index] = drag.original;
@@ -656,6 +696,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     getSelectedId: () => selectedId,
     destroy() {
       destroyed = true;
+      releaseCrosshairPin();
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(rangeChanged);
       chart.timeScale().unsubscribeVisibleTimeRangeChange(rangeChanged);
       resizeObserver?.disconnect();
@@ -671,7 +712,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
       document.removeEventListener('pointerdown', closeAxisMenuOnOutside, true);
       document.removeEventListener('pointerup', finishDismissedPointer, true);
       document.removeEventListener('pointercancel', finishDismissedPointer, true);
-      overlay.remove();
+      overlay.remove(); crosshairOverlay.remove();
       priceLabels.remove(); axisPlus.remove(); axisMenu.remove();
     },
   };
