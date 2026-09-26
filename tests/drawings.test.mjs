@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   logicalToTimestamp, moveDrawingPoint, projectDrawing, sanitizeDrawings,
-  timestampToLogical, translateDrawing, createDrawingTools,
+  timestampToLogical, translateDrawing, createDrawingTools, resizeZone,
 } from '../dist/drawings.mjs';
 
 const bars15 = Array.from({length: 5}, (_, i) => ({time: 1_700_000_000 + i * 900}));
@@ -21,6 +21,21 @@ test('trendlines need two valid points at distinct times', () => {
   assert.deepEqual(sanitizeDrawings([{id: 't1', type: 'trend', start: {time: 1, price: 5}, end: {time: 2, price: 7}}]),
     [{id: 't1', type: 'trend', start: {time: 1, price: 5}, end: {time: 2, price: 7}}]);
   assert.deepEqual(sanitizeDrawings([{id: 't2', type: 'trend', start: {time: 1, price: 5}, end: {time: 1, price: 7}}]), []);
+});
+
+test('SMC zones normalize corners, reject zero-area records, project across timeframes, and resize edges', () => {
+  const zone={id:'zone-1',type:'zone',start:{time:bars15[3].time,price:42000},end:{time:bars15[1].time,price:43000}};
+  const normalized={id:'zone-1',type:'zone',start:{time:bars15[1].time,price:43000},end:{time:bars15[3].time,price:42000}};
+  assert.deepEqual(sanitizeDrawings([zone,{...zone,id:'flat-time',end:{...zone.start,time:zone.start.time}},
+    {...zone,id:'flat-price',end:{...zone.start,price:zone.start.price}}]),[normalized]);
+  assert.deepEqual(projectDrawing(normalized,bars30,1800),{id:'zone-1',type:'zone',
+    start:{logical:0.5,price:43000},end:{logical:1.5,price:42000}});
+  assert.deepEqual(translateDrawing(normalized,900,-25),{...normalized,
+    start:{time:normalized.start.time+900,price:42975},end:{time:normalized.end.time+900,price:41975}});
+  assert.deepEqual(resizeZone(normalized,'n',{time:normalized.start.time,price:43100}),{...normalized,
+    start:{time:normalized.start.time,price:43100},end:normalized.end});
+  assert.deepEqual(resizeZone(normalized,'e',{time:normalized.end.time+900,price:normalized.end.price}),{...normalized,
+    start:normalized.start,end:{time:normalized.end.time+900,price:normalized.end.price}});
 });
 
 test('timestamp and logical conversions interpolate timeframe aggregation both ways', () => {
@@ -199,6 +214,75 @@ test('trendline takes two clicks through preview and Escape clears an unfinished
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete globalThis[key]; else globalThis[key] = value;
     }
+  }
+});
+
+test('SMC zone previews and completes on two clicks, then supports whole drag and edge-handle resize', () => {
+  const previous={document:globalThis.document,window:globalThis.window,getComputedStyle:globalThis.getComputedStyle,ResizeObserver:globalThis.ResizeObserver};
+  class FakeNode {
+    constructor(tag){this.tagName=tag;this.attributes={};this.style={};this.dataset={};this.children=[];this.listeners={};this.hidden=false;this.textContent='';}
+    setAttribute(key,value){this.attributes[key]=String(value);}
+    append(...nodes){for(const node of nodes){node.parentNode=this;this.children.push(node);}}
+    replaceChildren(...nodes){this.children=[];this.append(...nodes);}
+    addEventListener(type,fn){(this.listeners[type]??=[]).push(fn);}
+    removeEventListener(){}
+    remove(){}
+    getBoundingClientRect(){return {left:0,top:0};}
+    contains(node){for(let current=node;current;current=current.parentNode)if(current===this)return true;return false;}
+    setPointerCapture(){}
+    hasPointerCapture(){return true;}
+    releasePointerCapture(){}
+  }
+  globalThis.document={createElement:tag=>new FakeNode(tag),createElementNS:(_ns,tag)=>new FakeNode(tag),addEventListener(){},removeEventListener(){}};
+  globalThis.window={addEventListener(){},removeEventListener(){}};
+  globalThis.getComputedStyle=()=>({position:'relative'});
+  globalThis.ResizeObserver=class{observe(){} disconnect(){}};
+  const container=new FakeNode('div');container.clientWidth=1000;container.clientHeight=400;
+  const chart={timeScale:()=>({width:()=>900,height:()=>28,logicalToCoordinate:logical=>logical*100,coordinateToLogical:x=>x/100,
+    subscribeVisibleLogicalRangeChange(){},unsubscribeVisibleLogicalRangeChange(){},subscribeVisibleTimeRangeChange(){},unsubscribeVisibleTimeRangeChange(){}})};
+  const series={priceToCoordinate:price=>40000-price,coordinateToPrice:y=>40000-y};
+  const session={id:'zone-interaction',drawings:[]},states=[];
+  const tools=createDrawingTools({chart,series,container,getSession:()=>session,getBars:()=>bars15,getInterval:()=>900,onStateChange:state=>states.push(state)});
+  const overlay=container.children[0];
+  const dispatch=(node,type,event)=>{for(const fn of node.listeners[type]??[])fn(event);};
+  const pointEvent=(x,y)=>({button:0,pointerId:4,target:container,clientX:x,clientY:y,preventDefault(){},stopPropagation(){}});
+  const click=(x,y)=>{const event=pointEvent(x,y);dispatch(container,'pointerdown',event);dispatch(container,'pointerup',event);};
+  try{
+    tools.setTool('zone');
+    click(100,200);
+    dispatch(container,'pointermove',{pointerId:4,target:container,clientX:300,clientY:150});
+    assert.ok(overlay.children.some(node=>String(node.attributes.class||'').includes('drawing-zone-preview')),'the second corner previews a translucent rectangle');
+    assert.equal(states.at(-1).phase,'end');
+    click(300,150);
+    assert.equal(session.drawings.length,1);
+    assert.deepEqual(session.drawings[0],{id:session.drawings[0].id,type:'zone',
+      start:{time:bars15[1].time,price:39850},end:{time:bars15[3].time,price:39800}});
+    assert.equal(tools.getSelectedId(),session.drawings[0].id);
+    assert.equal(states.at(-1).tool,null,'completing the area returns to selection mode');
+    assert.equal(overlay.children.filter(node=>String(node.attributes.class||'').includes('drawing-zone-handle')).length,8);
+
+    let body=overlay.children.find(node=>String(node.attributes.class||'').includes('drawing-zone-hit'));
+    assert.equal(body.style.pointerEvents,'all','selected zone body can be dragged');
+    const originalStart=session.drawings[0].start.time;
+    const down=pointEvent(150,175);down.target=body;
+    dispatch(body,'pointerdown',down);
+    dispatch(overlay,'pointermove',{...down,target:overlay,clientX:200,clientY:185});
+    dispatch(overlay,'pointerup',{...down,target:overlay,clientX:200,clientY:185});
+    assert.equal(session.drawings[0].start.time,originalStart+450,'whole-zone drag shifts the time range');
+    assert.equal(session.drawings[0].start.price,39840,'whole-zone drag shifts the price range');
+
+    const nw=overlay.children.find(node=>String(node.attributes.class||'').includes('drawing-zone-handle handle-nw'));
+    assert.ok(nw);
+    const beforeResize={...session.drawings[0].start};
+    const cornerDown=pointEvent(150,160);cornerDown.target=nw;
+    dispatch(nw,'pointerdown',cornerDown);
+    dispatch(overlay,'pointermove',{...cornerDown,target:overlay,clientX:120,clientY:140});
+    dispatch(overlay,'pointerup',{...cornerDown,target:overlay,clientX:120,clientY:140});
+    assert.ok(session.drawings[0].start.time<beforeResize.time,'corner resize changes the zone time boundary');
+    assert.ok(session.drawings[0].start.price>beforeResize.price,'corner resize changes the zone price boundary');
+  }finally{
+    tools.destroy();
+    for(const [key,value] of Object.entries(previous)){if(value===undefined)delete globalThis[key];else globalThis[key]=value;}
   }
 });
 

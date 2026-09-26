@@ -79,7 +79,14 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .drawing-axis-menu-item{width:100%;border:0;border-radius:2px;background:#17212b;color:#d9eaff;text-align:left;padding:8px 9px;font-size:12px;white-space:nowrap;cursor:pointer}
 .drawing-axis-menu-item:hover,.drawing-axis-menu-item:focus-visible{background:#274968;color:#fff;outline:0}
 .drawing-overlay{z-index:7;pointer-events:none;touch-action:none}
-.drawing-overlay line,.drawing-overlay circle{vector-effect:non-scaling-stroke}
+.drawing-overlay line,.drawing-overlay circle,.drawing-overlay rect{vector-effect:non-scaling-stroke}
+.drawing-overlay .drawing-zone-fill{fill:#4ca9c72b}
+.drawing-overlay .drawing-zone-fill.selected{fill:#55b6d633}
+.drawing-overlay .drawing-zone-border{stroke:#609eb0;stroke-width:1.3;fill:none}
+.drawing-overlay .drawing-zone-border.selected{stroke:#83d2e8;stroke-width:1.8}
+.drawing-overlay .drawing-zone-preview{fill:#4ca9c733;stroke:#83d2e8;stroke-width:1.5;stroke-dasharray:5 3}
+.drawing-overlay .drawing-zone-handle{fill:#b7e5ef;stroke:#18313a;stroke-width:1.2;cursor:move}
+.drawing-overlay .drawing-zone-hit{cursor:move}
 .price-line-overlay.drawing-disabled,.price-line-overlay.drawing-disabled *{pointer-events:none!important}
 @media(max-width:760px){.workspace{align-items:stretch}.chart-wrap{flex:0 0 330px;height:330px;min-height:330px}.order-panel{height:auto;max-height:none;overflow:visible}.drawing-toolbar{padding:0 8px;gap:4px}.drawing-toolbar button{padding:4px 6px;font-size:10px}.drawing-toolbar small{display:none}}
 @media(max-width:760px){.header-actions{gap:2px}.header-actions .review-export-button{padding:7px 6px;font-size:10px}.header-actions #export{display:none}.chart-options{gap:8px}.chart-options label{font-size:10px}.volume-value{font-size:10px}.quote-line{flex-wrap:wrap}.quote-line .ohlc{min-width:100%;margin-left:0}}

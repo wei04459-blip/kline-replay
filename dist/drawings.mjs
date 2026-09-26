@@ -1,6 +1,8 @@
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const MIN_PRICE = Number.MIN_VALUE;
 const MAX_DRAWINGS = 500;
+const MIN_ZONE_TIME_SPAN = 1;
+const MIN_ZONE_PRICE_SPAN = 1e-8;
 
 function validPoint(point) {
   return point && Number.isSafeInteger(point.time) && point.time >= 0 &&
@@ -18,6 +20,12 @@ function cloneDrawing(item) {
     return {id: item.id, type: item.type,
       start: {time: item.start.time, price: item.start.price},
       end: {time: item.end.time, price: item.end.price}};
+  }
+  if (item.type === 'zone' && validPoint(item.start) && validPoint(item.end)) {
+    const left = Math.min(item.start.time, item.end.time), right = Math.max(item.start.time, item.end.time);
+    const top = Math.max(item.start.price, item.end.price), bottom = Math.min(item.start.price, item.end.price);
+    if (right - left < MIN_ZONE_TIME_SPAN || top - bottom < MIN_ZONE_PRICE_SPAN) return null;
+    return {id: item.id, type: 'zone', start: {time: left, price: top}, end: {time: right, price: bottom}};
   }
   return null;
 }
@@ -107,6 +115,28 @@ export function moveDrawingPoint(drawing, which, point) {
   if (!valid || valid.type !== 'trend' || !validPoint(point) || !['start', 'end'].includes(which)) return null;
   const result = {...valid, [which]: {time: point.time, price: point.price}};
   return result.start.time === result.end.time ? null : result;
+}
+
+/** Resize one edge/corner of a normalized SMC zone in chart data coordinates. */
+export function resizeZone(drawing, handle, point) {
+  const valid = cloneDrawing(drawing);
+  if (!valid || valid.type !== 'zone' || !validPoint(point) ||
+      !['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].includes(handle)) return null;
+  let left = valid.start.time, right = valid.end.time;
+  let top = valid.start.price, bottom = valid.end.price;
+  if (handle.includes('w')) left = point.time;
+  if (handle.includes('e')) right = point.time;
+  if (handle.includes('n')) top = point.price;
+  if (handle.includes('s')) bottom = point.price;
+  if (right - left < MIN_ZONE_TIME_SPAN) {
+    if (handle.includes('w')) left = right - MIN_ZONE_TIME_SPAN;
+    else right = left + MIN_ZONE_TIME_SPAN;
+  }
+  if (top - bottom < MIN_ZONE_PRICE_SPAN) {
+    if (handle.includes('n')) top = bottom + MIN_ZONE_PRICE_SPAN;
+    else bottom = top - MIN_ZONE_PRICE_SPAN;
+  }
+  return cloneDrawing({...valid, start: {time: left, price: top}, end: {time: right, price: bottom}});
 }
 
 function svgElement(tag, attrs = {}) {
@@ -233,7 +263,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   }
   function emitState() {
     const state = {tool, selectedId, drawingCount: currentDrawings().length,
-      phase: tool === 'trendline' ? (draftStart ? 'end' : 'start') : null,
+      phase: tool === 'trendline' || tool === 'zone' ? (draftStart ? 'end' : 'start') : null,
       axisMenuOpen};
     const signature = JSON.stringify(state);
     if (signature !== lastStateSignature) { lastStateSignature = signature; onStateChange(state); }
@@ -344,7 +374,9 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   }
   function bindHit(node, drawingId, dragKind = 'whole') {
     node.dataset.drawingId = drawingId;
-      node.style.pointerEvents = tool ? 'none' : (node.tagName.toLowerCase() === 'circle' ? 'all' : 'stroke');
+    node.dataset.dragKind = dragKind;
+    node.style.pointerEvents = tool ? 'none' :
+      (node.tagName.toLowerCase() === 'circle' || dragKind !== 'whole' ? 'all' : 'stroke');
     node.addEventListener('pointerdown', event => {
       if (isLocked() || tool || event.button !== 0) return;
       event.preventDefault(); event.stopPropagation();
@@ -380,6 +412,33 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     }
     const a = pointToPixel(drawing.start), b = pointToPixel(drawing.end);
     if (!a || !b) return;
+    if (drawing.type === 'zone') {
+      const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+      const width = Math.max(1, Math.abs(b.x - a.x)), height = Math.max(1, Math.abs(b.y - a.y));
+      const hit = createSvg('rect', {x, y, width, height, fill: 'transparent', 'fill-opacity': chosen ? '0.015' : '0',
+        stroke: 'transparent', 'stroke-width': chosen ? 0 : 12, 'vector-effect': 'non-scaling-stroke'}, 'drawing-zone-hit drawing-hit-area');
+      bindHit(hit, drawing.id, chosen ? 'zone-whole' : 'whole');
+      overlay.append(hit);
+      const fill = createSvg('rect', {x, y, width, height, fill: chosen ? '#4ca9c733' : '#4ca9c722', stroke: 'none'},
+        `drawing-zone-fill${chosen ? ' selected' : ''}`);
+      fill.style.pointerEvents = 'none'; overlay.append(fill);
+      const border = createSvg('rect', {x, y, width, height, fill: 'none', stroke: chosen ? '#83d2e8' : '#609eb0',
+        'stroke-width': chosen ? 1.8 : 1.3, 'vector-effect': 'non-scaling-stroke'}, `drawing-zone-border${chosen ? ' selected' : ''}`);
+      border.style.pointerEvents = 'none'; overlay.append(border);
+      if (chosen) {
+        const midX = x + width / 2, midY = y + height / 2;
+        const handles = [['nw', x, y], ['n', midX, y], ['ne', x + width, y], ['e', x + width, midY],
+          ['se', x + width, y + height], ['s', midX, y + height], ['sw', x, y + height], ['w', x, midY]];
+        for (const [name, hx, hy] of handles) {
+          const size = name.length === 2 ? 8 : 6;
+          const handle = createSvg('rect', {x: hx - size / 2, y: hy - size / 2, width: size, height: size, rx: 1.5,
+            fill: '#b7e5ef', stroke: '#18313a', 'stroke-width': 1.2}, `drawing-zone-handle handle-${name}`);
+          bindHit(handle, drawing.id, `zone-${name}`);
+          overlay.append(handle);
+        }
+      }
+      return;
+    }
     const hit = createSvg('line', {x1: a.x, y1: a.y, x2: b.x, y2: b.y,
       stroke: 'transparent', 'stroke-width': 12, 'vector-effect': 'non-scaling-stroke'}, 'drawing-hit-area');
     bindHit(hit, drawing.id);
@@ -414,6 +473,17 @@ export function createDrawingTools({chart, series, container, getSession, getBar
         const preview = createSvg('line', {x1: a.x, y1: a.y, x2: b.x, y2: b.y, stroke: '#7ce0be', 'stroke-width': 1.5, 'stroke-dasharray': '4 3'}, 'drawing-preview');
         preview.style.pointerEvents = 'none';
         overlay.append(preview);
+      }
+    } else if (tool === 'zone') {
+      const marker = createSvg('circle', {cx: a.x, cy: a.y, r: 4.5, fill: '#b7e5ef', stroke: '#18313a', 'stroke-width': 2}, 'drawing-start-marker');
+      marker.style.pointerEvents = 'none'; overlay.append(marker);
+      if (!draftStart.current) return;
+      const b = pointToPixel(draftStart.current);
+      if (b) {
+        const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y), width = Math.abs(b.x - a.x), height = Math.abs(b.y - a.y);
+        const preview = createSvg('rect', {x, y, width, height, fill: '#4ca9c733', stroke: '#83d2e8', 'stroke-width': 1.5,
+          'stroke-dasharray': '5 3', 'vector-effect': 'non-scaling-stroke'}, 'drawing-preview drawing-zone-preview');
+        preview.style.pointerEvents = 'none'; overlay.append(preview);
       }
     }
   }
@@ -474,6 +544,14 @@ export function createDrawingTools({chart, series, container, getSession, getBar
         return finishDrawing({id: uid(), type: 'trend', start: first, end: point});
       }
     }
+    if (tool === 'zone') {
+      if (!draftStart) {
+        draftStart = {point, current: point};
+        render();
+        return true;
+      }
+      return finishDrawing({id: uid(), type: 'zone', start: draftStart.point, end: point});
+    }
     return false;
   }
   function isAxisControl(target) {
@@ -502,6 +580,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     const drawing = drag.original;
     let next;
     if (drag.kind === 'start' || drag.kind === 'end') next = moveDrawingPoint(drawing, drag.kind, current);
+    else if (drag.kind.startsWith('zone-') && drag.kind !== 'zone-whole') next = resizeZone(drawing, drag.kind.slice(5), current);
     else next = translateDrawing(drawing, dt, dp);
     if (next) {
       const list = drag.list, index = list.findIndex(item => item.id === drag.id);
@@ -514,7 +593,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     if (gesture && (event.pointerId === undefined || event.pointerId === gesture.pointerId)) {
       if (Math.hypot(event.clientX - gesture.x, event.clientY - gesture.y) > 4) gesture.moved = true;
     }
-    if (draftStart && tool === 'trendline' && !isLocked() && !isAxisControl(event.target)) {
+    if (draftStart && (tool === 'trendline' || tool === 'zone') && !isLocked() && !isAxisControl(event.target)) {
       const next = eventDataPoint(event);
       if (next) { draftStart.current = next; render(); }
     }
@@ -622,7 +701,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     return typeof Element !== 'undefined' && target instanceof Element && (target.matches('input,textarea,select,[contenteditable="true"]') || target.closest('[contenteditable="true"]'));
   }
   function setTool(nextTool) {
-    if (![null, 'horizontal', 'trendline'].includes(nextTool)) throw new TypeError('未知画线工具。');
+    if (![null, 'horizontal', 'trendline', 'zone'].includes(nextTool)) throw new TypeError('未知画线工具。');
     if (isLocked() && nextTool) return false;
     tool = nextTool;
     draftStart = null;
