@@ -58,7 +58,7 @@
             <div><span>开仓手续费</span><strong id="entry-fee-value">0.40 U</strong></div>
             <div><span>预估强平价</span><strong id="liquidation-value">—</strong></div>
           </div>
-          <div class="risk-line"><span>价差估算（未计成本） · 盈亏比</span><span id="risk-preview">—</span></div>
+          <div class="risk-line"><span id="risk-preview-label">本笔风险估算</span><div id="risk-preview" class="risk-preview" aria-live="polite"><span>—</span></div></div>
           <div class="trade-buttons"><button type="button" id="long" class="buy" aria-pressed="false" disabled>↗ 买入 / 做多</button><button type="button" id="short" class="sell" aria-pressed="false" disabled>↘ 卖出 / 做空</button></div>
           <button type="button" id="observation-open" class="quiet full observation-open">记录判断 / 这次不做</button>
           <div id="plan-actions" hidden><p id="plan-hint" class="order-hint">市价单按当前回放收盘价立即成交；限价按指定价或更优成交，否则挂起等待。</p><button type="button" id="confirm-plan" class="primary full" disabled>确认市价做多</button><button type="button" id="locate-plan" class="quiet full" hidden>定位计划价格</button><button type="button" id="cancel-plan" class="quiet full">取消计划</button></div>

@@ -241,6 +241,8 @@ function evidenceCoverageFor(session, events) {
   const thesisIds = new Set((session?.theses ?? []).map(thesis => thesis.thesisId).filter(Boolean));
   const eventSnapshotIds = new Set((events ?? []).map(event => event.snapshotId).filter(Boolean));
   const positionIds = new Set([...trades.map(trade => trade.positionId), session?.position?.positionId].filter(Boolean));
+  const modelBoundary = session?.modelEvidenceStart?.visibleThrough ?? session?.modelEvidenceStart?.replayMarketTime;
+  const captureReplayStart = typeof modelBoundary === 'number' && Number.isFinite(modelBoundary) && modelBoundary >= 0 ? modelBoundary : null;
   const missingEventRefs = events.filter(event =>
     event.orderId && !ordersById.has(event.orderId) && !(session?.orderHistory ?? []).some(order => order.id === event.orderId) ||
     event.tradeId && !tradeIds.has(event.tradeId) && session?.position?.tradeId !== event.tradeId ||
@@ -249,6 +251,15 @@ function evidenceCoverageFor(session, events) {
   const missingModels = modelReferences.filter(item => typeof item.modelConfigId !== 'string' || !configIds.has(item.modelConfigId)).length;
   const linkedPlans = orders.filter(order => order.planId && plansById.has(order.planId)).length;
   const missingPlanReferences = orders.filter(order => !order.planId || !plansById.has(order.planId)).length;
+  const ordersByIdForTrades = new Map(orders.map(order => [order.id, order]));
+  const missingOrderTradeIds = trades.filter(trade => !trade.orderId || !ordersByIdForTrades.has(trade.orderId))
+    .map(trade => trade.id ?? trade.tradeId ?? 'unknown');
+  const linkedCapturedTradeCount = captureReplayStart === null ? null : trades.filter(trade =>
+    Number.isFinite(trade.entryTime) && trade.entryTime >= captureReplayStart && trade.orderId && ordersByIdForTrades.has(trade.orderId)).length;
+  const expectedCapturedTradeCount = captureReplayStart === null ? null : trades.filter(trade =>
+    Number.isFinite(trade.entryTime) && trade.entryTime >= captureReplayStart).length;
+  const historicalTradeCount = captureReplayStart === null ? null : trades.filter(trade =>
+    Number.isFinite(trade.entryTime) && trade.entryTime < captureReplayStart).length;
   const missingPlanSnapshots = plans.filter(plan => {
     const visible = plan.visibleThrough;
     const validTime = typeof visible === 'number' ? Number.isFinite(visible) && visible >= 0
@@ -266,10 +277,48 @@ function evidenceCoverageFor(session, events) {
   }).length;
   const keyEvents = events.filter(event => SCREENSHOT_ACTIONS.has(event.kind));
   const missingSnapshots = keyEvents.filter(event => !event.snapshotId || !event.view || typeof event.view !== 'object').length;
+  const drawingEvents = events.filter(event => String(event.kind ?? '').startsWith('drawing-'));
+  const currentDrawings = Array.isArray(session?.drawings) ? session.drawings : null;
+  const currentDrawingIds = new Set((currentDrawings ?? []).map(drawing => drawing?.id)
+    .filter(id => typeof id === 'string' && id.length > 0));
+  const eventDrawingIds = new Set(), afterDrawingIds = new Set();
+  for (const event of drawingEvents) {
+    for (const key of ['before', 'after']) {
+      const drawings = event?.[key]?.drawings;
+      if (!Array.isArray(drawings)) continue;
+      for (const drawing of drawings) {
+        if (typeof drawing?.id !== 'string' || !drawing.id) continue;
+        eventDrawingIds.add(drawing.id);
+        if (key === 'after') afterDrawingIds.add(drawing.id);
+      }
+    }
+    for (const id of [event.drawingId, event.references?.drawingId])
+      if (typeof id === 'string' && id) eventDrawingIds.add(id);
+  }
+  const currentDrawingCount = currentDrawings?.length ?? null;
+  const currentDrawingIdList = [...currentDrawingIds].sort();
+  const eventDrawingIdList = [...eventDrawingIds].sort();
+  const eventBackedCurrentIds = currentDrawingIdList.filter(id => afterDrawingIds.has(id));
+  const currentStateOnlyIds = currentDrawingIdList.filter(id => !afterDrawingIds.has(id));
+  const eventOnlyIds = eventDrawingIdList.filter(id => !currentDrawingIds.has(id));
+  const unidentifiedCurrentDrawingCount = currentDrawings
+    ? currentDrawings.filter(drawing => typeof drawing?.id !== 'string' || !drawing.id).length : null;
+  const drawingVersions = Array.isArray(session?.drawingVersions) ? session.drawingVersions : null;
   const observedLedger = Array.isArray(session?.ledger) ? session.ledger : null;
   let ledgerValid = !!observedLedger?.length;
+  let ledgerFullHistoryVerified = !!observedLedger?.length;
+  let ledgerSegment = null;
   if (ledgerValid) {
     const ordered = [...observedLedger].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    const legacyBaselineIndex = ordered.findIndex(row => row?.type === 'legacy-baseline' || row?.legacyHistoryUnknown === true);
+    if (legacyBaselineIndex >= 0) {
+      ledgerFullHistoryVerified = false;
+      ledgerSegment = {startSeq: ordered[legacyBaselineIndex].seq ?? null,
+        startReplayMarketTime: ordered[legacyBaselineIndex].replayMarketTime ?? null,
+        startVisibleThrough: ordered[legacyBaselineIndex].visibleThrough ?? null,
+        openingBalance: ordered[legacyBaselineIndex].balanceAfter ?? null,
+        historicalBeforeStart: 'unknown'};
+    }
     const ledgerIds = new Set();
     for (let index = 0; index < ordered.length; index += 1) {
       const row = ordered[index];
@@ -277,7 +326,14 @@ function evidenceCoverageFor(session, events) {
           ![row.cashDelta, row.balanceAfter, row.equityAfter, row.usedMarginAfter].every(Number.isFinite)) { ledgerValid = false; break; }
       ledgerIds.add(row.id);
       if (index === 0) {
-        if (!Number.isFinite(row.baselineBalance) || Math.abs(row.baselineBalance + row.cashDelta - row.balanceAfter) > 0.02) ledgerValid = false;
+        if (legacyBaselineIndex === 0) {
+          if (!row.legacyHistoryUnknown && row.type !== 'legacy-baseline') ledgerValid = false;
+          if (!Number.isFinite(row.balanceAfter)) ledgerValid = false;
+          if (row.baselineBalance !== undefined || row.cashDelta !== undefined) {
+            if (!Number.isFinite(row.baselineBalance) || !Number.isFinite(row.cashDelta) ||
+                Math.abs(row.baselineBalance + row.cashDelta - row.balanceAfter) > 0.02) ledgerValid = false;
+          }
+        } else if (!Number.isFinite(row.baselineBalance) || Math.abs(row.baselineBalance + row.cashDelta - row.balanceAfter) > 0.02) ledgerValid = false;
       } else if (Math.abs(ordered[index - 1].balanceAfter + row.cashDelta - row.balanceAfter) > 0.02) ledgerValid = false;
       if (row.fillId && !fillsById.has(row.fillId)) ledgerValid = false;
       if (row.orderId && !ordersById.has(row.orderId)) ledgerValid = false;
@@ -286,19 +342,28 @@ function evidenceCoverageFor(session, events) {
     }
     const first = ordered[0];
     const last = ordered.at(-1);
-    if (!Number.isFinite(session.initialBalance) || !Number.isFinite(session.balance) ||
-        !Number.isFinite(first?.baselineBalance) || Math.abs(first.baselineBalance - session.initialBalance) > 0.02 ||
-        Math.abs(last.balanceAfter - session.balance) > 0.02) ledgerValid = false;
+    if (legacyBaselineIndex < 0 && (!Number.isFinite(session.initialBalance) ||
+        !Number.isFinite(first?.baselineBalance) || Math.abs(first.baselineBalance - session.initialBalance) > 0.02)) ledgerValid = false;
+    if (!Number.isFinite(session.balance) || Math.abs(last.balanceAfter - session.balance) > 0.02) ledgerValid = false;
+    if (ledgerSegment) ledgerSegment.endingBalance = Number.isFinite(last?.balanceAfter) ? last.balanceAfter : null;
   }
   const evidence = {
     modelConfigs: {status: !session.engineVersion ? 'unknown-legacy' : missingModels ? 'incomplete' : configs.length ? 'complete' : 'missing',
       expected: modelReferences.length, available: modelReferences.length - missingModels, missing: missingModels},
-    immutableOrders: {status: !session.engineVersion ? 'unknown-legacy' : Array.isArray(session.orders) ? 'complete' : 'missing',
-      expected: trades.length, available: orders.length},
+    immutableOrders: {status: !session.engineVersion ? 'unknown-legacy' : !Array.isArray(session.orders) ? 'missing'
+      : missingOrderTradeIds.length ? captureReplayStart !== null && linkedCapturedTradeCount === expectedCapturedTradeCount ? 'partial-history' : 'incomplete'
+        : 'complete',
+      scope: captureReplayStart === null ? 'all-recorded-trades; capture boundary unavailable' : 'full history plus post-baseline collection range',
+      captureReplayStart, captureReplayStartUtc: iso(captureReplayStart),
+      expected: trades.length, available: trades.length - missingOrderTradeIds.length, missingTradeIds: missingOrderTradeIds,
+      capturedRangeExpected: expectedCapturedTradeCount, capturedRangeAvailable: linkedCapturedTradeCount,
+      preCaptureHistoricalTradeCount: historicalTradeCount},
     fills: {status: !session.engineVersion ? 'unknown-legacy' : missingFillLinks ? 'incomplete' : Array.isArray(session.fills) ? 'complete' : 'missing',
       expected: trades.length * 2, available: fills.length, missingTradeLinks: missingFillLinks},
-    ledger: {status: !session.engineVersion ? 'unknown-legacy' : ledgerValid ? 'complete' : 'incomplete',
-      available: observedLedger?.length ?? 0, missingOrInvalidReferences: ledgerValid ? 0 : 1},
+    ledger: {status: !session.engineVersion ? 'unknown-legacy' : !ledgerValid ? 'incomplete'
+      : ledgerFullHistoryVerified ? 'complete' : 'partial-history',
+      available: observedLedger?.length ?? 0, missingOrInvalidReferences: ledgerValid ? 0 : 1,
+      fullHistoryVerified: ledgerFullHistoryVerified, verifiedSegment: ledgerSegment},
     riskChanges: {status: !session.engineVersion ? 'unknown-legacy' : Array.isArray(session.riskChanges) ? 'present' : 'missing',
       available: session.riskChanges?.length ?? 0},
     plans: {status: !session.engineVersion ? 'unknown-legacy' : missingPlanReferences || missingPlanSnapshots ? 'incomplete' : plans.length ? 'present' : orders.length ? 'incomplete' : 'not-applicable',
@@ -307,12 +372,24 @@ function evidenceCoverageFor(session, events) {
       expected: keyEvents.length, available: keyEvents.length - missingSnapshots, missing: missingSnapshots},
     references: {status: !session.engineVersion ? 'unknown-legacy' : missingEventRefs.length || missingThesisReferences.length ? 'incomplete' : 'complete',
       missingEventRefs, missingThesisReferences},
-    drawings: {status: Array.isArray(session.drawingVersions) ? 'present' : 'unknown-legacy', available: session.drawingVersions?.length ?? 0},
+    drawings: {status: drawingVersions ? 'present' : currentDrawingCount === 0 && drawingEvents.length === 0 ? 'not-applicable'
+      : currentDrawingCount > 0 && currentStateOnlyIds.length === 0 && unidentifiedCurrentDrawingCount === 0
+        ? 'event-backed-range'
+        : currentDrawingCount > 0 && eventDrawingIds.size > 0 ? 'event-backed-partial'
+          : currentDrawingCount > 0 ? 'state-only-incomplete'
+            : eventDrawingIds.size > 0 ? 'event-backed-range' : drawingEvents.length ? 'event-only-incomplete' : 'not-applicable',
+      currentDrawingCount, currentDrawingIds: currentDrawingIdList,
+      eventBackedCurrentCount: eventBackedCurrentIds.length, eventBackedCurrentIds,
+      currentStateOnlyIds, eventOnlyIds, unidentifiedCurrentDrawingCount,
+      createdOrChangedEventCount: drawingEvents.length, eventEvidenceIdCount: eventDrawingIds.size,
+      eventEvidenceIds: eventDrawingIdList, versionRows: drawingVersions?.length ?? null,
+      collection: drawingVersions ? 'drawingVersions' : drawingEvents.length ? 'version facts are event-backed; no dedicated drawingVersions collection' : 'no version collection',
+      scope: '当前状态ID与已导出drawing事件after快照逐一匹配；事件前状态和删除记录单列；未被事件覆盖的旧绘图仍可能未知'},
     theses: {status: Array.isArray(session.theses) ? 'present' : 'unknown-legacy', available: session.theses?.length ?? 0},
     observations: {status: Array.isArray(session.observations) ? 'present' : 'unknown-legacy', available: session.observations?.length ?? 0},
   };
-  const required = ['modelConfigs', 'immutableOrders', 'fills', 'ledger', 'riskChanges', 'plans', 'snapshots', 'references'];
-  const complete = required.every(key => ['complete', 'present', 'not-applicable'].includes(evidence[key].status));
+  const required = ['modelConfigs', 'immutableOrders', 'fills', 'ledger', 'riskChanges', 'plans', 'snapshots', 'references', 'drawings'];
+  const complete = required.every(key => ['complete', 'present', 'not-applicable', 'event-backed-range'].includes(evidence[key].status));
   return {evidence, evidenceComplete: complete};
 }
 
@@ -826,7 +903,11 @@ function renderReviewBook(sessions) {
     const unmatched = screenshots.filter(image => !usedScreenshotPaths.has(image.path));
     const otherImages = unmatched.map(image => `<figure><a href="${htmlEscape(image.path)}"><img loading="lazy" src="${htmlEscape(image.path)}" alt="未匹配截图"></a><figcaption>未能无歧义关联到某笔交易 · 事件 ${htmlEscape(image.eventId)}</figcaption></figure>`).join('');
     const tradeBody = transactionSections || '<p>本轮没有已平仓交易。</p>';
-    sections.push(`<section><h2>${htmlEscape(sessionRecord.id ?? session.id ?? '未命名练习')} · ${htmlEscape(session.symbol ?? '品种未记录')}</h2><p>可见行情截止 ${htmlEscape(sessionRecord.coverage?.visibleThroughUtc ?? '未记录')} UTC；行情 ${sessionRecord.coverage?.marketComplete ? '完整' : '不完整'}；过程记录 ${sessionRecord.coverage?.auditComplete ? '完整' : '不完整或未录全'}；关键截图 ${sessionRecord.coverage?.screenshotsComplete ? '齐全' : '有缺失'}；行情缺口 ${sessionRecord.coverage?.gaps?.length ?? 0} 项。</p>${tradeBody}<h3>未归属到交易的操作和截图</h3>${unassigned.length ? `<p>保留 ${unassigned.length} 条未能与单笔成交无歧义匹配的事件。</p>` : '<p>无。</p>'}${otherImages || '<p>没有未归属截图。</p>'}</section>`);
+    const oldScreenshotLayerWarning = screenshots.some(image => {
+      const event = events.find(item => item?.id === image?.eventId);
+      return event && !event?.references?.screenshotBindingVersion;
+    }) ? '<p class="missing">旧版截图可能混入上一笔交易卡片；图中的价格、保护价或盈亏不能单独证明当前交易状态，应以同一事件的结构化记录为准。原始截图未改写。</p>' : '';
+    sections.push(`<section><h2>${htmlEscape(sessionRecord.id ?? session.id ?? '未命名练习')} · ${htmlEscape(session.symbol ?? '品种未记录')}</h2><p>可见行情截止 ${htmlEscape(sessionRecord.coverage?.visibleThroughUtc ?? '未记录')} UTC；行情 ${sessionRecord.coverage?.marketComplete ? '完整' : '不完整'}；过程记录 ${sessionRecord.coverage?.auditComplete ? '完整' : '不完整或未录全'}；关键截图 ${sessionRecord.coverage?.screenshotsComplete ? '齐全' : '有缺失'}；行情缺口 ${sessionRecord.coverage?.gaps?.length ?? 0} 项。</p>${oldScreenshotLayerWarning}${tradeBody}<h3>未归属到交易的操作和截图</h3>${unassigned.length ? `<p>保留 ${unassigned.length} 条未能与单笔成交无歧义关联的事件。</p>` : '<p>无。</p>'}${otherImages || '<p>没有未归属截图。</p>'}</section>`);
   }
   const html = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' file:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><meta name="viewport" content="width=device-width,initial-scale=1"><title>K线回放离线复盘册</title><style>body{margin:0;background:#10161b;color:#d9e1e7;font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}main{max-width:1000px;margin:auto;padding:28px}h1,h2,h3,h4{color:#e8f0f5}section,article{border:1px solid #34424c;border-radius:10px;padding:18px;margin:18px 0;background:#172127}article{background:#121b20;scroll-margin-top:12px}dl{display:grid;grid-template-columns:minmax(120px,190px) 1fr;gap:5px 14px}dt{color:#8da1ab}dd{margin:0;overflow-wrap:anywhere}.user-text{white-space:pre-wrap}.missing{color:#d8aa72}li{margin:12px 0}li span{display:block;color:#aebbc2;font-size:13px}figure{display:inline-block;vertical-align:top;margin:10px 10px 4px 0;max-width:min(100%,720px)}img{display:block;max-width:100%;height:auto;border:1px solid #41515b;border-radius:5px}figcaption{color:#aebbc2;font-size:12px;margin-top:4px}a{color:#83baff}code{color:#b4d7ff}@media(max-width:600px){main{padding:14px}dl{grid-template-columns:1fr}dd{margin-bottom:8px}}</style><main><h1>K线回放离线复盘册</h1><p>本页来自导出时冻结的本地交易记录与关键操作截图。截图只在事件和订单/成交编号可明确匹配时归入对应阶段；无明确关联的内容单列，不按时间猜测。</p><p>所有路径均相对于本HTML文件，可离线查看。真实行情、完整记录、逐笔分析见同目录文件。</p>${sections.join('\n')}</main></html>`;
   return html;
@@ -1114,7 +1195,13 @@ export async function buildReviewExport({current = null, history = [], loadDatas
     const expected = expectedTimes.length;
     const marketComplete = expected === covered && bounds.warmupMissingBars === 0 && contextGaps.length === 0 && minuteGaps.length === 0 && unavailable.length === 0;
     const auditComplete = auditReadSucceeded && audit.baseline === false && !!audit.recordingStartedAt && auditIssues.length === 0;
-    const screenshotsComplete = missingScreenshotEventIds.length === 0;
+    const captureScreenshotsComplete = missingScreenshotEventIds.length === 0;
+    const captureBoundaryValue = sessionForPackage.modelEvidenceStart?.visibleThrough ?? sessionForPackage.modelEvidenceStart?.replayMarketTime;
+    const captureReplayStart = typeof captureBoundaryValue === 'number' && Number.isFinite(captureBoundaryValue) ? captureBoundaryValue : null;
+    const captureTrades = Array.isArray(sessionForPackage.trades) ? sessionForPackage.trades : [];
+    const preCaptureTrades = captureReplayStart === null ? null : captureTrades.filter(trade =>
+      Number.isFinite(trade.entryTime) && trade.entryTime < captureReplayStart).length;
+    const screenshotsComplete = captureScreenshotsComplete && preCaptureTrades === 0;
     const evidenceCoverage = evidenceCoverageFor(sessionForPackage, sessionEvents);
     const modelEvidence = modelEvidenceFor(sessionForPackage);
     const roundPayload = {
@@ -1128,12 +1215,18 @@ export async function buildReviewExport({current = null, history = [], loadDatas
         replayFromUtc: iso(bounds.replayFrom), cutoffIsExclusiveClose: true, expectedMinuteRows: expected,
         availableMinuteRows: covered, missingMinuteRows: expected - covered,
         marketComplete, auditComplete, screenshotsComplete,
-        captureCoverageComplete: marketComplete && auditComplete && screenshotsComplete,
+        captureCoverageComplete: marketComplete && auditComplete && captureScreenshotsComplete,
+        historicalEvidenceComplete: evidenceCoverage.evidenceComplete && screenshotsComplete,
         evidenceCoverage: evidenceCoverage.evidence, evidenceComplete: evidenceCoverage.evidenceComplete,
         baseline: audit.baseline ?? null, auditRecordingStartedAt: audit.recordingStartedAt ?? null,
-        screenshotCoverage: {expectedKeyActionCount: expectedScreenshotActions.length,
+        screenshotCoverage: {scope: '当前操作审计采集范围；不代表基线之前的全部交易',
+          captureReplayStart, captureReplayStartUtc: iso(captureReplayStart),
+          expectedKeyActionCount: expectedScreenshotActions.length,
           availableScreenshotCount: expectedScreenshotActions.length - missingScreenshotEventIds.length,
-          missingScreenshotCount: missingScreenshotEventIds.length, missingEventIds: missingScreenshotEventIds},
+          missingScreenshotCount: missingScreenshotEventIds.length, missingEventIds: missingScreenshotEventIds,
+          captureRangeComplete: captureScreenshotsComplete,
+          historicalStatus: preCaptureTrades === null ? 'unknown-legacy' : preCaptureTrades ? 'unknown-legacy' : 'not-applicable',
+          preCaptureTradesWithoutVerifiableCapture: preCaptureTrades},
         futureFiltered: {minuteRows: futureAuditMinutesFiltered, auditEvents: audited.futureExcluded,
           laterRecordedEvents: audited.recordedAfterSnapshot, beyondEventWatermark: audited.afterWatermark,
           tradeOutcomes: futureOutcomeRedactions + eventOutcomeRedactions,

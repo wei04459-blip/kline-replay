@@ -130,6 +130,7 @@ test('incomplete old records are retained and explicitly marked instead of disca
 
 test('HTML review book links only the matching trade screenshots and escapes all user text', async () => {
   const session = activeSession('book-round', start + minute, null);
+  session.modelEvidenceStart = {replayMarketTime: start - minute, visibleThrough: start - minute};
   const dangerous = '</script><img src=x onerror=alert(1)>';
   session.trades = [
     {id: 'trade-A', orderId: 'order-A', side: 1, entry: 100, exit: 102, qty: 1, entryTime: start, exitTime: start + minute,
@@ -184,6 +185,37 @@ test('HTML review book links only the matching trade screenshots and escapes all
   assert.equal(payload.sessions[0].coverage.captureCoverageComplete, false, 'market data warmup is intentionally incomplete in the tiny fixture');
   assert.equal(payload.sessions[0].coverage.auditComplete, true);
   assert.equal(payload.sessions[0].coverage.screenshotsComplete, true);
+});
+
+test('drawing coverage matches current drawing IDs to event after-snapshots, not event counts', async () => {
+  const session = activeSession('drawing-round', start + minute, null);
+  session.engineVersion = 'paper-engine-v2';
+  session.drawings = [{id: 'line-a'}, {id: 'trend-b'}];
+  const events = [
+    {id: 'draw-a', seq: 1, kind: 'drawing-created', recordedAt: new Date().toISOString(), visibleThrough: start + minute,
+      before: {drawings: []}, after: {drawings: [{id: 'line-a'}]}},
+    {id: 'draw-b', seq: 2, kind: 'drawing-created', recordedAt: new Date().toISOString(), visibleThrough: start + minute,
+      before: {drawings: [{id: 'line-a'}]}, after: {drawings: [{id: 'line-a'}, {id: 'trend-b'}]}},
+  ];
+  const run = async current => {
+    const output = await buildReviewExport({current, history: [], loadDataset: async () => dataset(),
+      readAudit: async () => ({baseline: false, recordingStartedAt: new Date().toISOString(), minutes: [candle(start)], events,
+        screenshots: [], issues: []})});
+    return output.payload.sessions[0].coverage.evidenceCoverage.drawings;
+  };
+
+  const matching = await run(session);
+  assert.equal(matching.status, 'event-backed-range');
+  assert.deepEqual(matching.currentDrawingIds, ['line-a', 'trend-b']);
+  assert.deepEqual(matching.eventBackedCurrentIds, ['line-a', 'trend-b']);
+  assert.equal(matching.eventBackedCurrentCount, 2);
+
+  const mismatchedSession = {...session, drawings: [{id: 'unrelated-current-line'}]};
+  const mismatched = await run(mismatchedSession);
+  assert.equal(mismatched.createdOrChangedEventCount, 2);
+  assert.equal(mismatched.currentDrawingCount, 1);
+  assert.equal(mismatched.status, 'event-backed-partial', 'more events than current drawings must not imply identity coverage');
+  assert.deepEqual(mismatched.currentStateOnlyIds, ['unrelated-current-line']);
 });
 
 test('HTML review book orders stages numerically by event sequence, not by event ID or input order', async () => {

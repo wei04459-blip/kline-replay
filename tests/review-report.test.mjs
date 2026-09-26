@@ -130,6 +130,11 @@ test('ledger reconciliation checks both baseline and the final wallet snapshot',
   reconciliation = buildReviewReport(payload).metricsBySession[0].accountLedgerReconciliation;
   assert.equal(reconciliation.balanced, false);
   assert.match(reconciliation.reason, /末行账本余额与会话钱包余额/);
+  payload.sessions[0].session.ledger[1].balanceAfter = 10001.92;
+  payload.sessions[0].session.ledger.push({id: 'l3', seq: 3, type: 'risk-change', cashDelta: 0, balanceAfter: 10001.92, fee: 0});
+  reconciliation = buildReviewReport(payload).metricsBySession[0].accountLedgerReconciliation;
+  assert.equal(reconciliation.balanced, false, 'untimed ledger rows are excluded from the as-of set');
+  assert.match(reconciliation.reason, /缺少可验证时间/);
 });
 
 test('market fill snapshots match the submitted order through position.orderId', () => {
@@ -239,7 +244,7 @@ test('minute-close equity includes open-position mark-to-market and drawdown use
   assert.equal(metrics.drawdownTrough.time, 240);
 });
 
-test('equity drawdown percentage tracks its own historical peak when later absolute drawdown is larger', () => {
+test('transaction-only points without complete minute samples do not claim a full equity drawdown', () => {
   const payload = makePayload();
   const trades = [500, -150, 1150, -200].map((pnl, index) => ({id: `t${index}`, orderId: `o${index}`, side: 1,
     entry: 100, exit: 100, qty: 1, entryFee: 0, fees: 0, pnl, entryTime: 10 + index * 20, exitTime: 20 + index * 20}));
@@ -248,10 +253,10 @@ test('equity drawdown percentage tracks its own historical peak when later absol
   payload.sessions[0].coverage = {visibleFrom: 0, visibleThrough: 400};
   payload.sessions[0].events = [];
   const metrics = buildReviewReport(payload).metricsBySession[0];
-  assert.equal(metrics.maxDrawdown, 200);
-  assert.equal(metrics.maxDrawdownPct, 0.1);
-  assert.equal(metrics.drawdownPeak.equity, 2500);
-  assert.equal(metrics.drawdownPctPeak.equity, 1500);
+  assert.equal(metrics.equityCurveAvailable, false);
+  assert.equal(metrics.maxDrawdown, null);
+  assert.equal(metrics.maxDrawdownPct, null);
+  assert.match(metrics.equityCurveReason, /没有可用于采样回撤的完整分钟行情/);
 });
 
 test('same-minute entry and exit plus adjacent same-time close/re-entry remain in the equity ledger', () => {
@@ -305,7 +310,7 @@ test('disclosed currentBar is preferred for event volume; reconstruction combine
   assert.match(buildReviewReport(rebuilt).reportText, /当前周期量：105 BTC/);
 });
 
-test('issues and baseline coverage are visible, while oversized snapshots point to untouched raw JSON', () => {
+test('issues and baseline coverage are visible while large event snapshots link to untouched raw JSON without duplication', () => {
   const payload = makePayload();
   payload.sessions[0].coverage.baseline = {from: 0, through: 60, candles: 60};
   payload.sessions[0].issues = ['one source gap needs review'];
@@ -313,9 +318,58 @@ test('issues and baseline coverage are visible, while oversized snapshots point 
   const {reportText} = buildReviewReport(payload);
   assert.match(reportText, /基线覆盖：[\s\S]*"from": 0/);
   assert.match(reportText, /one source gap needs review/);
-  assert.match(reportText, /JSON Pointer `\/sessions\/0\/events\/0\/after`/);
-  assert.match(reportText, /展示摘要，完整原始内容保留/);
+  assert.match(reportText, /JSON Pointer）：`\/sessions\/0\/events\/0\/after`/);
+  assert.match(reportText, /原始内容位置（JSON Pointer）：`\/sessions\/0\/events\/0\/after`/);
+  assert.doesNotMatch(reportText, /x{100}/);
   assert.equal(payload.sessions[0].events[0].after.notes.length, 6500);
+});
+
+test('contiguous order-plan drafts are compactly summarized and never called decision counts', () => {
+  const payload = makePayload();
+  const events = Array.from({length: 335}, (_, index) => ({id: `draft-${index}`, seq: index + 1, kind: 'order-plan',
+    recordedAt: new Date(0 + index * 1000).toISOString(), replayMarketTime: 180,
+    before: {draftPlan: {stop: index}, orderHistory: [{id: 'old', trades: Array(10).fill({secret: 'x'.repeat(100)})}]},
+    after: {draftPlan: {stop: index + 1}, orderHistory: [{id: 'old', trades: Array(10).fill({secret: 'x'.repeat(100)})}]}}));
+  payload.sessions[0].events = events;
+  const {reportText} = buildReviewReport(payload);
+  assert.match(reportText, /连续计划草稿交互（335 条；不等于决策次数）/);
+  assert.match(reportText, /序号范围：1–335/);
+  assert.match(reportText, /\/sessions\/0\/events\/0/);
+  assert.doesNotMatch(reportText, /secret.{0,10}xxxxxxxx/);
+  assert.equal(payload.sessions[0].events.length, 335, 'the full raw event stream remains unchanged');
+});
+
+test('pretrade net risk is separate from fill-time R0 and requires explicit user budget', () => {
+  const payload = makePayload();
+  const session = payload.sessions[0].session;
+  session.modelConfigs = [{modelConfigId: 'model-current', engineVersion: 'paper-engine-v2',
+    effectiveFrom: {replayMarketTime: 0}, fee: {openRate: 0.0004, closeRate: 0.0004}, slippage: {rate: 0.0002}}];
+  session.orders = [{id: 'order-1', modelConfigId: 'model-current', type: 'market', side: 1, notional: 100,
+    entryPrice: 100, referencePrice: 100, stop: 90, take: 120, riskBudget: {lossBudget: null}}];
+  session.trades[0].modelConfigId = 'model-current';
+  const {reportText, metricsBySession} = buildReviewReport(payload);
+  const trade = metricsBySession[0].trades[0];
+  assert.equal(trade.pretradeRisk.source, 'recomputed-frozen-config');
+  assert.ok(trade.pretradeRisk.netStopRisk > trade.pretradeRisk.priceRisk);
+  assert.equal(trade.pretradeRisk.lossBudget, null);
+  assert.equal(trade.initialRisk, 10, 'R0 remains the fill-time price-distance denominator');
+  assert.match(reportText, /用户明确填写的亏损预算 未填写/);
+  assert.match(reportText, /分母为成交时初始止损与实际成交价的纯价格差×数量/);
+});
+
+test('explicit null pretrade protection never falls back to a later order protection edit', () => {
+  const payload = makePayload();
+  const session = payload.sessions[0].session;
+  session.modelConfigs = [{modelConfigId: 'model-current', engineVersion: 'paper-engine-v2',
+    effectiveFrom: {replayMarketTime: 0}, fee: {openRate: 0.0004, closeRate: 0.0004}, slippage: {rate: 0.0002}}];
+  session.orders = [{id: 'order-1', modelConfigId: 'model-current', type: 'market', side: 1, notional: 100,
+    entryPrice: 100, referencePrice: 100, stop: 90, take: 120,
+    pretradeRisk: {referencePrice: 100, stop: null, take: null, plannedRiskIncludingCosts: 0}}];
+  session.trades[0].modelConfigId = 'model-current';
+  const trade = buildReviewReport(payload).metricsBySession[0].trades[0];
+  assert.equal(trade.pretradeRisk.priceRisk, null);
+  assert.equal(trade.pretradeRisk.netStopRisk, null);
+  assert.equal(trade.pretradeRisk.expectedTakeProfitNet, null);
 });
 
 test('profit factor infinity stays JSON-safe and reports the no-loss condition explicitly', () => {
