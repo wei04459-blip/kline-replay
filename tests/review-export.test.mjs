@@ -124,7 +124,7 @@ test('incomplete old records are retained and explicitly marked instead of disca
     loadDataset: async () => dataset(), readAudit: async () => ({})});
   const payload = JSON.parse(new TextDecoder().decode((await readStoredZip(output.blob)).get('完整记录.json')));
   assert.equal(payload.history[0].corrupt, 'keep me');
-  assert.equal(payload.sessions[0].coverage.complete, false);
+  assert.equal(payload.sessions[0].coverage.captureCoverageComplete, false);
   assert.match(payload.sessions[0].issues.join('\n'), /缺少可读取的session快照/);
 });
 
@@ -132,9 +132,9 @@ test('HTML review book links only the matching trade screenshots and escapes all
   const session = activeSession('book-round', start + minute, null);
   const dangerous = '</script><img src=x onerror=alert(1)>';
   session.trades = [
-    {id: 'trade-A', orderId: 'order-A', side: 1, entry: 100, exit: 102, qty: 1, entryTime: start, exitTime: start + 600,
+    {id: 'trade-A', orderId: 'order-A', side: 1, entry: 100, exit: 102, qty: 1, entryTime: start, exitTime: start + minute,
       entryReason: dangerous, exitReason: '按计划', reason: '止盈', pnl: 2},
-    {id: 'trade-B', orderId: 'order-B', side: -1, entry: 102, exit: 101, qty: 1, entryTime: start, exitTime: start + 600,
+    {id: 'trade-B', orderId: 'order-B', side: -1, entry: 102, exit: 101, qty: 1, entryTime: start, exitTime: start + minute,
       entryReason: '第二笔', exitReason: '收盘', reason: '手动平仓', pnl: 1},
   ];
   const image = () => new Blob([Uint8Array.of(137, 80, 78, 71, 1, 2, 3)], {type: 'image/png'});
@@ -181,7 +181,7 @@ test('HTML review book links only the matching trade screenshots and escapes all
   const shotPath = '截图/current_book-round_shot-open-A.png';
   const shotHash = createHash('sha256').update(files.get(shotPath)).digest('hex');
   assert.equal(manifest.files.find(entry => entry.path === shotPath).sha256, shotHash);
-  assert.equal(payload.sessions[0].coverage.complete, false, 'market data warmup is intentionally incomplete in the tiny fixture');
+  assert.equal(payload.sessions[0].coverage.captureCoverageComplete, false, 'market data warmup is intentionally incomplete in the tiny fixture');
   assert.equal(payload.sessions[0].coverage.auditComplete, true);
   assert.equal(payload.sessions[0].coverage.screenshotsComplete, true);
 });
@@ -189,7 +189,7 @@ test('HTML review book links only the matching trade screenshots and escapes all
 test('HTML review book orders stages numerically by event sequence, not by event ID or input order', async () => {
   const session = activeSession('ordered-book', start + minute, null);
   session.trades = [{id: 'ordered-trade', orderId: 'ordered-order', side: 1, entry: 100, exit: 101,
-    qty: 1, entryTime: start, exitTime: start + 600, pnl: 1}];
+    qty: 1, entryTime: start, exitTime: start + minute, pnl: 1}];
   const events = [
     {id: 'event-10', seq: 10, kind: 'position-closed', orderId: 'ordered-order', tradeId: 'ordered-trade',
       recordedAt: '2025-01-01T00:10:00Z', visibleThrough: start + minute},
@@ -225,6 +225,61 @@ test('same stable session id in current and history is counted once; backup reta
   assert.doesNotMatch(JSON.stringify(output.payload.legacyStateBackup), /999|500/);
 });
 
+test('as-of snapshots hide future cancellations, protection edits, and exits while restoring known open state', async () => {
+  const session = activeSession('asof-protection', start + minute, null);
+  session.riskChanges = [{id: 'risk-before', seq: 1, orderId: 'order-x', replayMarketTime: start + 30,
+    visibleThrough: start + 30, before: {stop: 80, take: 130}, after: {stop: 90, take: 120}},
+    {id: 'risk-pending-before', seq: 2, orderId: 'pending-y', replayMarketTime: start + 30,
+      visibleThrough: null, before: {stop: 80, take: 130}, after: {stop: 91, take: 121}}];
+  session.accountSnapshots = [{id: 'future-account', seq: 99, visibleThrough: null, replayMarketTime: start + 600, balance: 9000}];
+  session.pending = {id: 'pending-y', status: 'pending', placedTime: start, modifiedTime: start + 600, stop: 70, take: 140};
+  session.orderHistory = [{id: 'order-x', status: 'cancelled', placedTime: start, cancelledTime: start + 600,
+    cancelReason: 'future reason', modifiedTime: start + 600, stop: 70, take: 140}];
+  session.trades = [{id: 'trade-x', orderId: 'order-x', positionId: 'position-x', side: 1, entry: 100, qty: 1,
+    entryTime: start, entryIndex: 2, exit: 70, exitTime: start + 600, exitIndex: 5, reason: 'future exit', pnl: -30,
+    stop: 70, take: 140, initialStop: 90, initialTake: 120, triggerEvidence: {futureExit: true},
+    riskChanges: [{id: 'future-risk', replayMarketTime: start + 600}]}];
+  const output = await buildReviewExport({current: session, history: [], loadDataset: async () => dataset(),
+    readAudit: async () => ({minutes: [candle(start)], events: [], screenshots: [], issues: []})});
+  const files = await readStoredZip(output.blob);
+  const snapshot = JSON.parse(new TextDecoder().decode(files.get('完整记录.json'))).sessions[0].session;
+  assert.equal(snapshot.trades.length, 0);
+  assert.equal(snapshot.position.asOfOpenPosition, true);
+  assert.equal(snapshot.position.stop, 90);
+  assert.equal(snapshot.position.take, 120);
+  assert.equal(snapshot.position.pnl, undefined);
+  assert.equal(snapshot.position.reason, undefined);
+  assert.deepEqual(snapshot.position.riskChanges.map(row => row.id), ['risk-before']);
+  assert.equal(snapshot.orderHistory[0].status, 'pending');
+  assert.equal(snapshot.orderHistory[0].stop, 90);
+  assert.equal(snapshot.orderHistory[0].cancelReason, undefined);
+  assert.equal(snapshot.orderHistory[0].cancelledTime, undefined);
+  assert.equal(snapshot.position.triggerEvidence, undefined);
+  assert.equal(snapshot.pending.stop, 91);
+  assert.equal(snapshot.pending.take, 121);
+  assert.deepEqual(snapshot.accountSnapshots, [], 'null visibleThrough must not become timestamp zero and bypass replayMarketTime');
+});
+
+test('fixed post-exit windows reference only already disclosed minutes and never duplicate candle arrays', async () => {
+  const session = activeSession('post-exit-window', start + 900, null);
+  session.trades = [{id: 'window-trade', orderId: 'window-order', side: 1, entry: 100, exit: 102, qty: 1,
+    entryTime: start, exitTime: start + 120, pnl: 2, fees: 0.08}];
+  const minutes = Array.from({length: 16}, (_, index) => candle(start + index * minute, 100, 101, 99, 100.5, 2));
+  const output = await buildReviewExport({current: session, history: [], loadDataset: async () => dataset(),
+    readAudit: async () => ({minutes, events: [], screenshots: [], issues: []})});
+  const files = await readStoredZip(output.blob);
+  const round = JSON.parse(new TextDecoder().decode(files.get('完整记录.json'))).sessions[0];
+  const window15 = round.session.trades[0].followUpWindows.find(item => item.durationSeconds === 900);
+  assert.equal(window15.status, 'pending');
+  assert.equal(window15.dataRef, 'session.market.minuteCandles');
+  assert.equal(window15.expectedMinuteRows, 15);
+  const observedWindow = round.market.minuteCandles.filter(row => row[0] >= start + 120 && row[0] + 60 <= start + 1020);
+  assert.equal(window15.availableMinuteRows, observedWindow.length);
+  assert.equal(Object.hasOwn(window15, 'candles'), false);
+  assert.ok(round.market.minuteCandles.every(row => row[0] + 60 <= round.coverage.visibleThrough));
+  assert.equal(window15.observedSummary.volumeBase, observedWindow.reduce((sum, row) => sum + row[5], 0));
+});
+
 test('missing key-action screenshot is named and prevents a complete screenshot claim', async () => {
   const session = activeSession('missing-shot', start, null);
   const output = await buildReviewExport({current: session, history: [], loadDataset: async () => dataset(),
@@ -236,6 +291,35 @@ test('missing key-action screenshot is named and prevents a complete screenshot 
   assert.equal(coverage.screenshotCoverage.missingScreenshotCount, 1);
   assert.deepEqual(coverage.screenshotCoverage.missingEventIds, ['open-without-shot']);
   assert.ok(output.issues.some(item => item.message.includes('没有可验证的截图附件')));
+});
+
+test('evidence quality requires a plan per order, ledger endpoint reconciliation, and captures trigger/observation events', async () => {
+  const session = activeSession('evidence-quality', start + minute, null);
+  session.engineVersion = 'isolated-v1';
+  session.initialBalance = 10000;
+  session.balance = 10010;
+  session.orders = [{id: 'planned-order', planId: 'plan-1'}, {id: 'unplanned-order'}];
+  session.reviewPlans = [{planId: 'plan-1', snapshotId: 'plan-shot', visibleThrough: start + minute}];
+  session.modelConfigs = [{modelConfigId: 'model-1'}];
+  session.ledger = [
+    {id: 'ledger-1', seq: 1, type: 'initial-balance', baselineBalance: 10000, cashDelta: 0,
+      balanceAfter: 10000, equityAfter: 10000, usedMarginAfter: 0},
+    {id: 'ledger-2', seq: 2, type: 'entry-fee', cashDelta: 0, balanceAfter: 10000,
+      equityAfter: 10000, usedMarginAfter: 0},
+  ];
+  const events = [
+    {id: 'trigger-event', seq: 1, kind: 'position-triggered', snapshotId: 'trigger-snap', visibleThrough: start + minute, view: {}},
+    {id: 'observation-event', seq: 2, kind: 'observation-recorded', snapshotId: 'observation-snap', visibleThrough: start + minute, view: {}},
+  ];
+  const output = await buildReviewExport({current: session, history: [], loadDataset: async () => dataset(),
+    readAudit: async () => ({recordingStartedAt: '2025-01-01T00:00:00Z', baseline: false,
+      minutes: [candle(start)], events, screenshots: [], issues: []})});
+  const coverage = output.payload.sessions[0].coverage;
+  assert.equal(coverage.evidenceComplete, false);
+  assert.equal(coverage.evidenceCoverage.plans.missingReferences, 1);
+  assert.equal(coverage.evidenceCoverage.ledger.status, 'incomplete', 'tail ledger balance must reconcile to session balance');
+  assert.equal(coverage.screenshotCoverage.expectedKeyActionCount, 2);
+  assert.deepEqual(coverage.screenshotCoverage.missingEventIds, ['trigger-event', 'observation-event']);
 });
 
 test('exporter passes explicit round model evidence, as-of chart bar, gap coverage, and metrics into the real report', async () => {
@@ -268,6 +352,33 @@ test('exporter passes explicit round model evidence, as-of chart bar, gap covera
   assert.equal(output.metricsBySession[0].initialBalance, 10000);
   assert.equal(output.metricsBySession[0].trades[0].anchor, 'trade-model-trade');
   assert.match(output.reportText, /trade-model-trade/);
+});
+
+test('nested immutable model configs override legacy flat rates and identify the actual referenced config', async () => {
+  const session = activeSession('nested-model', start + minute, null);
+  session.simulationModel = {feeRate: 0.09, slippageRate: 0.08, maintenanceMarginRate: 0.07};
+  session.modelConfigId = 'baseline';
+  session.modelConfigs = [
+    {modelConfigId: 'cfg-used', engineVersion: 'engine-v2', productType: 'spot-market-data',
+      executionModel: 'local-isolated-paper-simulator', fee: {openRate: 0.001, closeRate: 0.002},
+      slippage: {rate: 0.003}, margin: {maintenanceRate: 0.01}, effectiveFrom: {recordedAt: '2025-01-01T00:00:00Z', replayMarketTime: start}, baselineOnly: false},
+    {modelConfigId: 'baseline', engineVersion: 'legacy-unversioned', fee: {openRate: 0.09, closeRate: 0.09},
+      slippage: {rate: 0.08}, margin: {maintenanceRate: 0.07}, baselineOnly: true},
+  ];
+  session.orders = [{id: 'nested-order', modelConfigId: 'cfg-used'}];
+  session.fills = [{id: 'nested-fill', orderId: 'nested-order', side: 'entry', modelConfigId: 'cfg-used',
+    time: start, price: 100, qty: 1, fee: 0.2}];
+  session.trades = [{id: 'nested-trade', orderId: 'nested-order', modelConfigId: 'cfg-used', side: 1,
+    entry: 100, exit: 101, qty: 1, entryTime: start, exitTime: start + minute, pnl: 0.6, fees: 0.4,
+    initialStop: 99, initialRiskR0: 1, marginMode: 'isolated-v1'}];
+  const output = await buildReviewExport({current: session, history: [], loadDataset: async () => dataset(),
+    readAudit: async () => ({minutes: [candle(start), candle(start + minute)], events: [], screenshots: [], issues: []})});
+  const record = output.payload.sessions[0];
+  assert.equal(record.modelEvidence.modelConfigId, 'cfg-used');
+  assert.equal(record.modelEvidence.feeRate, 0.002);
+  assert.equal(record.modelEvidence.slippageRate, 0.003);
+  assert.notEqual(record.modelEvidence.feeRate, session.simulationModel.feeRate);
+  assert.equal(output.metricsBySession[0].trades[0].modelConfigId, 'cfg-used');
 });
 
 test('range export shares validated network work without poisoning nextMinute candle cache', async () => {

@@ -39,6 +39,12 @@ function jsonClone(value) {
   try { return JSON.parse(JSON.stringify(value)); } catch { return null; }
 }
 
+export function cloneScreenshotRecord(item) {
+  if (!item || typeof item !== 'object') return null;
+  try { return typeof structuredClone === 'function' ? structuredClone(item) : {...item}; }
+  catch { return {...item}; }
+}
+
 function projection(session) {
   // Callers capture this immediately before mutating the live session. Detach
   // nested records here as well as in observe(), otherwise in-place engine
@@ -65,7 +71,13 @@ function projection(session) {
     trades: session.trades ?? [],
     drawings: session.drawings ?? [],
     notes: session.notes ?? '',
-    simulationModel: session.simulationModel ?? null
+    simulationModel: session.simulationModel ?? null,
+    modelConfigId: session.modelConfigId ?? session.modelEvidence?.modelConfigId ?? session.simulationModel?.modelConfigId ?? null,
+    engineVersion: session.engineVersion ?? null,
+    account: {balance: session.balance ?? null, initialBalance: session.initialBalance ?? null,
+      positionId: session.position?.positionId ?? null, orderId: session.pending?.id ?? null},
+    // Accumulative evidence lives once on the session/export, not in every
+    // event snapshot. Individual events carry their own delta/references.
   });
 }
 
@@ -114,7 +126,7 @@ function inferredKind(before, after) {
 }
 
 function keyAction(kind) {
-  return /^(order-|position-|protection-|drawing-)/.test(kind || '');
+  return /^(order-|position-|protection-|drawing-|plan-|observation-)/.test(kind || '');
 }
 
 export function createReviewRecorder() {
@@ -149,6 +161,21 @@ export function createReviewRecorder() {
     const capturedView = jsonClone(options.view || {});
     const capturedBefore = jsonClone(options.before);
     const capturedAfter = jsonClone(options.after);
+    const capturedModification = jsonClone(options.modification);
+    const capturedReferences = jsonClone(options.references);
+    const capturedReason = typeof options.reason === 'string' ? options.reason : null;
+    const capturedPlanId = typeof options.planId === 'string' ? options.planId : null;
+    const capturedThesisId = typeof options.thesisId === 'string' ? options.thesisId : null;
+    const capturedParentTradeId = typeof options.parentTradeId === 'string' ? options.parentTradeId : null;
+    const capturedObservationId = typeof options.observationId === 'string' ? options.observationId : null;
+    const capturedStrategyVersion = typeof options.strategyVersion === 'string' ? options.strategyVersion : null;
+    const capturedAttemptNumber = Number.isInteger(options.attemptNumber) ? options.attemptNumber : null;
+    const capturedSnapshotId = typeof options.snapshotId === 'string' ? options.snapshotId : null;
+    const capturedModelConfigId = typeof options.modelConfigId === 'string' ? options.modelConfigId : null;
+    const capturedActor = options.actor || 'user';
+    const capturedTimingClass = options.timingClass || null;
+    const capturedRecordedAt = typeof options.recordedAt === 'string' ? options.recordedAt : null;
+    const capturedCaptureType = typeof options.captureType === 'string' ? options.captureType : 'live-chart-canvas-plus-composited-overlays';
     const recordedAt = new Date().toISOString();
     // Invoke the provider before queuing IndexedDB work so the screenshot freezes
     // the exact canvas state at the action, even while replay continues.
@@ -198,9 +225,22 @@ export function createReviewRecorder() {
       const seq = Math.max(latestMeta?.nextSeq || 1, (highWater.get(sessionId) || 0) + 1);
       const concurrentChange = !!(latestMeta?.lastState && !same(latestMeta.lastState, beforeState));
       const event = {
-        id: `${sessionId}:${seq}`, sessionId, seq, kind, recordedAt, replayMarketTime: visibleThrough, visibleThrough,
+        id: `${sessionId}:${seq}`, sessionId, seq, kind, recordedAt: capturedRecordedAt || recordedAt, replayMarketTime: visibleThrough, visibleThrough,
         before: capturedBefore ?? beforeState, after: capturedAfter ?? afterState,
         view: capturedView, screenshotId: null,
+        snapshotId: capturedSnapshotId || (keyAction(kind) ? `${sessionId}:snapshot:${seq}` : null),
+        actor: capturedActor,
+        modelConfigId: capturedModelConfigId || snapshot.modelConfigId || null,
+        ...(capturedPlanId ? {planId: capturedPlanId} : {}),
+        ...(capturedThesisId ? {thesisId: capturedThesisId} : {}),
+        ...(capturedParentTradeId ? {parentTradeId: capturedParentTradeId} : {}),
+        ...(capturedObservationId ? {observationId: capturedObservationId} : {}),
+        ...(capturedStrategyVersion ? {strategyVersion: capturedStrategyVersion} : {}),
+        ...(capturedAttemptNumber !== null ? {attemptNumber: capturedAttemptNumber} : {}),
+        ...(capturedTimingClass ? {timingClass: capturedTimingClass} : {}),
+        ...(capturedModification ? {modification: capturedModification} : {}),
+        ...(capturedReferences ? {references: capturedReferences} : {}),
+        ...(capturedReason !== null ? {reason: capturedReason} : {}),
         ...(concurrentChange?{concurrentChange:true}:{}),
         ...(screenshotMissing?{screenshotMissing:true}:{}),
         ...(typeof options.orderId==='string'?{orderId:options.orderId}:{}),
@@ -209,7 +249,7 @@ export function createReviewRecorder() {
       if (screenshotBlob instanceof Blob && keyAction(kind)) {
         screenshotId = `${sessionId}:${seq}:${Date.now()}`;
         event.screenshotId = screenshotId;
-        screenshots.put({id: screenshotId, sessionId, eventId: `${sessionId}:${seq}`, blob: screenshotBlob, mimeType: screenshotBlob.type || 'image/png', captureType: 'live-chart-canvas-plus-composited-overlays'});
+        screenshots.put({id: screenshotId, sessionId, eventId: `${sessionId}:${seq}`, blob: screenshotBlob, mimeType: screenshotBlob.type || 'image/png', captureType: capturedCaptureType});
       }
       events.put(event);
       const nextMeta = latestMeta || {
@@ -267,6 +307,64 @@ export function createReviewRecorder() {
     });
   }
 
+  async function importSessionArchive(archive, {contentHash = null} = {}) {
+    const session = archive?.session;
+    if (!session || typeof session.id !== 'string' || !session.id || typeof session.symbol !== 'string') {
+      throw new TypeError('导入练习缺少有效的session身份');
+    }
+    const sessionId = String(session.id);
+    const events = Array.isArray(archive.events) ? archive.events.map(jsonClone).filter(Boolean) : [];
+    const screenshots = Array.isArray(archive.screenshots) ? archive.screenshots.map(cloneScreenshotRecord).filter(Boolean) : [];
+    const minutes = Array.isArray(archive.minutes) ? archive.minutes.map(row => Array.isArray(row) ? row.slice(0, 6) : null).filter(row => row?.length === 6 && row.every(Number.isFinite)) : [];
+    const importedAt = new Date().toISOString();
+    return enqueue(async () => {
+      const database = await db();
+      const tx = database.transaction(['sessions', 'events', 'screenshots', 'minutes'], 'readwrite');
+      const done = transactionDone(tx), sessions = tx.objectStore('sessions');
+      const existing = await requestResult(sessions.get(sessionId));
+      if (existing) {
+        await done;
+        if (contentHash && existing.importContentHash === contentHash) return {status: 'duplicate', sessionId};
+        return {status: 'conflict', sessionId, conflictId: `${sessionId}:import:${Date.now()}`};
+      }
+      if (events.some(event => !Number.isInteger(event.seq) || event.seq < 1 || (event.sessionId && String(event.sessionId) !== sessionId))) {
+        tx.abort(); await done.catch(()=>{}); throw new TypeError('导入事件序号或sessionId无效');
+      }
+      const screenshotStore = tx.objectStore('screenshots');
+      const existingScreenshots = await Promise.all(screenshots.map(item => item?.id ? requestResult(screenshotStore.get(item.id)) : Promise.resolve(null)));
+      if (screenshots.some((item,index) => !item?.id || !(item.blob instanceof Blob) || (existingScreenshots[index] && existingScreenshots[index].sessionId !== sessionId))) {
+        tx.abort(); await done.catch(()=>{}); throw new Error('导入截图ID冲突或图片数据无效，未写入本轮资料');
+      }
+      const maxSeq = events.reduce((max, event) => Math.max(max, event.seq), 0);
+      sessions.put({sessionId, recordingStartedAt: archive.recordingStartedAt || archive.coverage?.auditRecordingStartedAt || importedAt, baseline: archive.baseline ?? archive.coverage?.auditBaseline ?? true, imported: true,
+        importedAt, importContentHash: contentHash || null, sourceMetadata: jsonClone(archive.sourceMetadata), coverage: jsonClone(archive.coverage),
+        // The sidebar/localStorage keeps only a lean session index. Preserve the
+        // original imported session here so re-export can retain accounting,
+        // fills, and model evidence without copying them into localStorage.
+        archivedSession: jsonClone(session),
+        issues: Array.isArray(archive.issues) ? archive.issues.slice() : ['此轮来自导入归档；导入前本地过程缺失情况以原包标记为准。'],
+        nextSeq: maxSeq + 1, lastState: jsonClone(projection(session))});
+      const eventStore = tx.objectStore('events'), minuteStore = tx.objectStore('minutes');
+      for (const event of events) {
+        event.sessionId = sessionId;
+        if (!event.id) event.id = `${sessionId}:${event.seq}`;
+        eventStore.put(event);
+      }
+      for (const screenshot of screenshots) {
+        if (!screenshot?.id || !(screenshot.blob instanceof Blob)) continue;
+        screenshot.sessionId = sessionId;
+        screenshotStore.put(screenshot);
+      }
+      let visibleThrough = Number.isFinite(session.minuteCursorTime) ? session.minuteCursorTime + 60 : Number.MAX_SAFE_INTEGER;
+      for (const row of minutes) {
+        if (row[0] + 60 > visibleThrough) continue;
+        minuteStore.put({sessionId, time: row[0], row, recordedAt: importedAt});
+      }
+      await done;
+      return {status: 'imported', sessionId};
+    }, sessionId);
+  }
+
   async function flush() {
     await queue;
     if (dbPromise) await db();
@@ -293,11 +391,15 @@ export function createReviewRecorder() {
       sessionId: String(sessionId), events, screenshots, minutes,
       recordingStartedAt: meta?.recordingStartedAt ?? null,
       baseline: meta?.baseline ?? true,
+      imported: meta?.imported ?? false,
+      archivedSession: jsonClone(meta?.archivedSession ?? null),
+      sourceMetadata: jsonClone(meta?.sourceMetadata ?? null),
+      coverage: jsonClone(meta?.coverage ?? null),
       issues: [...(meta?.issues || []), ...(failureIssues.get(String(sessionId)) || []), ...(!meta ? ['此轮在过程记录启用前已开始，未记录此前的操作和分钟行情'] : [])]
     };
   }
 
-  return {observe, appendMinute, flush, readSession, captureWatermarks};
+  return {observe, appendMinute, flush, readSession, captureWatermarks, importSessionArchive};
 }
 
 export {projection as reviewStateProjection, inferredKind as inferReviewEventKind};

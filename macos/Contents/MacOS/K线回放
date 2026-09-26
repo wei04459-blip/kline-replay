@@ -27,7 +27,7 @@ import sys
 directory = Path(sys.argv[1])
 digest = hashlib.sha256()
 for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs", "drawings.mjs",
-             "review-export.mjs", "review-report.mjs", "review-recorder.mjs"):
+             "review-export.mjs", "review-report.mjs", "review-import.mjs", "review-recorder.mjs", "review-plans.mjs", "review-summary.mjs"):
     path = directory / name
     if path.is_file():
         digest.update(name.encode())

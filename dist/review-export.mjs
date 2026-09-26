@@ -8,8 +8,9 @@ const WEEK = 7 * 24 * 60 * 60;
 const MONDAY_OFFSET = 4 * 24 * 60 * 60;
 const SYMBOLS = new Set(['BTCUSDT', 'ETHUSDT']);
 const ZIP_LIMIT = 0xffffffff;
-const SCREENSHOT_ACTIONS = new Set(['order-submitted', 'order-filled', 'order-processed', 'order-modified', 'order-cancelled',
-  'order-history-changed', 'protection-changed', 'protection-modified', 'position-opened', 'position-closed', 'position-auto-closed', 'liquidated']);
+const SCREENSHOT_ACTIONS = new Set(['order-submitted', 'order-plan-locked', 'plan-supplemented', 'order-filled', 'order-processed', 'order-modified', 'order-cancelled',
+  'order-history-changed', 'protection-changed', 'protection-modified', 'position-opened', 'position-close-requested',
+  'position-closed', 'position-auto-closed', 'position-triggered', 'liquidated', 'observation-recorded']);
 
 const utf8 = new TextEncoder();
 const APP_ASSET_VERSION = new URL(import.meta.url).searchParams.get('v') || null;
@@ -111,6 +112,49 @@ function normalizeDataset(payload, symbol, issues) {
 }
 
 function modelEvidenceFor(session) {
+  const configs = Array.isArray(session?.modelConfigs) ? session.modelConfigs : [];
+  const referencedIds = new Set([
+    ...(Array.isArray(session?.orders) ? session.orders : []).map(item => item?.modelConfigId),
+    ...(Array.isArray(session?.fills) ? session.fills : []).map(item => item?.modelConfigId),
+    ...(Array.isArray(session?.trades) ? session.trades : []).map(item => item?.modelConfigId),
+  ].filter(id => typeof id === 'string'));
+  if (!referencedIds.size && typeof session?.modelConfigId === 'string') referencedIds.add(session.modelConfigId);
+  const evidenceConfigs = configs.filter(config => (!config?.baselineOnly || referencedIds.has(config?.modelConfigId)) &&
+    (!referencedIds.size || referencedIds.has(config?.modelConfigId)));
+  const configRates = evidenceConfigs.map(config => ({config,
+    feeRate: config?.fee?.closeRate, slippageRate: config?.slippage?.rate,
+    maintenanceMarginRate: config?.margin?.maintenanceRate})).filter(item =>
+    Number.isFinite(item.feeRate) && item.feeRate >= 0 && Number.isFinite(item.slippageRate) && item.slippageRate >= 0 &&
+    Number.isFinite(item.maintenanceMarginRate) && item.maintenanceMarginRate >= 0 && item.maintenanceMarginRate < 1);
+  if (configRates.length) {
+    const tradeConfig = trade => {
+      const orderId = trade?.orderId;
+      const fill = (session?.fills ?? []).find(item => item?.side === 'entry' &&
+        (item.tradeId === trade?.id || item.positionId === trade?.positionId || (!!orderId && item.orderId === orderId)));
+      const order = (session?.orders ?? []).find(item => item?.id === orderId || item?.orderId === orderId);
+      const id = trade?.modelConfigId ?? fill?.modelConfigId ?? order?.modelConfigId;
+      const config = configs.find(item => item?.modelConfigId === id);
+      const entry = Number.isFinite(trade?.entryTime) ? trade.entryTime : Number.isFinite(fill?.time) ? fill.time :
+        Number.isFinite(order?.fillTime) ? order.fillTime : null;
+      const effective = Number.isFinite(config?.effectiveFrom?.replayMarketTime) ? config.effectiveFrom.replayMarketTime : null;
+      return !!config && !!id && (!config.effectiveFrom || entry !== null && effective !== null && entry >= effective);
+    };
+    const unresolvedTrades = (session?.trades ?? []).filter(trade => !tradeConfig(trade));
+    const signatures = new Set(configRates.map(item => `${item.feeRate}/${item.slippageRate}/${item.maintenanceMarginRate}`));
+    if (signatures.size === 1 && unresolvedTrades.length === 0) {
+      const {config, feeRate, slippageRate, maintenanceMarginRate} = configRates[0];
+      return {applicableToSession: true, modelConfigId: config.modelConfigId, engineVersion: config.engineVersion,
+        feeRate, slippageRate, maintenanceMarginRate, source: 'session-model-config',
+        effectiveFrom: config.effectiveFrom ?? null,
+        applicabilityReason: configRates.length > 1 ? '本轮引用的模型配置费率一致。' : null};
+    }
+    return {applicableToSession: false, feeRate: null, slippageRate: null, maintenanceMarginRate: null,
+      source: 'mixed-or-unverified-session-model-configs', applicabilityReason: unresolvedTrades.length
+        ? '部分交易未关联适用生效时间内的模型配置' : '会话引用了不同费率的模型配置；总体费率不合并。'};
+  }
+  if (configs.length) return {applicableToSession: false, feeRate: null, slippageRate: null,
+    maintenanceMarginRate: null, source: 'unknown-or-unreferenced-model-config',
+    applicabilityReason: '旧交易没有引用可证明的模型配置；升级基线只适用于其生效后明确关联的操作。'};
   if (session?.modelEvidence?.applicableToSession === false) return {...session.modelEvidence,
     feeRate: null, slippageRate: null, maintenanceMarginRate: null,
     source: session.modelEvidence.source ?? 'explicitly-not-applicable'};
@@ -157,6 +201,121 @@ function findGaps(rows, interval, type) {
   return gaps;
 }
 
+function postExitWindows(trade, minuteCandles, cutoff) {
+  const exitTime = Number.isFinite(trade?.exitTime) ? trade.exitTime :
+    typeof trade?.exitTime === 'string' && Number.isFinite(Date.parse(trade.exitTime)) ? Date.parse(trade.exitTime) / 1000 : null;
+  if (exitTime === null) return [900, 3600, 14400].map(durationSeconds => ({durationSeconds, status: 'unavailable',
+    reason: '交易缺少可核验的退出行情时间。', candles: []}));
+  const from = Math.ceil(exitTime / MINUTE) * MINUTE; // Exclude the minute containing the exit event.
+  return [900, 3600, 14400].map(durationSeconds => {
+    const to = exitTime + durationSeconds;
+    const expectedTimes = [];
+    for (let time = from; time + MINUTE <= to; time += MINUTE) expectedTimes.push(time);
+    const candles = minuteCandles.filter(row => row[0] >= from && row[0] + MINUTE <= to && row[0] + MINUTE <= cutoff);
+    const observedTimes = new Set(candles.map(row => row[0]));
+    const missingOpenTimes = expectedTimes.filter(time => time + MINUTE <= cutoff && !observedTimes.has(time));
+    const complete = cutoff >= to && candles.length === expectedTimes.length && candles.every((row, index) => row[0] === expectedTimes[index]);
+    const gap = candles.length !== expectedTimes.filter(time => time + MINUTE <= cutoff).length;
+    return {durationSeconds, visibleFrom: from, windowEnd: to, visibleThrough: Math.min(cutoff, to),
+      status: complete ? 'complete' : cutoff < to ? 'pending' : gap ? 'coverage-gap' : 'incomplete',
+      expectedMinuteRows: expectedTimes.length,
+      availableMinuteRows: candles.length, dataRef: 'session.market.minuteCandles', missingOpenTimes,
+      observedSummary: candles.length ? {firstOpen: candles[0][1], highest: Math.max(...candles.map(row => row[2])),
+        lowest: Math.min(...candles.map(row => row[3])), lastClose: candles.at(-1)[4], volumeBase: candles.reduce((sum, row) => sum + row[5], 0)} : null,
+      note: '固定市场时间窗口；排除包含退出事件的分钟，不生成反事实盈亏或行为评分。'};
+  });
+}
+
+function evidenceCoverageFor(session, events) {
+  const plans = Array.isArray(session?.reviewPlans) ? session.reviewPlans : [];
+  const orders = Array.isArray(session?.orders) ? session.orders : [];
+  const fills = Array.isArray(session?.fills) ? session.fills : [];
+  const trades = Array.isArray(session?.trades) ? session.trades : [];
+  const configs = Array.isArray(session?.modelConfigs) ? session.modelConfigs : [];
+  const ordersById = new Map(orders.map(order => [order.id, order]));
+  const plansById = new Map(plans.map(plan => [plan.planId, plan]));
+  const fillsById = new Map(fills.map(fill => [fill.id, fill]));
+  const configIds = new Set(configs.map(config => config.modelConfigId));
+  const tradeIds = new Set(trades.flatMap(trade => [trade.id, trade.tradeId]).filter(Boolean));
+  const planIds = new Set(plans.map(plan => plan.planId).filter(Boolean));
+  const thesisIds = new Set((session?.theses ?? []).map(thesis => thesis.thesisId).filter(Boolean));
+  const eventSnapshotIds = new Set((events ?? []).map(event => event.snapshotId).filter(Boolean));
+  const positionIds = new Set([...trades.map(trade => trade.positionId), session?.position?.positionId].filter(Boolean));
+  const missingEventRefs = events.filter(event =>
+    event.orderId && !ordersById.has(event.orderId) && !(session?.orderHistory ?? []).some(order => order.id === event.orderId) ||
+    event.tradeId && !tradeIds.has(event.tradeId) && session?.position?.tradeId !== event.tradeId ||
+    event.planId && !planIds.has(event.planId)).map(event => event.id ?? event.seq ?? 'unknown');
+  const modelReferences = [...orders, ...fills, ...trades].filter(item => item.modelConfigId || session.engineVersion);
+  const missingModels = modelReferences.filter(item => typeof item.modelConfigId !== 'string' || !configIds.has(item.modelConfigId)).length;
+  const linkedPlans = orders.filter(order => order.planId && plansById.has(order.planId)).length;
+  const missingPlanReferences = orders.filter(order => !order.planId || !plansById.has(order.planId)).length;
+  const missingPlanSnapshots = plans.filter(plan => {
+    const visible = plan.visibleThrough;
+    const validTime = typeof visible === 'number' ? Number.isFinite(visible) && visible >= 0
+      : typeof visible === 'string' && visible.trim() !== '' && Number.isFinite(Date.parse(visible));
+    return !validTime || typeof plan.snapshotId !== 'string' || !eventSnapshotIds.has(plan.snapshotId);
+  }).length;
+  const missingThesisReferences = [
+    ...orders.filter(order => order.thesisId && !thesisIds.has(order.thesisId)).map(order => `order:${order.id}:thesis:${order.thesisId}`),
+    ...trades.filter(trade => trade.thesisId && !thesisIds.has(trade.thesisId)).map(trade => `trade:${trade.id}:thesis:${trade.thesisId}`),
+    ...(session?.observations ?? []).filter(item => item.thesisId && !thesisIds.has(item.thesisId)).map(item => `observation:${item.observationId}:thesis:${item.thesisId}`),
+  ];
+  const missingFillLinks = trades.filter(trade => {
+    const entry = fillsById.get(trade.entryFillId), exit = fillsById.get(trade.exitFillId);
+    return !entry || entry.side !== 'entry' || !exit || exit.side !== 'exit' || exit.tradeId !== (trade.tradeId ?? trade.id);
+  }).length;
+  const keyEvents = events.filter(event => SCREENSHOT_ACTIONS.has(event.kind));
+  const missingSnapshots = keyEvents.filter(event => !event.snapshotId || !event.view || typeof event.view !== 'object').length;
+  const observedLedger = Array.isArray(session?.ledger) ? session.ledger : null;
+  let ledgerValid = !!observedLedger?.length;
+  if (ledgerValid) {
+    const ordered = [...observedLedger].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    const ledgerIds = new Set();
+    for (let index = 0; index < ordered.length; index += 1) {
+      const row = ordered[index];
+      if (!row || typeof row.id !== 'string' || ledgerIds.has(row.id) || row.seq !== index + 1 ||
+          ![row.cashDelta, row.balanceAfter, row.equityAfter, row.usedMarginAfter].every(Number.isFinite)) { ledgerValid = false; break; }
+      ledgerIds.add(row.id);
+      if (index === 0) {
+        if (!Number.isFinite(row.baselineBalance) || Math.abs(row.baselineBalance + row.cashDelta - row.balanceAfter) > 0.02) ledgerValid = false;
+      } else if (Math.abs(ordered[index - 1].balanceAfter + row.cashDelta - row.balanceAfter) > 0.02) ledgerValid = false;
+      if (row.fillId && !fillsById.has(row.fillId)) ledgerValid = false;
+      if (row.orderId && !ordersById.has(row.orderId)) ledgerValid = false;
+      if (row.tradeId && !tradeIds.has(row.tradeId)) ledgerValid = false;
+      if (row.positionId && !positionIds.has(row.positionId)) ledgerValid = false;
+    }
+    const first = ordered[0];
+    const last = ordered.at(-1);
+    if (!Number.isFinite(session.initialBalance) || !Number.isFinite(session.balance) ||
+        !Number.isFinite(first?.baselineBalance) || Math.abs(first.baselineBalance - session.initialBalance) > 0.02 ||
+        Math.abs(last.balanceAfter - session.balance) > 0.02) ledgerValid = false;
+  }
+  const evidence = {
+    modelConfigs: {status: !session.engineVersion ? 'unknown-legacy' : missingModels ? 'incomplete' : configs.length ? 'complete' : 'missing',
+      expected: modelReferences.length, available: modelReferences.length - missingModels, missing: missingModels},
+    immutableOrders: {status: !session.engineVersion ? 'unknown-legacy' : Array.isArray(session.orders) ? 'complete' : 'missing',
+      expected: trades.length, available: orders.length},
+    fills: {status: !session.engineVersion ? 'unknown-legacy' : missingFillLinks ? 'incomplete' : Array.isArray(session.fills) ? 'complete' : 'missing',
+      expected: trades.length * 2, available: fills.length, missingTradeLinks: missingFillLinks},
+    ledger: {status: !session.engineVersion ? 'unknown-legacy' : ledgerValid ? 'complete' : 'incomplete',
+      available: observedLedger?.length ?? 0, missingOrInvalidReferences: ledgerValid ? 0 : 1},
+    riskChanges: {status: !session.engineVersion ? 'unknown-legacy' : Array.isArray(session.riskChanges) ? 'present' : 'missing',
+      available: session.riskChanges?.length ?? 0},
+    plans: {status: !session.engineVersion ? 'unknown-legacy' : missingPlanReferences || missingPlanSnapshots ? 'incomplete' : plans.length ? 'present' : orders.length ? 'incomplete' : 'not-applicable',
+      expected: orders.length, available: linkedPlans, missingReferences: missingPlanReferences, missingSnapshotsOrTimes: missingPlanSnapshots},
+    snapshots: {status: !session.engineVersion ? 'unknown-legacy' : missingSnapshots ? 'incomplete' : keyEvents.length ? 'complete' : 'not-applicable',
+      expected: keyEvents.length, available: keyEvents.length - missingSnapshots, missing: missingSnapshots},
+    references: {status: !session.engineVersion ? 'unknown-legacy' : missingEventRefs.length || missingThesisReferences.length ? 'incomplete' : 'complete',
+      missingEventRefs, missingThesisReferences},
+    drawings: {status: Array.isArray(session.drawingVersions) ? 'present' : 'unknown-legacy', available: session.drawingVersions?.length ?? 0},
+    theses: {status: Array.isArray(session.theses) ? 'present' : 'unknown-legacy', available: session.theses?.length ?? 0},
+    observations: {status: Array.isArray(session.observations) ? 'present' : 'unknown-legacy', available: session.observations?.length ?? 0},
+  };
+  const required = ['modelConfigs', 'immutableOrders', 'fills', 'ledger', 'riskChanges', 'plans', 'snapshots', 'references'];
+  const complete = required.every(key => ['complete', 'present', 'not-applicable'].includes(evidence[key].status));
+  return {evidence, evidenceComplete: complete};
+}
+
 function monthKey(url) {
   return String(url || '').match(/-(\d{4})-(\d{2})\.zip(?:\.CHECKSUM)?$/)?.slice(1).join('-') ?? null;
 }
@@ -182,6 +341,7 @@ function collectRoundInputs(current, history) {
     }
     add({slot: `history-${index}`, id: item.id ?? item.session?.id ?? null,
       session: item.session ? clone(item.session) : null, archivedAt: item.archivedAt ?? null,
+      imported: item.imported === true || item.sourceMetadata?.origin === 'review-zip-import' || item.sourceMetadata?.origin === 'v1-import',
       rawInvalidRecord: item.session ? undefined : clone(item)});
   }
   result.duplicates = duplicates;
@@ -271,8 +431,51 @@ function redactFutureOutcomes(target, cutoff, rows, issues, label) {
   if (!target || typeof target !== 'object' || !Number.isFinite(cutoff)) return 0;
   let count = 0;
   const epoch = value => typeof value === 'string' && !Number.isFinite(Number(value)) ? Date.parse(value) / 1000 : Number(value);
+  const originalRiskChanges = Array.isArray(target.riskChanges) ? target.riskChanges : [];
+  const riskTime = item => {
+    for (const value of [item?.visibleThrough, item?.replayMarketTime, item?.time]) {
+      if (value === null || value === undefined || value === '') continue;
+      const parsed = typeof value === 'string' && !Number.isFinite(Number(value)) ? Date.parse(value) / 1000 : Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+  const visibleRiskChange = (orderId, positionId) => originalRiskChanges.filter(change =>
+    (orderId && change.orderId === orderId || positionId && change.positionId === positionId) &&
+    riskTime(change) !== null && riskTime(change) <= cutoff).sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0)).at(-1);
+  const scrubRiskHistory = item => {
+    if (!Array.isArray(item.riskChanges)) return;
+    item.riskChanges = item.riskChanges.filter(change => riskTime(change) === null || riskTime(change) <= cutoff);
+  };
   const redact = (item, kind) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+    const modifiedTime = item.modifiedTime == null ? NaN : epoch(item.modifiedTime);
+    if (Number.isFinite(modifiedTime) && modifiedTime > cutoff) {
+      const previous = visibleRiskChange(item.orderId ?? item.id, item.positionId);
+      if (previous?.after && typeof previous.after === 'object') {
+        if (Object.hasOwn(previous.after, 'stop')) item.stop = previous.after.stop;
+        if (Object.hasOwn(previous.after, 'take')) item.take = previous.after.take;
+      } else {
+        if (Object.hasOwn(item, 'stop')) item.stop = kind === 'trade' && Object.hasOwn(item, 'initialStop') ? item.initialStop : null;
+        if (Object.hasOwn(item, 'take')) item.take = kind === 'trade' && Object.hasOwn(item, 'initialTake') ? item.initialTake : null;
+      }
+      delete item.modifiedTime; delete item.modifiedAt;
+      item.futureProtectionRedacted = true;
+      count += 1;
+      issues.push(`${label}含有晚于披露边界的保护价修改，已还原到可证的保护状态。`);
+    }
+    scrubRiskHistory(item);
+    const cancelTime = item.cancelledTime ?? item.canceledTime ?? item.cancelTime;
+    const cancelIndex = item.cancelledIndex ?? item.canceledIndex;
+    const cancelRow = Number.isInteger(cancelIndex) ? rows[cancelIndex] : null;
+    const cancelledAt = cancelTime == null ? (validCandle(cancelRow, BASE) ? cancelRow[0] + BASE : NaN) : epoch(cancelTime);
+    if (kind === 'order' && Number.isFinite(cancelledAt) && cancelledAt > cutoff) {
+      for (const field of ['cancelledTime', 'canceledTime', 'cancelTime', 'cancelledIndex', 'canceledIndex', 'cancelReason']) delete item[field];
+      if (item.status === 'cancelled' || item.status === 'canceled') item.status = 'pending';
+      item.futureCancellationRedacted = true;
+      count += 1;
+      issues.push(`${label}含有晚于披露边界的撤单结果，已恢复为当时尚未撤销的状态。`);
+    }
     let after = false;
     const rawTime = item.exitTime ?? item.fillTime ?? item.filledAt;
     const exitTime = rawTime == null ? NaN : epoch(rawTime);
@@ -280,20 +483,111 @@ function redactFutureOutcomes(target, cutoff, rows, issues, label) {
     else if (Number.isInteger(item.exitIndex)) {
       const row = rows[item.exitIndex];
       after = validCandle(row, BASE) && row[0] + BASE > cutoff;
+    } else if (kind === 'order' && Number.isInteger(item.fillIndex)) {
+      const row = rows[item.fillIndex];
+      after = validCandle(row, BASE) && row[0] + BASE > cutoff;
     }
     if (!after) return;
     const fields = kind === 'trade'
       ? ['exit', 'exitTime', 'exitIndex', 'reason', 'exitReason', 'pnl', 'fees', 'grossPnl', 'exitFee', 'isolatedAdjustment']
       : ['fillTime', 'filledAt', 'fillPrice', 'fillQty', 'fillIndex', 'averagePrice'];
     for (const field of fields) if (Object.hasOwn(item, field)) item[field] = null;
-    if (kind === 'order' && Object.hasOwn(item, 'status')) item.status = 'future-result-redacted';
+    if (kind === 'order' && Object.hasOwn(item, 'status')) item.status = 'pending';
     item.futureOutcomeRedacted = true;
     count += 1;
     issues.push(`${label}含有晚于该时点的${kind === 'trade' ? '成交结果' : '订单结果'}，其结果字段已脱敏。`);
   };
-  if (Array.isArray(target.trades)) for (const trade of target.trades) redact(trade, 'trade');
-  if (Array.isArray(target.orderHistory)) for (const order of target.orderHistory) redact(order, 'order');
+  const asOfOpen = [];
+  if (Array.isArray(target.trades)) {
+    const retained = [];
+    for (const trade of target.trades) {
+      const exitValue = trade?.exitTime;
+      const exitTime = exitValue == null ? NaN : epoch(exitValue);
+      const entryTime = epoch(trade?.entryTime ?? trade?.entryTimeSec);
+      if (Number.isFinite(exitTime) && exitTime > cutoff && Number.isFinite(entryTime) && entryTime <= cutoff) {
+        const open = clone(trade);
+        for (const field of ['id', 'tradeId', 'exit', 'exitTime', 'exitIndex', 'reason', 'exitReason', 'pnl', 'fees', 'grossPnl',
+          'exitFee', 'isolatedAdjustment', 'exitFillId', 'executionEvidence', 'triggerEvidence', 'closeReason', 'status', 'closedAt', 'exitType']) delete open[field];
+        open.entryTime = entryTime;
+        open.asOfOpenPosition = true;
+        open.riskChanges = originalRiskChanges.filter(change =>
+          (change.orderId === open.orderId || change.positionId === open.positionId) && riskTime(change) !== null && riskTime(change) <= cutoff);
+        const previous = visibleRiskChange(open.orderId, open.positionId);
+        if (previous?.after && typeof previous.after === 'object') {
+          if (Object.hasOwn(previous.after, 'stop')) open.stop = previous.after.stop;
+          if (Object.hasOwn(previous.after, 'take')) open.take = previous.after.take;
+        } else {
+          if (Object.hasOwn(open, 'initialStop')) open.stop = open.initialStop;
+          if (Object.hasOwn(open, 'initialTake')) open.take = open.initialTake;
+        }
+        scrubRiskHistory(open);
+        asOfOpen.push(open);
+        issues.push(`${label}的一笔交易在截止后才退出；导出中按当时仍持仓处理，隐藏未来退出与盈亏。`);
+        count += 1;
+      } else {
+        redact(trade, 'trade');
+        retained.push(trade);
+      }
+    }
+    target.trades = retained;
+  }
+  if (Array.isArray(target.orderHistory)) {
+    target.orderHistory = target.orderHistory.filter(order => {
+      const placed = order?.placedTime == null ? NaN : epoch(order.placedTime);
+      const placedRow = Number.isInteger(order?.placedIndex) ? rows[order.placedIndex] : null;
+      const after = Number.isFinite(placed) ? placed > cutoff : validCandle(placedRow, BASE) && placedRow[0] + BASE > cutoff;
+      if (after) { count += 1; issues.push(`${label}中的订单是在披露截止后才提交，已隐藏。`); return false; }
+      redact(order, 'order');
+      return true;
+    });
+  }
+  if (target.position) redact(target.position, 'trade');
+  if (target.pending) redact(target.pending, 'order');
+  if (asOfOpen.length) {
+    const active = target.position && Number.isFinite(epoch(target.position.entryTime ?? target.position.entryTimeSec)) &&
+      epoch(target.position.entryTime ?? target.position.entryTimeSec) <= cutoff ? target.position : asOfOpen.sort((a,b)=>a.entryTime-b.entryTime).at(-1);
+    if (active) target.position = active;
+  }
+  const positionTime = target.position ? epoch(target.position.entryTime ?? target.position.entryTimeSec) : NaN;
+  if (target.position && Number.isFinite(positionTime) && positionTime > cutoff) {
+    target.position = null; issues.push(`${label}的当前持仓晚于披露边界，已排除。`); count += 1;
+  }
+    const pendingTime = target.pending ? epoch(target.pending.placedTime) : NaN;
+  if (target.pending && Number.isFinite(pendingTime) && pendingTime > cutoff) {
+    target.pending = null; issues.push(`${label}的当前挂单晚于披露边界，已排除。`); count += 1;
+  }
   return count;
+}
+
+function restrictEvidenceToCutoff(target, cutoff, rows, issues, label) {
+  if (!target || typeof target !== 'object' || !Number.isFinite(cutoff)) return;
+  const at = item => {
+    for (const value of [item?.visibleThrough, item?.replayMarketTime, item?.time, item?.placedTime,
+      item?.effectiveFrom?.replayMarketTime]) {
+      if (value === null || value === undefined || typeof value === 'string' && !value.trim()) continue;
+      const parsed = typeof value === 'string' && !Number.isFinite(Number(value)) ? Date.parse(value) / 1000 : Number(value);
+      if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+    }
+    if (Number.isInteger(item?.index) && validCandle(rows[item.index], BASE)) return rows[item.index][0] + BASE;
+    if (Number.isInteger(item?.placedIndex) && validCandle(rows[item.placedIndex], BASE)) return rows[item.placedIndex][0] + BASE;
+    return null;
+  };
+  const collections = ['modelConfigs', 'orders', 'fills', 'ledger', 'accountSnapshots', 'riskChanges',
+    'reviewPlans', 'planHistory', 'theses', 'observations', 'drawingVersions', 'snapshots', 'viewSnapshots'];
+  for (const key of collections) {
+    if (!Array.isArray(target[key])) continue;
+    const before = target[key].length;
+    target[key] = target[key].filter(item => {
+      const time = at(item);
+      if (time === null) return true; // Retain legacy evidence but mark it unverifiable below.
+      return time <= cutoff;
+    });
+    if (target[key].length !== before) issues.push(`${label}的${key}中晚于本轮披露边界的 ${before - target[key].length} 条已排除。`);
+    if (target[key].some(item => at(item) === null)) issues.push(`${label}的${key}有记录缺少可核验的市场时间或记录时间，原样保留并标明未知。`);
+  }
+  const visibleConfigIds = new Set((target.modelConfigs || []).map(item => item.modelConfigId).filter(Boolean));
+  if (target.modelConfigId && target.modelConfigs && !visibleConfigIds.has(target.modelConfigId))
+    target.modelConfigId = (target.modelConfigs.filter(item => !item.baselineOnly).at(-1) ?? target.modelConfigs.at(-1))?.modelConfigId ?? null;
 }
 
 function safeCurrentBar(target, cutoff, contextCandles, minuteCandles, issues, label) {
@@ -571,11 +865,26 @@ export async function buildReviewExport({current = null, history = [], loadDatas
     checkAbort(signal);
     const roundIssues = [];
     if (!input.session) {
-      sessions.push({id: input.id, slot: input.slot, session: null, coverage: {complete: false}, market: null,
+      sessions.push({id: input.id, slot: input.slot, session: null, coverage: {captureCoverageComplete: false,
+        evidenceComplete: false, evidenceCoverage: {status: 'unknown-legacy', reason: '无法读取session快照'}}, market: null,
         events: [], issues: ['此历史记录缺少可读取的session快照，原记录保留在顶层history。'], rawInvalidRecord: input.rawInvalidRecord});
       workDone += 1; reportProgress({sessionId: input.id, phase: 'record'}); continue;
     }
-    const record = input.session;
+    let record = input.session;
+    let audit = {};
+    let auditReadSucceeded = true;
+    try {
+      const roundId = String(input.id ?? record.id ?? '');
+      const maxSeq = Number.isInteger(auditWatermarks?.[roundId]) ? auditWatermarks[roundId] : Number.MAX_SAFE_INTEGER;
+      const roughCutoff = Number.isInteger(record.minuteCursorTime) ? record.minuteCursorTime + MINUTE : null;
+      audit = await readAudit(input.id ?? record.id, {snapshotAt: new Date(snapshotAt).toISOString(),
+        visibleThrough: roughCutoff, maxSeq, sessionSnapshot: record});
+      if (!audit || typeof audit !== 'object') audit = {};
+      if (input.imported && audit.archivedSession && typeof audit.archivedSession === 'object') record = audit.archivedSession;
+    } catch (error) {
+      auditReadSucceeded = false;
+      roundIssues.push(`无法读取本轮操作审计：${error?.message || '未知错误'}`);
+    }
     const symbol = record.symbol;
     if (!SYMBOLS.has(symbol)) {
       const safeRecord = clone(record); stripFormingDeep(safeRecord);
@@ -585,8 +894,17 @@ export async function buildReviewExport({current = null, history = [], loadDatas
     }
     let sourceDataset;
     try {
-      if (!datasets.has(symbol)) datasets.set(symbol, normalizeDataset(await loadDataset(symbol), symbol, roundIssues));
-      sourceDataset = datasets.get(symbol);
+      const importedMarket = input.imported ? audit.sourceMetadata?.market : null;
+      if (Array.isArray(importedMarket?.contextCandles) && importedMarket.contextCandles.length) {
+        const coverage = audit.coverage ?? audit.sourceMetadata?.coverage ?? {};
+        sourceDataset = normalizeDataset({symbol, interval: BASE, candles: importedMarket.contextCandles,
+          range: {start: Number.isFinite(coverage.visibleFrom) ? coverage.visibleFrom : importedMarket.contextCandles[0][0],
+            end: Number.isFinite(coverage.visibleThrough) ? coverage.visibleThrough : importedMarket.contextCandles.at(-1)[0] + BASE},
+          sources: importedMarket.sources ?? [], sourceManifest: importedMarket.sourceManifest ?? null}, symbol, roundIssues);
+      } else {
+        if (!datasets.has(symbol)) datasets.set(symbol, normalizeDataset(await loadDataset(symbol), symbol, roundIssues));
+        sourceDataset = datasets.get(symbol);
+      }
     } catch (error) {
       roundIssues.push(`无法读取内置15分钟行情：${error?.message || '未知错误'}`);
       const safeRecord = clone(record); stripFormingDeep(safeRecord);
@@ -613,24 +931,15 @@ export async function buildReviewExport({current = null, history = [], loadDatas
       fromUtc: iso(bounds.requestedVisibleFrom), toUtc: iso(bounds.availableStart - BASE)});
     const expectedFrom = Math.ceil(bounds.replayFrom / MINUTE) * MINUTE;
     const expectedThrough = Math.floor((roundCutoff - MINUTE) / MINUTE) * MINUTE;
-    let audit;
-    let auditReadSucceeded = true;
-    try {
-      const roundId = String(input.id ?? record.id ?? '');
-      const maxSeq = Number.isInteger(auditWatermarks?.[roundId]) ? auditWatermarks[roundId] : Number.MAX_SAFE_INTEGER;
-      audit = await readAudit(input.id ?? record.id, {snapshotAt: new Date(snapshotAt).toISOString(), visibleThrough: roundCutoff,
-        maxSeq, sessionSnapshot: record});
-      if (!audit || typeof audit !== 'object') audit = {};
-    } catch (error) {
-      auditReadSucceeded = false;
-      audit = {};
-      roundIssues.push(`无法读取本轮操作审计：${error?.message || '未知错误'}`);
-    }
     // Import only valid audit minutes up to the frozen cutoff.
     const minuteByTime = new Map();
     let invalidAuditMinutes = 0;
     let futureAuditMinutesFiltered = 0;
-    for (const row of Array.isArray(audit.minutes) ? audit.minutes : []) {
+    const minuteSourceRows = [
+      ...(Array.isArray(audit.minutes) ? audit.minutes : []),
+      ...(Array.isArray(audit.sourceMetadata?.market?.minuteCandles) ? audit.sourceMetadata.market.minuteCandles : []),
+    ];
+    for (const row of minuteSourceRows) {
       if (validCandle(row, MINUTE) && (row[0] < expectedFrom || row[0] > expectedThrough || row[0] + MINUTE > roundCutoff)) {
         futureAuditMinutesFiltered += row[0] > expectedThrough || row[0] + MINUTE > roundCutoff ? 1 : 0;
       }
@@ -655,6 +964,11 @@ export async function buildReviewExport({current = null, history = [], loadDatas
       const through = Math.min(roundCutoff, dayEnd);
       if (through <= from) continue;
       try {
+        if (input.imported) {
+          unavailable.push({from, through, reason: '导入档案只使用其本地已保存的行情证据；未联网补取。'});
+          roundIssues.push(`导入档案缺少 ${utcDay(from)} 至 ${utcDay(through)} 的分钟行情；离线再导出不联网补取。`);
+          continue;
+        }
         const result = await readMinuteRange(symbol, from, through, {dayCache, signal});
         const dayEntry = result.days.find(entry => entry.date === day);
         if (dayEntry && !dayEntry.unavailable) verifiedDays.add(day);
@@ -733,8 +1047,17 @@ export async function buildReviewExport({current = null, history = [], loadDatas
     for (const id of missingScreenshotEventIds) roundIssues.push(`关键操作事件 ${id ?? '未知'} 没有可验证的截图附件。`);
     const sessionForPackage = clone(record);
     const futureOutcomeRedactions = redactFutureOutcomes(sessionForPackage, roundCutoff, rows, roundIssues, '本轮快照');
+    restrictEvidenceToCutoff(sessionForPackage, roundCutoff, rows, roundIssues, '本轮快照');
     redactUnverifiedPartial(sessionForPackage, roundCutoff, partialIndex, roundIssues, '本轮快照');
     safeCurrentBar(sessionForPackage, roundCutoff, contextCandles, minuteCandles, roundIssues, '本轮快照');
+    if (Array.isArray(sessionForPackage.trades)) {
+      for (const trade of sessionForPackage.trades) {
+        const exit = Number.isFinite(trade?.exitTime) ? trade.exitTime :
+          typeof trade?.exitTime === 'string' && Number.isFinite(Date.parse(trade.exitTime)) ? Date.parse(trade.exitTime) / 1000 : null;
+        if (exit !== null && roundCutoff !== null && exit <= roundCutoff)
+          trade.followUpWindows = postExitWindows(trade, minuteCandles, roundCutoff);
+      }
+    }
     if (input.slot === 'current') {
       snapshot.current = clone(sessionForPackage);
       legacyBackupState.current = clone(sessionForPackage);
@@ -792,7 +1115,8 @@ export async function buildReviewExport({current = null, history = [], loadDatas
     const marketComplete = expected === covered && bounds.warmupMissingBars === 0 && contextGaps.length === 0 && minuteGaps.length === 0 && unavailable.length === 0;
     const auditComplete = auditReadSucceeded && audit.baseline === false && !!audit.recordingStartedAt && auditIssues.length === 0;
     const screenshotsComplete = missingScreenshotEventIds.length === 0;
-    const modelEvidence = modelEvidenceFor(record);
+    const evidenceCoverage = evidenceCoverageFor(sessionForPackage, sessionEvents);
+    const modelEvidence = modelEvidenceFor(sessionForPackage);
     const roundPayload = {
       id: input.id ?? record.id ?? input.slot, slot: input.slot, archivedAt: input.archivedAt,
       session: sessionForPackage,
@@ -804,7 +1128,8 @@ export async function buildReviewExport({current = null, history = [], loadDatas
         replayFromUtc: iso(bounds.replayFrom), cutoffIsExclusiveClose: true, expectedMinuteRows: expected,
         availableMinuteRows: covered, missingMinuteRows: expected - covered,
         marketComplete, auditComplete, screenshotsComplete,
-        complete: marketComplete && auditComplete && screenshotsComplete,
+        captureCoverageComplete: marketComplete && auditComplete && screenshotsComplete,
+        evidenceCoverage: evidenceCoverage.evidence, evidenceComplete: evidenceCoverage.evidenceComplete,
         baseline: audit.baseline ?? null, auditRecordingStartedAt: audit.recordingStartedAt ?? null,
         screenshotCoverage: {expectedKeyActionCount: expectedScreenshotActions.length,
           availableScreenshotCount: expectedScreenshotActions.length - missingScreenshotEventIds.length,
@@ -854,6 +1179,8 @@ export async function buildReviewExport({current = null, history = [], loadDatas
       redactions: legacyRedactions, current: legacyBackupState.current, history: legacyBackupState.history},
     dataDictionary: {timestamp: 'Unix epoch seconds，UTC；时间为K线openTime。',
       intervalBoundary: '区间左闭右开；完整K线仅当openTime+interval<=visibleThrough时导出。',
+      backgroundObservationInterval: '15分钟原始OHLCV，覆盖当时回放场景的背景观察/热身；不代表该期间已逐分钟回放。',
+      replayExecutionInterval: '1分钟真实OHLCV，只覆盖逐步揭示并落入该轮visibleThrough之前的区间。',
       visibleThrough: '每轮及事件各自的排他收盘边界。',
       row: ['openTime', 'open', 'high', 'low', 'close', 'volume'], price: 'USDT per BTC/ETH',
       volume: '基础资产数量BTC或ETH，不是USDT成交额；源数据数值精度原样保留。'},
@@ -880,7 +1207,8 @@ export async function buildReviewExport({current = null, history = [], loadDatas
   for (const file of files) manifestEntries.push({path: file.name, bytes: file.bytes.length, sha256: await sha256(file.bytes)});
   const manifest = {version: 1, generatedAt: exportedAt, totalFileCountIncludingManifest: files.length + 1,
     hashedFileCount: manifestEntries.length, selfHashExcluded: true, files: manifestEntries,
-    sessions: sessions.map(item => ({id: item.id, slot: item.slot, complete: item.coverage?.complete ?? false,
+    sessions: sessions.map(item => ({id: item.id, slot: item.slot, captureCoverageComplete: item.coverage?.captureCoverageComplete ?? false,
+      evidenceComplete: item.coverage?.evidenceComplete ?? false, evidenceCoverage: item.coverage?.evidenceCoverage ?? {},
       marketComplete: item.coverage?.marketComplete ?? false, auditComplete: item.coverage?.auditComplete ?? false,
       screenshotsComplete: item.coverage?.screenshotsComplete ?? false, baseline: item.coverage?.baseline ?? null,
       recordingStartedAt: item.coverage?.auditRecordingStartedAt ?? item.coverage?.recordingStartedAt ?? null,

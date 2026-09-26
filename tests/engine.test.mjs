@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, ENGINE_VERSION, ensureEvidenceBaseline, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
 
 const TEST_ENTRY_REASON = '测试入场理由';
 function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
@@ -1282,4 +1282,199 @@ test('automatic stop, liquidation, and end-of-session closes do not require or i
   const ended = advance(end, endData).trade;
   assert.equal(ended.reason, '本轮结束');
   assert.equal(Object.hasOwn(ended, 'exitReason'), false);
+});
+
+
+test('new sessions declare a reproducible execution model and an opening balance ledger baseline', () => {
+  const count = Math.ceil((WARMUP + LENGTH) / 900) + 16;
+  const data = bars(count);
+  const s = createSession('BTCUSDT', data, () => 0);
+  assert.equal(s.engineVersion, ENGINE_VERSION);
+  assert.ok(s.modelConfigId);
+  const model = s.modelConfigs.find(x => x.modelConfigId === s.modelConfigId);
+  assert.equal(model.fee.openRate, FEE);
+  assert.equal(model.fee.closeRate, FEE);
+  assert.equal(model.slippage.rate, SLIP);
+  assert.equal(model.intrabar.bothStopTake, 'stop-first');
+  assert.equal(model.margin.maintenanceRate, MAINTENANCE_MARGIN_RATE);
+  assert.equal(model.funding, 'not-simulated');
+  assert.equal(s.ledger.length, 1);
+  assert.equal(s.ledger[0].type, 'initial-balance');
+  assert.equal(s.ledger[0].baselineBalance, INITIAL);
+  assert.equal(s.accountSnapshots[0].balance, INITIAL);
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+});
+
+test('ledger reconciles entry fee, realized settlement and non-cash margin without changing locked initial R', () => {
+  const count = Math.ceil((WARMUP + LENGTH) / 900) + 16, data = bars(count);
+  const s = createSession('BTCUSDT', data, () => 0); s.end = s.cursor + 4;
+  const {order, position} = placeOrder(s, data, 1, 1000, 100, 95, 110, 'market', TEST_ENTRY_REASON, 2,
+    {planId: 'plan-a', thesisId: 'thesis-a', parentTradeId: 'prior-trade', strategyVersion: 'v3',
+      observationId: 'obs-a', attemptNumber: 2, lossBudget: 25, rawReason: 'raw thesis'});
+  assert.equal(order.id, position.orderId);
+  assert.equal(position.planId, 'plan-a');
+  assert.equal(position.thesisId, 'thesis-a');
+  assert.equal(position.attemptNumber, 2);
+  assert.equal(position.modelConfigId, s.modelConfigId);
+  assert.equal(s.fills[0].positionId, position.positionId);
+  assert.equal(s.fills[0].orderId, order.id);
+  assert.equal(s.fills[0].tradeId, null, 'entry fill is linked through positionId until close');
+  assert.equal(s.fills[0].parentTradeId, 'prior-trade');
+  assert.equal(s.fills[0].strategyVersion, 'v3');
+  assert.equal(s.fills[0].observationId, 'obs-a');
+  assert.equal(s.fills[0].attemptNumber, 2);
+  assert.equal(position.riskBudget.lossBudget, 25);
+  assert.equal(position.initialStop, 95);
+  const r0 = position.initialRiskR0;
+  assert.ok(r0 > 0);
+  assert.equal(s.balance, INITIAL - 1000 * FEE);
+  assert.equal(s.ledger.find(x => x.type === 'margin-reserved').cashDelta, 0);
+  assert.equal(s.ledger.find(x => x.type === 'margin-reserved').marginDelta, position.margin);
+  updateProtection(s, data, 96, 110, {reason: '移动止损', rawReason: '锁盈'});
+  assert.equal(position.stop, 96);
+  assert.equal(position.initialStop, 95);
+  assert.equal(position.initialRiskR0, r0);
+  assert.equal(s.riskChanges[0].before.stop, 95);
+  assert.equal(s.riskChanges[0].after.stop, 96);
+  assert.equal(s.riskChanges[0].reason, '移动止损');
+  assert.equal(s.orders[0].stop, 95, 'submitted plan remains an immutable initial snapshot');
+  s.cursor++;
+  const trade = closePosition(s, data, 105, 'test exit', s.cursor);
+  assert.equal(trade.id, trade.tradeId);
+  assert.equal(trade.positionId, position.positionId);
+  assert.equal(trade.orderId, order.id);
+  assert.equal(trade.initialRiskR0, r0);
+  assert.equal(trade.riskChanges.length, 1);
+  assert.equal(trade.grossPnl, (trade.exit - trade.entry) * trade.qty * trade.side);
+  assert.equal(trade.fees, trade.entryFee + trade.exitFee);
+  assert.equal(s.fills.length, 2);
+  assert.equal(s.fills[0].side, 'entry');
+  assert.equal(s.fills[1].side, 'exit');
+  assert.equal(s.fills[0].positionId, s.fills[1].positionId);
+  assert.equal(s.fills[1].tradeId, trade.id);
+  assert.equal(trade.entryFillId, s.fills[0].id);
+  assert.equal(trade.exitFillId, s.fills[1].id);
+  assert.equal(s.fills[0].tradeId, null, 'entry fill keeps its original tradeId instead of being retroactively rewritten');
+  assert.ok(Math.abs(s.ledger.reduce((sum, x) => sum + x.cashDelta, 0) + INITIAL - s.balance) < 1e-8);
+  assert.ok(s.ledger.some(x => x.type === 'margin-released' && x.marginDelta === -position.margin));
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+  const badLink = structuredClone(s);
+  badLink.fills[1].tradeId = 'unlinked-trade';
+  assert.equal(validateSession(badLink, 'BTCUSDT', data), false);
+  const badLedger = structuredClone(s);
+  badLedger.ledger.find(x => x.type === 'exit-settlement').cashDelta += 1;
+  assert.equal(validateSession(badLedger, 'BTCUSDT', data), false);
+});
+
+test('the legacy 15m advance API releases reserved margin and accounts a fill under the active model', () => {
+  const count = Math.ceil((WARMUP + LENGTH) / 900) + 16, data = bars(count);
+  const s = createSession('BTCUSDT', data, () => 0); s.end = s.cursor + 4; s.tf = 900;
+  const {order} = placeOrder(s, data, 1, 1000, 99, 95, null, 'limit', TEST_ENTRY_REASON, 4, {planId: 'old-path'});
+  const result = advance(s, data);
+  assert.equal(result.orderFilled.id, order.id);
+  assert.equal(result.trade, null);
+  assert.equal(s.position.modelConfigId, s.modelConfigId);
+  assert.equal(metrics(s, data).reservedMargin, 0);
+  assert.ok(s.ledger.some(x => x.type === 'order-reservation-released' && x.orderId === order.id));
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+});
+
+test('limit reservation and cancellation are separate from wallet fees and reconcile to zero reserved margin', () => {
+  const count = Math.ceil((WARMUP + LENGTH) / 900) + 16, data = bars(count);
+  const s = createSession('BTCUSDT', data, () => 0); s.end = s.cursor + 4;
+  const wallet = s.balance;
+  const {order} = placeOrder(s, data, 1, 1000, 90, 85, 95, 'limit', TEST_ENTRY_REASON, 4, {planId: 'p'});
+  assert.equal(s.balance, wallet);
+  assert.equal(metrics(s, data).reservedMargin, order.margin + order.notional * FEE);
+  cancelOrder(s, 'cancel');
+  assert.equal(s.balance, wallet);
+  assert.equal(metrics(s, data).reservedMargin, 0);
+  assert.equal(s.ledger.at(-1).type, 'order-reservation-released');
+  assert.equal(s.ledger.at(-1).cashDelta, 0);
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+});
+
+test('same-minute limit fill and stop-first exit expose ordered before/after stage snapshots with ambiguity evidence', () => {
+  const count = Math.ceil((WARMUP + LENGTH) / 900) + 16, data = bars(count);
+  const s = createSession('BTCUSDT', data, () => 0); s.end = s.cursor + 3;
+  const {order} = placeOrder(s, data, 1, 1000, 99, 95, 105, 'limit', TEST_ENTRY_REASON, 5, {planId: 'same-minute'});
+  const barIndex = s.cursor + 1;
+  const result = advanceMinute(s, [data[barIndex][0], 100, 106, 94, 100, 1], data);
+  assert.equal(result.intrabarAmbiguous, true);
+  assert.deepEqual(result.affectedOrderIds, [order.id]);
+  assert.equal(result.rule.ruleId, '1m-ohlc-stop-first-v1');
+  assert.equal(result.rule.chosen, 'stop');
+  assert.equal(result.trade.reason, '双触发，按止损');
+  assert.deepEqual(result.executionEvents.map(x => x.kind), ['order-filled', 'position-triggered', 'position-auto-closed']);
+  const [filled, triggered, exited] = result.executionEvents;
+  assert.equal(filled.before.position, null);
+  assert.equal(filled.after.position.positionId, result.trade.positionId);
+  assert.equal(filled.after.minuteCursorTime, result.minuteTime);
+  assert.equal(filled.after.currentPrice, result.currentPrice);
+  assert.equal(filled.intrabarActualUnknown, true);
+  assert.equal(triggered.before.position.positionId, result.trade.positionId);
+  assert.equal(triggered.after.position.positionId, result.trade.positionId);
+  assert.deepEqual(triggered.triggerEvidence, result.trade.triggerEvidence);
+  assert.equal(triggered.triggerEvidence.type, 'stop');
+  assert.equal(triggered.triggerEvidence.triggerPrice, result.trade.stop);
+  assert.equal(triggered.triggerEvidence.referenceMinute, result.minuteTime);
+  assert.equal(triggered.triggerEvidence.triggerMarketTime, result.replayTime);
+  assert.equal(triggered.triggerEvidence.referenceIntervalSeconds, 60);
+  assert.equal(triggered.triggerEvidence.ruleId, '1m-ohlc-stop-first-v1');
+  assert.equal(triggered.triggerEvidence.actualIntrabarOrderUnknown, true);
+  assert.equal(triggered.seq + 1, exited.seq);
+  assert.equal(exited.before.position.positionId, result.trade.positionId);
+  assert.equal(exited.after.position, null);
+  assert.equal(exited.after.trade.id, result.trade.id);
+  assert.equal(exited.tradeId, result.trade.id);
+  assert.equal(exited.fillId, result.trade.exitFillId);
+  assert.equal(s.fills.find(f => f.id === exited.fillId).time, result.trade.exitTime);
+  assert.equal(result.trade.exitFillId !== result.trade.entryFillId, true);
+  assert.equal(exited.intrabarAmbiguous, true);
+  assert.equal(result.minuteAccountSnapshot.visibleThrough, result.replayTime);
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+});
+
+test('legacy baseline records only upgrade-time facts and never fabricates old leverage or locked R', () => {
+  const data = bars(6), s = session(data);
+  engineOpenPosition(s, data, 1, 1000, null, null, TEST_ENTRY_REASON);
+  for (const key of ['marginMode', 'leverage', 'margin', 'liquidationPrice']) delete s.position[key];
+  s.cursor = 1;
+  const legacyTrade = closePosition(s, data, 101, 'legacy', 1);
+  for (const key of ['positionId', 'tradeId', 'initialStop', 'initialTake', 'initialRiskR0', 'grossPnl', 'exitFee', 'riskChanges']) delete legacyTrade[key];
+  const before = JSON.stringify(legacyTrade);
+  assert.equal(ensureEvidenceBaseline(s, data), true);
+  assert.equal(ensureEvidenceBaseline(s, data), false);
+  assert.equal(s.engineVersion, 'legacy-unversioned');
+  assert.equal(s.modelConfigs.at(-1).baselineOnly, false);
+  assert.equal(s.activeEngineVersion, ENGINE_VERSION);
+  assert.equal(s.modelConfigs.at(-1).effectiveFrom.replayMarketTime, 1800);
+  assert.equal(JSON.stringify(legacyTrade), before);
+  assert.equal(legacyTrade.leverage, undefined);
+  assert.equal(legacyTrade.initialRiskR0, undefined);
+  assert.equal(s.ledger[0].type, 'legacy-baseline');
+  assert.equal(s.ledger[0].legacyHistoryUnknown, true);
+  const result = enginePlaceOrder(s, data, 1, 1000, 100, null, null, 'market', TEST_ENTRY_REASON, 2,
+    {planId: 'after-upgrade', attemptNumber: 2});
+  assert.equal(result.position.modelConfigId, s.modelConfigId);
+  assert.equal(result.position.engineVersion, ENGINE_VERSION);
+  assert.equal(result.position.attemptNumber, 2);
+  assert.equal(s.orders.at(-1).modelConfigId, s.modelConfigId);
+  assert.equal(s.fills.at(-1).modelConfigId, s.modelConfigId);
+  assert.equal(s.fills.at(-1).attemptNumber, 2);
+  assert.equal(legacyTrade.modelConfigId, undefined);
+  assert.equal(validateSession(s, 'BTCUSDT', data), true);
+});
+
+test('invalid evidence metadata rejects entry and protection changes before any account mutation', () => {
+  const count = Math.ceil((WARMUP + LENGTH) / 900) + 16, data = bars(count);
+  const s = createSession('BTCUSDT', data, () => 0); s.end = s.cursor + 4;
+  const before = JSON.stringify(s);
+  assert.throws(() => enginePlaceOrder(s, data, 1, 1000, 100, 95, 110, 'market', TEST_ENTRY_REASON, 1, {lossBudget: -1}), /亏损预算/);
+  assert.equal(JSON.stringify(s), before);
+  const {position} = enginePlaceOrder(s, data, 1, 1000, 100, 95, 110, 'market', TEST_ENTRY_REASON);
+  const active = JSON.stringify(s);
+  assert.throws(() => updateProtection(s, data, 96, 110, {reason: '   '}), /风险修改理由/);
+  assert.equal(JSON.stringify(s), active);
+  assert.equal(position.initialStop, 95);
 });

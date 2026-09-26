@@ -26,6 +26,7 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .entry-reason-label{display:block;color:#dce4e6;font-size:14px;font-weight:600}.entry-reason-label textarea{display:block;width:100%;min-height:96px;max-height:36vh;resize:vertical;margin-top:7px;padding:9px 10px;border:1px solid #424d51;border-radius:4px;background:#111517;color:var(--text);font-size:14px;line-height:1.5;outline:0;touch-action:auto;user-select:text}
 .entry-reason-label textarea:focus{border-color:#8ca2a6;box-shadow:0 0 0 2px #8ca2a622}.entry-reason-error{min-height:20px;margin:5px 0;color:#ff9ba3;font-size:12px}
 .reason-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}.reason-actions .primary,.reason-actions .quiet{min-width:92px}
+.loss-budget-details{margin-top:9px;border-top:1px solid #30393d;padding-top:7px;color:#aeb9bc;font-size:12px}.loss-budget-details summary{cursor:pointer}.loss-budget-details label{display:flex;align-items:center;gap:8px;margin-top:8px}.loss-budget-details input{width:135px;padding:6px;border:1px solid #424d51;border-radius:3px;background:#111517;color:var(--text);font:13px var(--mono)}.loss-budget-details small{display:block;margin-top:5px;color:#778589;line-height:1.4}.loss-budget-details span{display:block;color:#f0c978;font-size:11px;margin-top:4px}
 @media(max-width:600px){.order-reason-window{width:calc(100vw - 20px);max-height:calc(100dvh - 20px);padding:14px}.order-reason-drag{cursor:move}.entry-reason-label textarea{min-height:110px;max-height:32dvh}}
 .price-line-overlay.reason-frozen,.price-line-overlay.reason-frozen *{pointer-events:none!important}
 .entry-reason-view{margin:8px 0 0;color:#cbd5d7;font-size:13px;line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap}
@@ -85,3 +86,15 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 :root{--review-export-link:#84b8ff}
 .review-export-download{display:inline-block;margin:0 1px 6px;color:var(--review-export-link);font-size:12px;text-decoration:underline;cursor:pointer}
 .review-export-download[hidden]{display:none}
+
+/* Optional thesis, observation, and append-only plan history. */
+.thesis-fields{margin:8px 0;padding:8px 9px;border:1px solid #303a3e;border-radius:4px;background:#171d1f}
+.thesis-fields>summary{color:#aebdc0;font-size:12px;cursor:pointer}
+.thesis-fields label,.observation-fields label{display:flex;flex-direction:column;gap:4px;margin-top:8px;color:#8f9da0;font-size:11px}
+.thesis-fields input,.thesis-fields select,.observation-fields select,.observation-fields textarea{width:100%;min-width:0;border:1px solid #354044;border-radius:3px;background:#101517;color:#e0e7e8;padding:7px;font:12px var(--sans)}
+.thesis-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#thesis-label-wrap[hidden],.observation-fields[hidden]{display:none}
+.observation-fields{display:grid;gap:3px;margin:8px 0;padding:8px 9px;border:1px solid #364744;border-radius:4px;background:#171e1c}
+.plan-history-dialog{width:min(620px,calc(100vw - 24px));max-height:min(76vh,720px);overflow:auto;background:#171d1f;color:#dbe2e3;border:1px solid #354044;border-radius:6px;padding:14px}
+.plan-history-body{display:grid;gap:8px}.plan-version-card{padding:10px;border:1px solid #303a3e;border-radius:4px;background:#111618}.plan-version-card strong{display:block;color:#cdd8da;font-size:12px}.plan-version-card p{margin:7px 0;color:#e3e8e9;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55}.plan-version-card small{display:block;color:#8e9b9e;line-height:1.6;overflow-wrap:anywhere}
+@media(max-width:600px){.thesis-row{gap:5px}.plan-history-dialog{padding:10px}}

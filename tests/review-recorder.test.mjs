@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {inferReviewEventKind, reviewStateProjection} from '../dist/review-recorder.mjs';
+import {cloneScreenshotRecord, inferReviewEventKind, reviewStateProjection} from '../dist/review-recorder.mjs';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
@@ -40,6 +40,14 @@ test('review projection is a detached before-snapshot for in-place trade mutatio
   assert.equal(before.drawings[0].anchor.price,101);
 });
 
+test('imported screenshot cloning preserves Blob bytes instead of JSON-cloning them away', async () => {
+  const original=new Blob(['chart-pixels'],{type:'image/png'});
+  const cloned=cloneScreenshotRecord({id:'shot-1',sessionId:'s-1',blob:original,eventId:'s-1:1'});
+  assert.ok(cloned.blob instanceof Blob);
+  assert.equal(cloned.blob.type,'image/png');
+  assert.equal(await cloned.blob.text(),'chart-pixels');
+});
+
 test('semantic inference distinguishes submitted orders, fills, protection changes, drawings, and note edits', () => {
   const base = {pending: null, position: null, orderHistory: [], trades: [], drawings: [], notes: '',
     tf: 900, ma: false, ma10: false, blind: true, volume: true, speed: 1500, draftPlan: null,
@@ -75,4 +83,16 @@ test('exit screenshot price labels use a fixed readable card while chart price l
   assert.deepEqual(rowYs,[23,39,55,71]);
   assert.ok(rowYs.every((value,index)=>index===0||value-rowYs[index-1]>=16));
   assert.match(labels.at(-1).text,/止损 · -2.69 U/);
+});
+
+test('imported history keeps a lean local index and the archive replay-time anchor', () => {
+  const start=appSource.indexOf('function importedHistorySession('),end=appSource.indexOf('\nasync function importReviewFile(',start);
+  assert.ok(start>=0&&end>start);
+  const context={clone:value=>JSON.parse(JSON.stringify(value))};
+  vm.runInNewContext(`${appSource.slice(start,end)}\nglobalThis.makeImported=importedHistorySession;`,context);
+  const imported=context.makeImported({id:'archive-1',symbol:'ETHUSDT',start:25,startTime:999,trades:[{id:'t-1'}],
+    ledger:[{kind:'balance'}],fills:[{id:'f-1'}],accountSnapshots:[{id:'a-1'}],riskChanges:[{id:'r-1'}],contextCandles:[[1,1,1,1,1,1]]},123456);
+  assert.equal(imported.displayReplayFrom,123456);
+  assert.deepEqual(JSON.parse(JSON.stringify(imported.trades)),[{id:'t-1'}]);
+  for(const key of ['ledger','fills','accountSnapshots','riskChanges','contextCandles'])assert.equal(Object.hasOwn(imported,key),false);
 });

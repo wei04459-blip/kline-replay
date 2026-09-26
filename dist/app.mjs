@@ -1,12 +1,14 @@
 import {createChart, CandlestickSeries, HistogramSeries, LineSeries, CrosshairMode, ColorType} from './vendor/charts.mjs';
-import {INITIAL, FEE, SLIP, MAINTENANCE_MARGIN_RATE, BASE, WARMUP, createSession, validateSession, aggregateReplay, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, manualClosePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, maxNotional, positionLiquidationPrice, metrics} from './engine.mjs';
+import {INITIAL, FEE, SLIP, MAINTENANCE_MARGIN_RATE, BASE, WARMUP, createSession, validateSession, ensureEvidenceBaseline, aggregateReplay, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, manualClosePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, maxNotional, positionLiquidationPrice, metrics} from './engine.mjs';
 import {nextMinute} from './minute-data.mjs';
 import {createDrawingTools, projectDrawing} from './drawings.mjs';
 import {createReviewRecorder, reviewStateProjection} from './review-recorder.mjs';
+import {appendPlanVersion, createPlanVersion, executionStageSnapshots, findClosedTradeForPosition, modificationEvidence} from './review-plans.mjs';
 import {buildReviewExport} from './review-export.mjs';
+import {parseReviewImport} from './review-import.mjs';
 
 const $ = id => document.getElementById(id);
-const els = Object.fromEntries(['save-status','new-session','equity','pnl','unreal','trade-count','win-rate','symbol','coin-mark','ma','ma10','volume','blind','recenter','last-price','last-change','volume-value','ohlc','loading','play','step','step-minute','cancel-advance','retry-minute','speed','replay-status','progress-text','progress-bar','balance','notional','risk-preview','long','short','order-hint','position-badge','position','journal-count','history-count','journal-content','notes','current-tab','history-tab','order-form','toast','new-dialog','confirm-new','info-dialog','export','review-export','review-export-status','review-export-download','rules','source-details','source-label','size-range','size-readout','leverage-range','leverage-readout','leverage-badge','notional-value','margin-value','entry-fee-value','liquidation-value','plan-actions','plan-hint','confirm-plan','cancel-plan','locate-plan','session-badge','order-reason-window','order-reason-drag','order-reason-summary','entry-reason','entry-reason-error','reason-cancel','reason-close','reason-confirm'].map(id=>[id,$(id)]));
+const els = Object.fromEntries(['save-status','new-session','equity','pnl','unreal','trade-count','win-rate','symbol','coin-mark','ma','ma10','volume','blind','recenter','last-price','last-change','volume-value','ohlc','loading','play','step','step-minute','cancel-advance','retry-minute','speed','replay-status','progress-text','progress-bar','balance','notional','risk-preview','long','short','observation-open','order-hint','position-badge','position','journal-count','history-count','journal-content','notes','current-tab','history-tab','order-form','toast','new-dialog','confirm-new','info-dialog','export','review-export','review-import','review-import-file','review-export-status','review-export-download','rules','source-details','source-label','size-range','size-readout','leverage-range','leverage-readout','leverage-badge','notional-value','margin-value','entry-fee-value','liquidation-value','plan-actions','plan-hint','confirm-plan','cancel-plan','locate-plan','session-badge','order-reason-window','order-reason-drag','order-reason-summary','thesis-fields','thesis-choice','thesis-label-wrap','thesis-label','parent-trade','attempt-number','strategy-version','observation-fields','observation-status','observed-conditions','entry-reason','entry-reason-error','reason-cancel','reason-close','reason-confirm','loss-budget','loss-budget-status'].map(id=>[id,$(id)]));
 const STORE_KEY = 'replay-lab-v1';
 const TF_LABELS = new Map([[900,'15分'],[1800,'30分'],[2700,'45分'],[3600,'1小时'],[14400,'4小时'],[86400,'1日'],[604800,'1周']]);
 const datasets = new Map();
@@ -52,7 +54,7 @@ let selectedDrawingId = null;
 let drawingAuditSnapshot = null;
 let chart, candleSeries, maSeries, ma10Series, volumeSeries, resizeObserver;
 const reviewRecorder=createReviewRecorder();
-let reviewExporting=false;
+let reviewExporting=false,reviewImporting=false;
 let reviewDownloadUrl=null;
 
 function toast(message) {
@@ -80,6 +82,7 @@ function readSaved() {
   const saved=safeParse(raw);
   if(!saved || saved.version!==1 || !Array.isArray(saved.history)) return null;
   history=saved.history.filter(x=>x&&x.session&&typeof x.id==='string');
+  for(const item of history)if(item.imported)item.session.importedArchive=true;
   if(saved.active&&saved.active.version===1&&typeof saved.active.symbol==='string') active=saved.active;
   let repaired=false;
   if(active)repaired=reconcileOrderProtections(active)||repaired;
@@ -87,11 +90,20 @@ function readSaved() {
   if(repaired)persist();
   return saved;
 }
+async function ensureLegacyEvidenceBaselines(){
+  let changed=false;
+  for(const item of history){
+    const session=item?.session;if(!session||Array.isArray(session.modelConfigs)&&session.modelConfigs.length)continue;
+    try{const data=await loadSymbol(session.symbol);if(validateSession(session,session.symbol,data))changed=ensureEvidenceBaseline(session,data)||changed;}catch{}
+  }
+  if(changed)persist({audit:false});
+  return changed;
+}
 function persist(options={}) {
   try {
     localStorage.setItem(STORE_KEY,JSON.stringify({version:1,source:'Binance spot public archive; UI simulation',active,history}));
     els['save-status'].textContent='已保存在此浏览器'; warnedStorage=false;
-    if(active&&options.audit!==false)void reviewRecorder.observe(active,{kind:options.kind,orderId:options.orderId,tradeId:options.tradeId,before:options.before,after:options.after,view:reviewView(active),screenshot:options.capture?()=>captureReviewScreenshot(options.annotation||null,options.kind||'action',options):undefined}).then(event=>{if(event?.screenshotMissing)setReviewStatus('关键操作截图缺失，复盘包会标明',true);}).catch(error=>setReviewStatus(`过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
+    if(active&&options.audit!==false)void reviewRecorder.observe(active,{kind:options.kind,orderId:options.orderId,tradeId:options.tradeId,planId:options.planId,snapshotId:options.snapshotId,thesisId:options.thesisId,parentTradeId:options.parentTradeId,observationId:options.observationId,strategyVersion:options.strategyVersion,attemptNumber:options.attemptNumber,actor:options.actor||'user',modelConfigId:options.modelConfigId||active.modelConfigId||active.modelEvidence?.modelConfigId,timingClass:options.timingClass,reason:options.reason,modification:options.modification,references:options.references,before:options.before,after:options.after,view:options.view||reviewView(active),screenshot:options.capture?()=>captureReviewScreenshot(options.annotation||null,options.kind||'action',options):options.screenshot}).then(event=>{if(event?.screenshotMissing)setReviewStatus('关键操作截图缺失，复盘包会标明',true);}).catch(error=>setReviewStatus(`过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
     return true;
   }
   catch { els['save-status'].textContent='保存失败：浏览器存储空间不足'; if(!warnedStorage){toast('保存失败：浏览器存储空间不足，请导出备份后释放空间');warnedStorage=true;} return false; }
@@ -111,11 +123,15 @@ async function loadSymbol(symbol, retry=false) {
   } catch(error) { throw new Error(error?.message||'行情读取失败'); }
 }
 function clone(value){return JSON.parse(JSON.stringify(value));}
+function reviewId(prefix='id'){return `${prefix}-${globalThis.crypto?.randomUUID?.()||`${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`}`;}
+function reviewModelConfigId(session=active){return session?.modelConfigId||session?.modelEvidence?.modelConfigId||session?.simulationModel?.modelConfigId||session?.simulationModel?.id||null;}
+function ensureReviewPlans(session=active){if(session&&!Array.isArray(session.reviewPlans))session.reviewPlans=[];return session?.reviewPlans||[];}
+function reviewAccountSnapshot(session=active){const data=datasets.get(session?.symbol)||[],m=metrics(session,data);return {balance:session?.balance??null,equity:m.equity,availableBalance:m.availableBalance,usedMargin:m.usedMargin,reservedMargin:m.reservedMargin,unrealizedPnl:m.unreal};}
 function candleTime(index){const data=datasets.get(active?.symbol);return data?.[index]?.[0]??0;}
 function utcDate(epoch){return new Intl.DateTimeFormat('zh-CN',{timeZone:'UTC',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(epoch*1000));}
 function relativeTime(epoch,session=active,symbol=session?.symbol){
   const source=datasets.get(symbol);
-  const anchor=session?.startTime??(source?.[session?.start]?.[0]??NaN)+BASE;
+  const anchor=session?.displayReplayFrom??session?.startTime??(session?.importedArchive?NaN:(source?.[session?.start]?.[0]??NaN)+BASE);
   if(!Number.isFinite(anchor))return utcDate(epoch);
   const minutes=Math.round((epoch-anchor)/60);
   if(minutes<0){const m=-minutes;return `练习前 ${Math.floor(m/1440)?`${Math.floor(m/1440)}天 `:''}${Math.floor(m%1440/60)}时`;}
@@ -131,13 +147,18 @@ function replayMark(session=active,data=currentData()){return engineReplayPrice(
 function replayClock(session=active,data=currentData()){return engineReplayTime(session,data);}
 function replayIsEnded(session=active,data=currentData()){return replayEnded(session,data);}
 function reviewView(session=active){
-  const range=chart?.timeScale?.().getVisibleLogicalRange?.(),priceScale=chart?.priceScale?.('right'),priceRange=priceScale?.getVisibleRange?.(),priceOptions=typeof priceScale?.options==='function'?priceScale.options():null;
+  const range=chart?.timeScale?.().getVisibleLogicalRange?.(),priceScale=chart?.priceScale?.('right'),apiPriceRange=priceScale?.getVisibleRange?.(),priceOptions=typeof priceScale?.options==='function'?priceScale.options():null;
+  let priceRange=apiPriceRange?{from:apiPriceRange.from,to:apiPriceRange.to,source:'chart-api'}:null;
+  const paneHeight=chart?.panes?.()?.[0]?.getHeight?.()??(chart?.timeScale?.().height?Math.max(0,$('chart').clientHeight-chart.timeScale().height()):null);
+  if(!priceRange&&Number.isFinite(paneHeight)&&paneHeight>0&&candleSeries?.coordinateToPrice){const top=candleSeries.coordinateToPrice(0),bottom=candleSeries.coordinateToPrice(paneHeight);if(Number.isFinite(top)&&Number.isFinite(bottom))priceRange={from:Math.min(top,bottom),to:Math.max(top,bottom),source:'derived-from-screen-coordinates'};}
   const visibleThrough=replayClock(session,datasets.get(session?.symbol)||[]),currentBar=disclosedBars().at(-1);
-  const bar=currentBar?{...clone(currentBar),interval:session?.tf??null,complete:Number.isFinite(visibleThrough)&&Number.isFinite(session?.tf)?currentBar.time+session.tf<=visibleThrough:false}:null;
+  const bar=currentBar?{...clone(currentBar),openTime:currentBar.time,closeTimeExclusive:currentBar.time+(session?.tf??0),timeSemantics:'UTC-epoch-seconds',interval:session?.tf??null,complete:Number.isFinite(visibleThrough)&&Number.isFinite(session?.tf)?currentBar.time+session.tf<=visibleThrough:false}:null;
   return {symbol:session?.symbol??null,tf:session?.tf??null,ma:!!session?.ma,ma10:!!session?.ma10,blind:!!session?.blind,volume:session?.volume!==false,
     visibleThrough:Number.isFinite(visibleThrough)?visibleThrough:null,
     replayMarketTime:Number.isFinite(visibleThrough)?visibleThrough:null,
+    replayMarketTimeSemantics:'latest-disclosed-minute-close-exclusive-utc-seconds',paneHeight:Number.isFinite(paneHeight)?paneHeight:null,
     logicalRange:range?{from:range.from,to:range.to}:null,priceRange:priceRange?{from:priceRange.from,to:priceRange.to}:null,
+    priceRangeSource:priceRange?.source??'unavailable',
     priceScaleMode:priceOptions?.mode??null,indicators:[...(session?.ma10?[{name:'SMA',period:10,input:'close',implementation:'sma-v1'}]:[]),...(session?.ma?[{name:'SMA',period:20,input:'close',implementation:'sma-v1'}]:[])],
     drawings:clone(session?.drawings||[]),forming15m:session?.forming15m?clone(session.forming15m):null,
     minuteCursorTime:session?.minuteCursorTime??null,currentBar:bar,fastForwarding:!!fastForwarding};
@@ -150,12 +171,13 @@ function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
     const host=$('chart'),canvas=document.createElement('canvas'),scaleY=source.height/Math.max(1,host.clientHeight),headerHeight=Math.round(34*scaleY);canvas.width=source.width;canvas.height=source.height+headerHeight;
     const ctx=canvas.getContext('2d');if(!ctx)return Promise.resolve(null);
     ctx.fillStyle='#13181b';ctx.fillRect(0,0,canvas.width,headerHeight);ctx.strokeStyle='#384246';ctx.beginPath();ctx.moveTo(0,headerHeight-.5);ctx.lineTo(canvas.width,headerHeight-.5);ctx.stroke();
-    const actionLabels={'order-modified':'限价订单已修改','protection-changed':'保护价已修改','position-closed':'主动平仓','position-auto-closed':'自动平仓','drawing-created':'新增绘图','drawing-modified':'移动绘图','drawing-deleted':'删除绘图'};
+    const actionLabels={'order-modified':'限价订单已修改','protection-changed':'保护价已修改','position-closed':'主动平仓','position-close-requested':'主动平仓请求','position-triggered':'保护阈值触发（分钟路径未知）','position-auto-closed':'自动平仓','order-plan-locked':'下单前计划锁定','plan-supplemented':'计划补充','drawing-created':'新增绘图','drawing-modified':'移动绘图','drawing-deleted':'删除绘图'};
     const tf=TF_LABELS.get(active.tf)||`${active.tf}s`,blindTime=showTime(replayClock(),active.blind,active),bar=disclosedBars().at(-1),coin=active.symbol.replace(/USDT$/,'');
-    const id=identifiers.tradeId||identifiers.orderId||annotation?.tradeId||annotation?.orderId||annotation?.trade?.id||annotation?.trade?.orderId||annotation?.orderFilled?.id;
+    const id=identifiers.tradeId||identifiers.orderId||identifiers.planId||annotation?.tradeId||annotation?.orderId||annotation?.executionEvent?.tradeId||annotation?.executionEvent?.orderId||annotation?.trade?.id||annotation?.trade?.orderId||annotation?.orderFilled?.id;
     const orderType=identifiers.orderType||annotation?.order?.type||annotation?.orderFilled?.type||annotation?.position?.type||null;
-    const sameMinuteFinal=!!annotation?.orderFilled&&!!active.trades?.at(-1)&&active.trades.at(-1).orderId===id;
-    const tags=[`${coin}/USDT`,tf,reviewActionLabel(kind,orderType)||actionLabels[kind]||kind, id?`#${String(id).slice(-8)}`:'',blindTime,sameMinuteFinal?'同一分钟最终图':'',identifiers.fastForwarding??fastForwarding?'快进过程中生成':'',`${volumeSeries&&active.volume!==false?'VOL ':''}${active.volume!==false?`${pretty(bar?.volume,4)} ${coin}`:'成交量隐藏'}`].filter(Boolean).join('  ·  ');
+    const sameMinuteFinal=!!(annotation?.orderFilled||annotation?.executionEvent)&&!!active.trades?.at(-1)&&active.trades.at(-1).orderId===id;
+    const stageTag=annotation?.executionEvent?`引擎阶段${annotation.executionEvent.seq||''} · 同一分钟最终盘面，分钟内先后未知`:'';
+    const tags=[`${coin}/USDT`,tf,reviewActionLabel(kind,orderType)||actionLabels[kind]||kind, id?`#${String(id).slice(-8)}`:'',blindTime,sameMinuteFinal?'同一分钟最终图':'',stageTag,identifiers.fastForwarding??fastForwarding?'快进过程中生成':'',`${volumeSeries&&active.volume!==false?'VOL ':''}${active.volume!==false?`${pretty(bar?.volume,4)} ${coin}`:'成交量隐藏'}`].filter(Boolean).join('  ·  ');
     ctx.font=`${Math.round(12*scaleY)}px ui-monospace, SFMono-Regular, Menlo, monospace`;ctx.fillStyle='#d8e1e3';ctx.textBaseline='middle';ctx.fillText(tags,10*scaleY,headerHeight/2,canvas.width-20*scaleY);
     ctx.drawImage(source,0,headerHeight);
     const sx=source.width/Math.max(1,host.clientWidth),sy=scaleY;ctx.save();ctx.translate(0,headerHeight);ctx.scale(sx,sy);
@@ -170,12 +192,16 @@ function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
         if([x1,y1,x2,y2].every(Number.isFinite)){ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();}
       }
     }
-    const order=effectivePlan();
+    const order=effectivePlan(),executionStage=annotation?.executionEvent||null,stagePosition=executionStage?.position||executionStage?.after?.position||executionStage?.before?.position||null;
+    if(stagePosition){
+      const levels=[['入场',stagePosition.entry,'#e7be6d'],['止损',stagePosition.stop,'#f06d78'],['止盈',stagePosition.take,'#22c58b'],['强平',recordLiquidation(stagePosition),'#ff7272']];
+      for(const [label,price,color] of levels){if(!Number.isFinite(price))continue;const y=candleSeries.priceToCoordinate(price);if(Number.isFinite(y)){ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1;ctx.setLineDash([5,4]);ctx.moveTo(0,y);ctx.lineTo(plotWidth,y);ctx.stroke();ctx.setLineDash([]);ctx.font='11px ui-monospace, SFMono-Regular, Menlo, monospace';ctx.fillStyle=color;ctx.fillText(`${label} ${pretty(price)}`,Math.max(4,plotWidth-138),Math.max(12,y-4));}}
+    }
     if(order){
       const levels=[['入场',order.entryPrice??order.entry,'#e7be6d'],['止损',order.stop,'#f06d78'],['止盈',order.take,'#22c58b'],['强平',recordLiquidation(order),'#ff7272']];
       for(const [label,price,color] of levels){if(!Number.isFinite(price))continue;const y=candleSeries.priceToCoordinate(price);if(!Number.isFinite(y))continue;ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1;ctx.setLineDash([5,4]);ctx.moveTo(0,y);ctx.lineTo(plotWidth,y);ctx.stroke();ctx.setLineDash([]);ctx.font='11px ui-monospace, SFMono-Regular, Menlo, monospace';ctx.fillStyle=color;ctx.fillText(`${label} ${pretty(price)}`,Math.max(4,plotWidth-138),Math.max(12,y-4));}
     }
-    const closedTrade=annotation?.trade||active.trades?.at(-1);
+    const closedTrade=annotation?.trade||executionStage?.trade||executionStage?.after?.trade||(!executionStage?active.trades?.at(-1):null);
     if(closedTrade&&!active.position){
       for(const {label,rawPrice:price,color} of reviewExitRows(closedTrade)){if(!Number.isFinite(price))continue;const y=candleSeries.priceToCoordinate(price);if(Number.isFinite(y)){ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=label==='平仓'?1.5:1;ctx.setLineDash(label==='平仓'?[3,3]:[5,4]);ctx.moveTo(0,y);ctx.lineTo(plotWidth,y);ctx.stroke();ctx.setLineDash([]);}}
       drawReviewExitCard(ctx,closedTrade,12,12);
@@ -186,6 +212,7 @@ function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
 }
 function setReviewStatus(message,warning=false){if(!els['review-export-status'])return;els['review-export-status'].textContent=message;els['review-export-status'].classList.toggle('warning',warning);}
 function reviewActionLabel(kind,orderType){
+  if(kind==='order-plan-locked')return '下单前计划锁定';
   if(kind==='order-submitted')return orderType==='market'?'市价单提交':orderType==='limit'?'限价挂单已提交':'订单已提交';
   if(kind==='order-filled')return orderType==='market'?'市价单成交':orderType==='limit'?'限价单成交':'订单已成交';
   return null;
@@ -202,10 +229,11 @@ function drawReviewExitCard(ctx,trade,x,y){
   rows.forEach((row,index)=>{ctx.fillStyle=row.color;ctx.fillText(`${row.label} ${row.price}`,x+9,y+11+index*rowHeight);});
   ctx.fillStyle='#e9eff0';ctx.fillText(summary,x+9,y+height-9);ctx.restore();
 }
-function recordReviewEvent(kind,{session=active,before,after,screenshot=false,view,orderId,tradeId,orderType}={}){
+function recordReviewEvent(kind,{session=active,before,after,screenshot=false,view,orderId,tradeId,orderType,planId,snapshotId,thesisId,parentTradeId,observationId,strategyVersion,attemptNumber,actor='user',modelConfigId,timingClass,reason,modification,references,recordedAt,captureType}={}){
   if(!session)return;
   const annotation=after?.event||after?.trade||null;
-  void reviewRecorder.observe(session,{kind,before,after,view:view||reviewView(session),orderId,tradeId,screenshot:screenshot?()=>captureReviewScreenshot(annotation,kind,{orderId,tradeId,orderType,fastForwarding:view?.fastForwarding}):undefined})
+  const screenshotSource=screenshot===true?()=>captureReviewScreenshot(annotation,kind,{orderId,tradeId,orderType,fastForwarding:view?.fastForwarding}):screenshot||undefined;
+  return reviewRecorder.observe(session,{kind,before,after,view:view||reviewView(session),orderId,tradeId,planId,snapshotId,thesisId,parentTradeId,observationId,strategyVersion,attemptNumber,actor,modelConfigId:modelConfigId||session.modelConfigId||session.modelEvidence?.modelConfigId,timingClass,reason,modification,references,recordedAt,captureType,screenshot:screenshotSource})
     .catch(error=>setReviewStatus(`复盘过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
 }
 function reviewPlaybackSnapshot(session=active,playing=isPlaying,speed=Number(els.speed?.value)||1500){return {...reviewStateProjection(session||{}),playback:{playing,speed}};}
@@ -234,7 +262,7 @@ function ensureModificationDraft(){
   const target=managedTarget();if(!target)return null;
   if(modificationIsCurrent())return modificationDraft;
   const source=target.order,copy=clone(source);copy.stop=source.stop??null;copy.take=source.take??null;
-  modificationDraft={...copy,_edit:{sessionId:active.id,kind:target.kind,id:target.id,base:{entryPrice:source.entryPrice??source.entry,stop:source.stop??null,take:source.take??null}}};
+  modificationDraft={...copy,changeReason:null,_edit:{sessionId:active.id,kind:target.kind,id:target.id,base:{entryPrice:source.entryPrice??source.entry,stop:source.stop??null,take:source.take??null}}};
   return modificationDraft;
 }
 function modificationChanged(draft=modificationDraft){
@@ -299,7 +327,7 @@ function beginPlan(side){
   const leverage=normalizeLeverage(active.leverage),entry=replayMark(),notional=calcNotional(active.sizePercent??10,leverage),previous=uiPlan;
   const stopDistance=previous&&Number.isFinite(previous.stop)?Math.abs(previous.entryPrice-previous.stop)/previous.entryPrice:null;
   const takeDistance=previous&&Number.isFinite(previous.take)?Math.abs(previous.take-previous.entryPrice)/previous.entryPrice:null;
-  uiPlan={side,orderType:selectedOrderType,entryPrice:entry,stop:stopDistance===null?null:entry*(1-side*stopDistance),take:takeDistance===null?null:entry*(1+side*takeDistance),notional,leverage};
+  uiPlan={side,orderType:selectedOrderType,entryPrice:entry,stop:stopDistance===null?null:entry*(1-side*stopDistance),take:takeDistance===null?null:entry*(1+side*takeDistance),notional,leverage,reviewPlanId:previous?.reviewPlanId||reviewId('plan'),captureStartedAt:previous?.captureStartedAt||new Date().toISOString()};
   active.draftPlan=clone(uiPlan);els['plan-actions'].hidden=false;chart.priceScale('right').applyOptions({autoScale:true});renderPlanOverlay();renderPosition();syncPlanSummary();syncDirectionSelection();syncPlaybackControls();persist();
 }
 function syncDirectionSelection(){
@@ -322,14 +350,17 @@ function protectionAnchor(plan){
   return plan.entryPrice??plan.entry;
 }
 function protectionPreviewValid(kind,price,plan){return validProtection(plan.side,kind,price,protectionAnchor(plan));}
+function reasonBlocksReplay(mode=pendingOrderRequest?.mode){return mode==='entry'||mode==='exit';}
 function chooseOrderType(type){
   if(pendingOrderRequest||active?.position||active?.pending)return;selectedOrderType=type;if(active)active.selectedOrderType=type;if(uiPlan){const old=uiPlan;uiPlan.orderType=type;if(type==='market'){const price=replayMark(),delta=price-old.entryPrice;uiPlan.entryPrice=price;if(Number.isFinite(uiPlan.stop))uiPlan.stop+=delta;if(Number.isFinite(uiPlan.take))uiPlan.take+=delta;}active.draftPlan=clone(uiPlan);chart.priceScale('right').applyOptions({autoScale:true});renderPlanOverlay();syncPlanSummary();persist();}
   $('market-type').classList.toggle('active',type==='market');$('limit-type').classList.toggle('active',type==='limit');if(active&&!uiPlan)persist();
 }
 function confirmPlan(){
   if(pendingOrderRequest||!uiPlan||!active||Number(els.notional.value)<=0){if(Number(els.notional.value)<=0)toast('请选择大于0%的仓位比例');return;}
-  const wasPlaying=isPlaying,speed=Number(els.speed.value)||1500;reasonResumePlayback=wasPlaying;pause(false);if(wasPlaying)recordPlaybackTransition('playback-pause',true,speed);pendingOrderRequest={...clone(uiPlan),mode:'entry',sessionId:active.id};reasonMode='entry';reasonSubmitting=false;reasonFocusReturn=els['confirm-plan'];els['reason-confirm'].disabled=false;
+  const wasPlaying=isPlaying,speed=Number(els.speed.value)||1500;reasonResumePlayback=wasPlaying;pause(false);if(wasPlaying)recordPlaybackTransition('playback-pause',true,speed);pendingOrderRequest={...clone(uiPlan),mode:'entry',sessionId:active.id,planId:uiPlan.reviewPlanId||reviewId('plan'),snapshotId:reviewId('snapshot'),captureStartedAt:uiPlan.captureStartedAt||new Date().toISOString(),account:reviewAccountSnapshot(active),view:reviewView(active)};reasonMode='entry';reasonSubmitting=false;reasonFocusReturn=els['confirm-plan'];els['reason-confirm'].disabled=false;
   els['entry-reason'].value=String(uiPlan.entryReason||'');els['entry-reason'].removeAttribute('aria-invalid');els['entry-reason-error'].textContent='';
+  els['loss-budget'].value=Number.isFinite(uiPlan.lossBudget)?String(uiPlan.lossBudget):'';els['loss-budget-status'].textContent='';
+  populateThesisFields({thesisId:uiPlan.thesisId||'',parentTradeId:uiPlan.parentTradeId||'',attemptNumber:uiPlan.attemptNumber||'',strategyVersion:uiPlan.strategyVersion||''});
   setReasonCopy('entry');els['reason-confirm'].disabled=!els['entry-reason'].value.trim();
   els['order-reason-summary'].textContent=reasonOrderSummary(pendingOrderRequest);
   els['reason-confirm'].textContent=`${pendingOrderRequest.orderType==='limit'?'提交限价':'确认市价'} · ${pendingOrderRequest.side===1?'买入 / 做多':'卖出 / 做空'}`;
@@ -340,16 +371,29 @@ function requestExitReason({archiveSymbol=null,returnFocus=null}={}){
   if(pendingOrderRequest||!active?.position||transitionPending)return false;
   const position=active.position;
   const wasPlaying=isPlaying,speed=Number(els.speed.value)||1500;reasonResumePlayback=wasPlaying;pause(false);if(wasPlaying)recordPlaybackTransition('playback-pause',true,speed);
-  pendingOrderRequest={mode:'exit',sessionId:active.id,positionId:positionIdentity(position),symbol:active.symbol,side:position.side,exitPrice:replayMark(),archiveSymbol};
+  const snapshotId=reviewId('snapshot'),before=reviewStateProjection(active),view=reviewView(active),startedAt=new Date().toISOString();
+  pendingOrderRequest={mode:'exit',sessionId:active.id,positionId:positionIdentity(position),symbol:active.symbol,side:position.side,exitPrice:replayMark(),archiveSymbol,planId:position.planId||null,tradeId:position.tradeId||null,snapshotId,captureStartedAt:startedAt,before,view,account:reviewAccountSnapshot(active)};
   reasonMode='exit';reasonSubmitting=false;reasonFocusReturn=returnFocus||els['new-session'];
   els['entry-reason'].value='';els['entry-reason'].removeAttribute('aria-invalid');els['entry-reason-error'].textContent='';
   setReasonCopy('exit');els['reason-confirm'].textContent=archiveSymbol?'确认平仓并归档':'确认平仓';els['reason-confirm'].disabled=!els['entry-reason'].value.trim();
   const closeSummary=`${position.symbol?.replace?.('USDT','')||active.symbol.replace('USDT','')} · ${position.side===1?'买入 / 做多':'卖出 / 做空'} · 主动市价平仓\n预计平仓价 ${pretty(pendingOrderRequest.exitPrice)} · 杠杆 ${recordLeverage(position)}× · 保证金 ${pretty(recordMargin(position))} U`;
   els['order-reason-summary'].textContent=archiveSymbol?`${closeSummary}\n确认后将归档本轮并尝试开始新一轮。取消会保留本轮。`:closeSummary;
-  els['order-reason-window'].hidden=false;syncReasonControls();syncPlaybackControls();els.play.textContent='▶';els.play.setAttribute('aria-label','自动播放');positionReasonWindow();requestAnimationFrame(()=>els['entry-reason'].focus());return true;
+  recordReviewEvent('position-close-requested',{session:active,before,after:{...before,closeRequest:{positionId:pendingOrderRequest.positionId,price:pendingOrderRequest.exitPrice,account:pendingOrderRequest.account}},view,screenshot:true,planId:pendingOrderRequest.planId,tradeId:pendingOrderRequest.tradeId,snapshotId,actor:'user',timingClass:'in-position'});
+  els['order-reason-window'].hidden=false;syncReasonControls();syncPlaybackControls();positionReasonWindow();requestAnimationFrame(()=>els['entry-reason'].focus());return true;
+}
+function requestPlanSupplement({trade=null,returnFocus=null}={}){
+  if(pendingOrderRequest||!active)return false;
+  const position=active.position,planId=trade?.planId||position?.planId||reviewId('plan'),tradeId=trade?.id||trade?.tradeId||position?.tradeId||null;
+  const mode=trade?'supplement-after':'supplement-position',timingClass=trade?'post-trade':'position';
+  reasonResumePlayback=false;
+  pendingOrderRequest={mode,sessionId:active.id,planId,tradeId,positionId:position?positionIdentity(position):null,orderId:position?.orderId||null,positionSnapshot:position?clone(position):null,captureStartedInPosition:!trade&&!!position,timingClass,captureStartedAt:new Date().toISOString(),snapshotId:reviewId('snapshot'),before:reviewStateProjection(active),view:reviewView(active),account:reviewAccountSnapshot(active)};
+  reasonMode='supplement';reasonSubmitting=false;reasonFocusReturn=returnFocus;els['entry-reason'].value='';els['entry-reason'].removeAttribute('aria-invalid');els['entry-reason-error'].textContent='';
+  els['loss-budget'].value='';populateThesisFields();setReasonCopy('supplement');els['reason-confirm'].textContent='保存补充记录';els['reason-confirm'].disabled=true;
+  els['order-reason-summary'].textContent=`${active.symbol.replace('USDT','')} · ${trade?'平仓后补充复盘（事后记录）':'持仓中追加计划'}\n原计划与原文不会被覆盖；本条将按${timingClass==='post-trade'?'事后':'持仓中'}版本另行保存。`;
+  els['order-reason-window'].hidden=false;syncReasonControls();syncPlaybackControls();positionReasonWindow();requestAnimationFrame(()=>els['entry-reason'].focus());return true;
 }
 function syncDrawingControls(){
-  const locked=!!pendingOrderRequest||!!transitionPending;
+  const locked=reasonBlocksReplay()||!!transitionPending;
   for(const [id,tool] of [['drawing-select',null],['drawing-horizontal','horizontal'],['drawing-trendline','trendline']]){
     const button=$(id);if(!button)continue;const selected=activeDrawingTool===tool;button.classList.toggle('active',selected);button.setAttribute('aria-pressed',String(selected));button.disabled=locked;
   }
@@ -367,8 +411,39 @@ function deleteSelectedDrawing(){
   syncDrawingControls();
 }
 function setReasonCopy(mode){
-  const exiting=mode==='exit';$('order-reason-title').textContent=exiting?'填写平仓理由':'填写下单理由';$('reason-prompt').textContent=exiting?'为什么现在主动平仓？':'为什么在这里下单？';
-  els['entry-reason'].placeholder=exiting?'写下主动退出的依据…':'写下你的判断依据…';els['reason-close'].setAttribute('aria-label',exiting?'取消本次平仓':'取消本次下单');
+  const exiting=mode==='exit',supplement=mode==='supplement';$('order-reason-title').textContent=exiting?'填写平仓理由':supplement?'补充复盘记录':'填写下单理由';$('reason-prompt').textContent=exiting?'为什么现在主动平仓？':supplement?'补充当时的想法、持仓计划或事后复盘':'为什么在这里下单？';
+  els['entry-reason'].placeholder=exiting?'写下主动退出的依据…':supplement?'原文会作为新版本保存，不会改写先前记录…':'写下你的判断依据…';els['reason-close'].setAttribute('aria-label',exiting?'取消本次平仓':supplement?'取消补充记录':'取消本次下单');
+  $('loss-budget-details').hidden=mode!=='entry';els['thesis-fields'].hidden=mode==='exit';els['observation-fields'].hidden=mode!=='observation';
+  if(mode==='observation'){$('order-reason-title').textContent='记录判断';$('reason-prompt').textContent='当时你在观察什么？';els['entry-reason'].placeholder='写下当时的判断或这次不做的原因…';els['reason-close'].setAttribute('aria-label','取消观察记录');}
+}
+function populateThesisFields({thesisId='',parentTradeId='',attemptNumber='',strategyVersion=''}={}){
+  const thesis=els['thesis-choice'],parent=els['parent-trade'];thesis.replaceChildren(new Option('不关联想法',''),new Option('新建想法','__new__'));
+  const known=new Map();for(const session of [active,...history.map(item=>item?.session)].filter(Boolean))for(const item of session.theses||[])if(item?.thesisId&&!known.has(item.thesisId))known.set(item.thesisId,item);
+  for(const item of known.values())thesis.add(new Option(item.label||'未命名想法',item.thesisId));thesis.value=thesisId||'';els['thesis-label-wrap'].hidden=thesis.value!=='__new__';els['thesis-label'].value='';
+  parent.replaceChildren(new Option('不关联前序交易',''));const trades=[];
+  for(const session of [active,...history.map(item=>item?.session)].filter(Boolean))for(const trade of session.trades||[])trades.push({session,trade});
+  for(const {session,trade} of trades){const id=String(trade.tradeId||trade.id||trade.orderId||'');if(!id)continue;const value=JSON.stringify({sessionId:session.id,tradeId:id}),label=`${session.symbol?.replace('USDT','')||''} ${trade.side===1?'多':'空'} · ${pretty(trade.pnl)} U · ${id.slice(-8)}`;parent.add(new Option(label,value));}
+  parent.value='';if(parentTradeId){const match=trades.find(({trade})=>String(trade.tradeId||trade.id||trade.orderId||'')===String(parentTradeId));if(match)parent.value=JSON.stringify({sessionId:match.session.id,tradeId:parentTradeId});}
+  els['attempt-number'].value=attemptNumber?String(attemptNumber):'';els['strategy-version'].value=strategyVersion||'';
+}
+function readThesisFields(session=active){
+  const choice=els['thesis-choice'].value,label=els['thesis-label'].value.trim(),parentValue=els['parent-trade'].value;
+  if(choice==='__new__'&&!label)throw new Error('请填写新想法名称，或选择不关联想法。');
+  let parent=null;if(parentValue){try{parent=JSON.parse(parentValue);}catch{throw new Error('前序交易选择无效。');}}
+  const rawAttempt=els['attempt-number'].value.trim(),attemptNumber=rawAttempt===''?null:Number(rawAttempt);
+  if(attemptNumber!==null&&(!Number.isInteger(attemptNumber)||attemptNumber<1))throw new Error('尝试次数需为正整数，或留空。');
+  return {thesisId:choice&&choice!=='__new__'?choice:null,newThesisLabel:choice==='__new__'?label:null,parentTradeId:parent?.tradeId||null,parentSessionId:parent?.sessionId||null,attemptNumber,strategyVersion:els['strategy-version'].value.trim()||null};
+}
+function commitThesis(session,context){
+  if(!session||!context?.newThesisLabel)return context?.thesisId||null;
+  session.theses??=[];const thesisId=context.thesisId||reviewId('thesis');if(!session.theses.some(item=>item.thesisId===thesisId))session.theses.push({thesisId,label:context.newThesisLabel,createdAt:new Date().toISOString(),actor:'user'});context.thesisId=thesisId;return thesisId;
+}
+function openObservation(status='judgement'){
+  if(!active||pendingOrderRequest||transitionPending)return false;
+  const openedAt=new Date().toISOString(),snapshotId=reviewId('snapshot'),view=reviewView(active);
+  pendingOrderRequest={mode:'observation',status,sessionId:active.id,observationId:reviewId('observation'),snapshotId,captureStartedAt:openedAt,openedAt,replayMarketTime:view.visibleThrough,visibleThrough:view.visibleThrough,before:reviewStateProjection(active),view,account:reviewAccountSnapshot(active),openingScreenshot:captureReviewScreenshot(null,'observation-open')};
+  reasonResumePlayback=false;reasonMode='observation';reasonSubmitting=false;reasonFocusReturn=els['observation-open'];els['entry-reason'].value='';els['observed-conditions'].value='';els['entry-reason-error'].textContent='';els['observation-status'].value=status;els['reason-confirm'].textContent='保存观察记录';els['reason-confirm'].disabled=true;els['order-reason-summary'].textContent=`${active.symbol.replace('USDT','')} · ${showTime(view.visibleThrough)} · 回放继续进行，不会暂停。`;
+  populateThesisFields();setReasonCopy('observation');els['order-reason-window'].hidden=false;syncReasonControls();syncPlaybackControls();positionReasonWindow();requestAnimationFrame(()=>els['entry-reason'].focus());return true;
 }
 function reasonOrderSummary(p){
   const entry=p.entryPrice??p.entry,stop=Number.isFinite(p.stop)?pretty(p.stop):'未设置',take=Number.isFinite(p.take)?pretty(p.take):'未设置';
@@ -393,9 +468,9 @@ function positionReasonWindow(){
   applyReasonWindowPosition(x,y,false);
 }
 function syncReasonControls(){
-  const locked=!!pendingOrderRequest;
-  els['order-reason-window'].hidden=!locked;
-  els['order-reason-window'].classList.toggle('reason-open',locked);
+  const locked=reasonBlocksReplay(),open=!!pendingOrderRequest;
+  els['order-reason-window'].hidden=!open;
+  els['order-reason-window'].classList.toggle('reason-open',open);
   chartOverlay?.classList.toggle('reason-frozen',locked);
   chartOverlay?.querySelectorAll('.plan-price-handle,.protection-remove,.protection-add-marker').forEach(control=>{control.disabled=locked;control.setAttribute('aria-disabled',String(locked));});
   syncDrawingControls();
@@ -407,13 +482,13 @@ function syncReasonControls(){
 }
 function closeOrderReason(returnFocus=true){
   if(!pendingOrderRequest||reasonSubmitting)return;
-  const request=pendingOrderRequest;if(request.mode!=='exit'&&uiPlan){uiPlan.entryReason=els['entry-reason'].value;active.draftPlan=clone(uiPlan);persist({audit:false});}
+  const request=pendingOrderRequest;if(request.mode==='entry'&&uiPlan){uiPlan.entryReason=els['entry-reason'].value;active.draftPlan=clone(uiPlan);persist({audit:false});}
   pendingOrderRequest=null;reasonWindowDrag=null;els['entry-reason-error'].textContent='';els['entry-reason'].removeAttribute('aria-invalid');syncReasonControls();
   if(request.mode==='exit'&&request.archiveSymbol){pendingSymbol=null;if(active)els.symbol.value=active.symbol;}
   if(active&&!invalidSavedActive)render(false,false);
   if(returnFocus&&reasonFocusReturn?.isConnected&&!reasonFocusReturn.hidden)reasonFocusReturn.focus();
   reasonFocusReturn=null;
-  resumeReasonPlayback();
+  if(reasonBlocksReplay(request.mode))resumeReasonPlayback();else reasonResumePlayback=false;
 }
 function resumeReasonPlayback(){const shouldResume=reasonResumePlayback;reasonResumePlayback=false;if(shouldResume&&active&&!replayIsEnded()&&!invalidSavedActive&&!isPlaying)togglePlayWithAudit();}
 async function submitOrderReason(){
@@ -421,13 +496,64 @@ async function submitOrderReason(){
   const entryReason=els['entry-reason'].value.trim();
   if(!entryReason){els['entry-reason'].setAttribute('aria-invalid','true');els['entry-reason-error'].textContent=`请填写${reasonMode==='exit'?'平仓':'下单'}理由后再确认。`;els['entry-reason'].focus();return;}
   if(entryReason.length>2000){els['entry-reason'].setAttribute('aria-invalid','true');els['entry-reason-error'].textContent=`${reasonMode==='exit'?'平仓':'下单'}理由不能超过 2000 个字符。`;els['entry-reason'].focus();return;}
-  const request=clone(pendingOrderRequest);reasonSubmitting=true;els['reason-confirm'].disabled=true;
+  const lossBudgetText=els['loss-budget'].value.trim(),lossBudget=lossBudgetText===''?null:Number(lossBudgetText);
+  if(pendingOrderRequest.mode==='entry'&&lossBudgetText!==''&&(!Number.isFinite(lossBudget)||lossBudget<0)){
+    els['loss-budget-status'].textContent='请输入非负的USDT金额，或留空';els['loss-budget'].focus();return;
+  }
+  els['loss-budget-status'].textContent='';
+  const request=clone(pendingOrderRequest);if(request.mode==='observation')request.openingScreenshot=pendingOrderRequest.openingScreenshot;reasonSubmitting=true;els['reason-confirm'].disabled=true;
   try{
+    const thesisContext=['entry','supplement-position','supplement-after','observation'].includes(request.mode)?readThesisFields():null;
+    if(thesisContext?.newThesisLabel)thesisContext.thesisId=reviewId('thesis');
+    if(request.mode==='observation'){
+      if(active?.id!==request.sessionId)throw new Error('本轮已变化，观察记录未保存');
+      commitThesis(active,thesisContext);
+      const recordedAt=new Date().toISOString(),observation={observationId:request.observationId,sessionId:active.id,status:els['observation-status'].value,
+        rawText:els['entry-reason'].value,structured:null,author:'user',origin:'user',observedConditions:els['observed-conditions'].value||null,
+        thesisId:thesisContext?.thesisId||null,parentTradeId:thesisContext?.parentTradeId||null,parentSessionId:thesisContext?.parentSessionId||null,
+        attemptNumber:thesisContext?.attemptNumber??null,strategyVersion:thesisContext?.strategyVersion||null,openedAt:request.openedAt,recordedAt,
+        replayMarketTime:request.replayMarketTime,visibleThrough:request.visibleThrough,visibleThroughSemantics:'exclusive-market-close-utc-seconds',
+        snapshotId:request.snapshotId,captureStartedView:request.view,captureStartedAccount:request.account,submittedView:reviewView(active),modelConfigId:reviewModelConfigId(active),actor:'user'};
+      active.observations??=[];active.observations.push(observation);const after=reviewStateProjection(active);
+      pendingOrderRequest=null;reasonSubmitting=false;syncReasonControls();render();
+      recordReviewEvent('observation-recorded',{before:request.before,after:{...after,observation},tradeId:observation.parentTradeId,snapshotId:request.snapshotId,thesisId:observation.thesisId,parentTradeId:observation.parentTradeId,observationId:observation.observationId,strategyVersion:observation.strategyVersion,attemptNumber:observation.attemptNumber,
+        references:{thesisId:observation.thesisId,observationId:observation.observationId,parentTradeId:observation.parentTradeId},actor:'user',timingClass:observation.status,
+        reason:observation.rawText,view:{...request.view,observationStatus:observation.status,recordedAt,marketTime:request.replayMarketTime},screenshot:request.openingScreenshot});
+      persist({audit:false});reasonFocusReturn=null;toast(observation.status==='not-taken'?'已记录这次不做的判断':'已记录观察判断');return;
+    }
+    if(request.mode==='supplement-position'||request.mode==='supplement-after'){
+      if(active?.id!==request.sessionId)throw new Error('本轮已变化，补充记录未保存');
+      let linkedTrade=null,linkedPosition=null,captureStartedInPosition=request.mode==='supplement-position'&&request.captureStartedInPosition===true;
+      if(request.mode==='supplement-position'){
+        if(active.position&&positionIdentity(active.position)===request.positionId)linkedPosition=active.position;
+        else linkedTrade=findClosedTradeForPosition(active.trades,request.positionSnapshot);
+        if(!linkedPosition&&!linkedTrade)throw new Error('原持仓已变化，未找到对应的成交记录；补充内容未保存');
+      }
+      if(request.mode==='supplement-after'){
+        linkedTrade=(active.trades||[]).find(item=>String(item.id||item.tradeId||item.orderId)===String(request.tradeId))||null;
+        if(!linkedTrade)throw new Error('成交记录已变化，补充记录未保存');
+      }
+      const targetTrade=linkedTrade,effectivePlanId=targetTrade?.planId||linkedPosition?.planId||request.planId,effectiveTradeId=targetTrade?.id||targetTrade?.tradeId||targetTrade?.orderId||request.tradeId||null,effectiveOrderId=targetTrade?.orderId||linkedPosition?.orderId||request.orderId||null;
+      const timingClass=request.mode==='supplement-after'||linkedTrade?'post-trade':'position';
+      const submittedAt=new Date().toISOString(),plans=ensureReviewPlans(active),latest=plans.filter(item=>item.planId===effectivePlanId).sort((a,b)=>b.version-a.version)[0],submittedSnapshotId=reviewId('snapshot'),submittedView=reviewView(active),submittedAccount=reviewAccountSnapshot(active);
+      const planVersion=createPlanVersion({session:active,planId:effectivePlanId,version:latest?latest.version+1:1,parentPlanId:latest?.planId||null,
+        rawText:els['entry-reason'].value,structured:null,author:'user',origin:'user',timingClass,
+        captureStartedAt:request.captureStartedAt,captureEndedAt:submittedAt,submittedAt,visibleThrough:replayClock(),replayMarketTime:replayClock(),snapshotId:submittedSnapshotId,
+        captureStartedView:request.view,captureStartedAccount:request.account,
+        orderId:effectiveOrderId,tradeId:effectiveTradeId,order:linkedPosition?clone(linkedPosition):targetTrade?clone(targetTrade):null,account:submittedAccount,captureStartedInPosition,
+        thesisId:thesisContext?.thesisId||null,parentTradeId:thesisContext?.parentTradeId||null,parentSessionId:thesisContext?.parentSessionId||null,attemptNumber:thesisContext?.attemptNumber??null,strategyVersion:thesisContext?.strategyVersion||null,
+        risk:{lossBudget:null,lossBudgetStatus:'not-provided',statusReason:'事后补记未设置风险预算'},modelConfigId:reviewModelConfigId(active),actor:'user'});
+      commitThesis(active,thesisContext);const before=reviewStateProjection(active);appendPlanVersion(active,planVersion);
+      pendingOrderRequest=null;reasonSubmitting=false;syncReasonControls();render();
+      recordReviewEvent('plan-supplemented',{before,after:{...reviewStateProjection(active),planVersion},planId:planVersion.planId,orderId:planVersion.orderId,tradeId:planVersion.tradeId,snapshotId:planVersion.snapshotId,thesisId:planVersion.thesisId,parentTradeId:planVersion.parentTradeId,strategyVersion:planVersion.strategyVersion,attemptNumber:planVersion.attemptNumber,references:{captureStartedAt:request.captureStartedAt,planVersion:planVersion.version,captureStartedInPosition},actor:'user',timingClass:planVersion.timingClass,reason:planVersion.rawText,screenshot:true,view:submittedView});
+      persist({audit:false});reasonFocusReturn=null;toast(planVersion.timingClass==='post-trade'?(captureStartedInPosition?'持仓期间开始的补充已作为事后版本保存':'事后复盘补充已另存为新版本'):'持仓计划补充已另存为新版本');resumeReasonPlayback();return;
+    }
     if(request.mode==='exit'){
       if(active?.id!==request.sessionId||!active.position||positionIdentity(active.position)!==request.positionId)throw new Error('持仓状态已变化，未执行平仓；请取消并检查当前持仓');
       const symbol=request.symbol,side=request.side,archiveSymbol=request.archiveSymbol,trade=manualClosePosition(active,currentData(),entryReason,request.exitPrice);
       if(!trade)throw new Error('持仓已变化，未执行平仓');
-      pendingOrderRequest=null;reasonSubmitting=false;clearModificationDraft();els['order-reason-window'].hidden=true;syncReasonControls();chart.priceScale('right').applyOptions({autoScale:true});render();persist({kind:'position-closed',tradeId:trade.id||trade.orderId,capture:true});reasonFocusReturn=null;
+      const exitRecordedAt=new Date().toISOString(),tradeId=trade.id||trade.tradeId||trade.orderId||null,afterClose=reviewStateProjection(active),closedSnapshotId=reviewId('snapshot');
+      pendingOrderRequest=null;reasonSubmitting=false;clearModificationDraft();els['order-reason-window'].hidden=true;syncReasonControls();chart.priceScale('right').applyOptions({autoScale:true});render();persist({kind:'position-closed',before:request.before,after:{...afterClose,trade:clone(trade),account:reviewAccountSnapshot(active)},tradeId,orderId:trade.orderId,planId:trade.planId||request.planId,snapshotId:closedSnapshotId,references:{closeRequestSnapshotId:request.snapshotId},actor:'user',timingClass:'exit',reason:els['entry-reason'].value,view:reviewView(active),capture:true});reasonFocusReturn=null;
       const shouldResume=reasonResumePlayback;reasonResumePlayback=false;
       toast(`主动平仓已成交 · ${symbol.replace('USDT','')} ${side===1?'做多':'做空'} · ${pretty(trade.exit)} · 理由已记录`);
       if(archiveSymbol){pendingSymbol=null;const started=await startRound(archiveSymbol);if(shouldResume&&active&&!replayIsEnded()&&!invalidSavedActive&&!isPlaying)togglePlayWithAudit();if(!started)return;}
@@ -436,14 +562,27 @@ async function submitOrderReason(){
     }
     const p=request;p.entryReason=entryReason;
     if(!uiPlan||active?.id!==request.sessionId)throw new Error('本轮计划已变化，订单未提交');
-    uiPlan.entryReason=entryReason;active.draftPlan=clone(uiPlan);persist({audit:false});
-    const beforeMetrics=metrics(active,currentData()),beforeSubmit={...reviewStateProjection(active),account:{balance:active.balance,equity:beforeMetrics.equity,availableBalance:beforeMetrics.availableBalance,usedMargin:beforeMetrics.usedMargin,reservedMargin:beforeMetrics.reservedMargin,unreal:beforeMetrics.unreal}};
-    const result=placeOrder(active,currentData(),p.side,p.notional,p.entryPrice,p.stop,p.take,p.orderType,entryReason,normalizeLeverage(p.leverage));
+    uiPlan.entryReason=entryReason;uiPlan.lossBudget=lossBudget;uiPlan.reviewPlanId=p.planId;active.draftPlan=clone(uiPlan);
+    const submittedAt=new Date().toISOString(),snapshotId=p.snapshotId||reviewId('snapshot'),captureStartedAt=p.captureStartedAt||submittedAt,preView=reviewView(active),beforeMetrics=metrics(active,currentData());
+    const account={balance:active.balance,equity:beforeMetrics.equity,availableBalance:beforeMetrics.availableBalance,usedMargin:beforeMetrics.usedMargin,reservedMargin:beforeMetrics.reservedMargin,unrealizedPnl:beforeMetrics.unreal,at:submittedAt};
+    const stateBefore=reviewStateProjection(active),beforeSubmit={...stateBefore,account};
+    const entryBeforeImage=captureReviewScreenshot({orderType:p.orderType},'order-plan-locked',{orderType:p.orderType});
+    const metadata={planId:p.planId,lossBudget,lossBudgetStatus:lossBudget===null?'not-provided':'user-provided',rawReason:els['entry-reason'].value,modelConfigId:reviewModelConfigId(active),thesisId:thesisContext?.thesisId||null,parentTradeId:thesisContext?.parentTradeId||null,parentSessionId:thesisContext?.parentSessionId||null,attemptNumber:thesisContext?.attemptNumber??null,strategyVersion:thesisContext?.strategyVersion||null};
+    const result=placeOrder(active,currentData(),p.side,p.notional,p.entryPrice,p.stop,p.take,p.orderType,entryReason,normalizeLeverage(p.leverage),metadata);
     const orderId=result.order?.id||result.position?.orderId||null;
+    const tradeId=result.position?.tradeId||result.trade?.id||null;
+    const estimateOrder=result.order||result.position||{};
+    const plannedPriceRisk=Number.isFinite(p.stop)&&Number.isFinite(p.entryPrice)&&p.entryPrice>0?p.notional*Math.abs(p.entryPrice-p.stop)/p.entryPrice:null;
+    const plannedRiskIncludingCosts=estimateOrder.pretradeRisk?.plannedRiskIncludingCosts??estimateOrder.plannedRiskIncludingCosts;
+    const planVersion=createPlanVersion({session:active,planId:p.planId,version:1,rawText:els['entry-reason'].value,structured:null,author:'user',origin:'user',timingClass:'pre-trade',captureStartedAt,captureEndedAt:submittedAt,submittedAt,visibleThrough:replayClock(),replayMarketTime:replayClock(),snapshotId,orderId,tradeId,order:{...clone(p),entryReason},account,risk:{lossBudget,lossBudgetStatus:lossBudget===null?'not-provided':'user-provided',lossBudgetReason:lossBudget===null?'用户未填写亏损预算':null,plannedPriceRisk,plannedRiskIncludingCosts:Number.isFinite(plannedRiskIncludingCosts)?plannedRiskIncludingCosts:null,plannedRiskUnavailableReason:Number.isFinite(plannedRiskIncludingCosts)?null:'引擎未提供含成本预算估算',initialStop:p.stop??null,initialTake:p.take??null},modelConfigId:reviewModelConfigId(active),actor:'user',thesisId:thesisContext?.thesisId||null,parentTradeId:thesisContext?.parentTradeId||null,parentSessionId:thesisContext?.parentSessionId||null,attemptNumber:thesisContext?.attemptNumber??null,strategyVersion:thesisContext?.strategyVersion||null});
+    commitThesis(active,thesisContext);appendPlanVersion(active,planVersion);
+    const planBefore={...beforeSubmit,planVersion:null},planAfter={...beforeSubmit,planVersion};
+    recordReviewEvent('order-plan-locked',{before:planBefore,after:planAfter,view:preView,orderId,tradeId,planId:p.planId,snapshotId,thesisId:planVersion.thesisId,parentTradeId:planVersion.parentTradeId,strategyVersion:planVersion.strategyVersion,attemptNumber:planVersion.attemptNumber,actor:'user',timingClass:'pre-trade',reason:planVersion.rawText,screenshot:entryBeforeImage});
     pendingOrderRequest=null;reasonSubmitting=false;uiPlan=null;active.draftPlan=null;els['plan-actions'].hidden=true;els['order-reason-window'].hidden=true;syncReasonControls();chart.priceScale('right').applyOptions({autoScale:true});render();
-    const afterMetrics=metrics(active,currentData()),afterSubmit={...reviewStateProjection(active),account:{balance:active.balance,equity:afterMetrics.equity,availableBalance:afterMetrics.availableBalance,usedMargin:afterMetrics.usedMargin,reservedMargin:afterMetrics.reservedMargin,unreal:afterMetrics.unreal},initialOrder:clone(result.order||result.position||null),entryReason};
-    persist({kind:'order-submitted',before:beforeSubmit,after:afterSubmit,orderId,orderType:p.orderType,capture:true});
-    if(result.status==='filled')recordReviewEvent('order-filled',{before:beforeSubmit,after:{...afterSubmit,event:{order:clone(result.order||null),position:clone(result.position||null)}},orderId,orderType:p.orderType,screenshot:true});
+    const afterMetrics=metrics(active,currentData()),afterSubmit={...reviewStateProjection(active),account:{balance:active.balance,equity:afterMetrics.equity,availableBalance:afterMetrics.availableBalance,usedMargin:afterMetrics.usedMargin,reservedMargin:afterMetrics.reservedMargin,unrealizedPnl:afterMetrics.unreal},initialOrder:clone(result.order||result.position||null),entryReason,planVersion};
+    const submittedSnapshotId=reviewId('snapshot');
+    persist({kind:'order-submitted',before:planAfter,after:afterSubmit,orderId,orderType:p.orderType,planId:p.planId,snapshotId:submittedSnapshotId,thesisId:planVersion.thesisId,parentTradeId:planVersion.parentTradeId,strategyVersion:planVersion.strategyVersion,attemptNumber:planVersion.attemptNumber,actor:'user',timingClass:'pre-trade',reason:planVersion.rawText,references:{planId:p.planId,preSubmitSnapshotId:snapshotId},capture:true});
+    if(result.status==='filled')recordReviewEvent('order-filled',{before:planAfter,after:{...afterSubmit,event:{order:clone(result.order||null),position:clone(result.position||null)}},orderId,tradeId,planId:p.planId,snapshotId:reviewId('snapshot'),thesisId:planVersion.thesisId,parentTradeId:planVersion.parentTradeId,strategyVersion:planVersion.strategyVersion,attemptNumber:planVersion.attemptNumber,references:{planId:p.planId,preSubmitSnapshotId:snapshotId,submitSnapshotId:submittedSnapshotId},orderType:p.orderType,actor:'engine',timingClass:'fill',screenshot:true});
     reasonFocusReturn=null;
     const coin=active.symbol.replace('USDT',''),direction=p.side===1?'做多':'做空',fill=result.position?.entry??result.order?.fillPrice??p.entryPrice;
     if(result.status==='pending')toast(`限价单已挂单 · ${coin} ${direction} · 限价 ${pretty(p.entryPrice)}`);
@@ -629,14 +768,25 @@ function updateQuote(bar){
   els.ohlc.textContent=`${showTime(bar.time)}  O ${pretty(bar.open)}  H ${pretty(bar.high)}  L ${pretty(bar.low)}  C ${pretty(bar.close)}`;
 }
 function putCell(row,text,className=''){const cell=document.createElement('td');cell.textContent=text;if(className)cell.className=className;row.append(cell);return cell;}
+function showPlanHistory(session,record){
+  const dialog=$('plan-history-dialog'),body=$('plan-history-body');body.replaceChildren();
+  const linked=(session?.reviewPlans||[]).filter(plan=>(record?.planId&&plan.planId===record.planId)||(record?.tradeId&&plan.tradeId===record.tradeId)||(record?.id&&plan.tradeId===record.id)||(record?.orderId&&plan.orderId===record.orderId)||(record?.orderId&&plan.tradeId===record.orderId));
+  const allSessions=[active,...history.map(item=>item?.session),session].filter(Boolean);
+  const ideaLabel=id=>{if(!id)return '未关联想法';for(const owner of allSessions){const item=(owner.theses||[]).find(thesis=>String(thesis.thesisId)===String(id));if(item)return item.label||'未命名想法';}return `想法记录未随本轮导入（${String(id).slice(-8)}）`;};
+  const parentLabel=(id,parentSessionId)=>{if(!id)return '无前序交易';for(const owner of allSessions){if(parentSessionId&&String(owner.id)!==String(parentSessionId))continue;const trade=(owner.trades||[]).find(item=>[item.tradeId,item.id,item.orderId].some(key=>key&&String(key)===String(id)));if(trade)return `${owner.symbol?.replace('USDT','')||''} ${trade.side===1?'多':'空'} · ${trade.entryTime?showTime(trade.entryTime,owner.blind,owner):'时间未知'} · #${String(id).slice(-8)}`;}return `前序交易未找到（${String(id).slice(-8)}）`;};
+  const sorted=linked.sort((a,b)=>(a.version||0)-(b.version||0));
+  if(!sorted.length){const empty=document.createElement('p');empty.textContent='这笔交易没有可确认的计划版本；不会用事后记录补写事前计划。';body.append(empty);}
+  for(const plan of sorted){const article=document.createElement('article');article.className='plan-version-card';const heading=document.createElement('strong');heading.textContent=`版本 ${plan.version||'—'} · ${plan.timingClass==='pre-trade'?'下单前':plan.timingClass==='post-trade'?'平仓后补记':'持仓中补充'} · ${plan.recordedAt?showTime(Date.parse(plan.recordedAt)/1000,false):'时间未知'}`;const text=document.createElement('p');text.textContent=plan.rawText||'（空记录）';const context=document.createElement('small');const risk=plan.risk?.lossBudget===null?'亏损预算未填写':Number.isFinite(plan.risk?.lossBudget)?`亏损预算 ${pretty(plan.risk.lossBudget)} U`:'无风险预算信息';context.textContent=[ideaLabel(plan.thesisId),parentLabel(plan.parentTradeId,plan.parentSessionId),Number.isInteger(plan.attemptNumber)?`第 ${plan.attemptNumber} 次`:'未记次数',plan.strategyVersion||'无策略标签',plan.captureStartedInPosition?'开窗时有持仓':'',risk].filter(Boolean).join(' · ');article.append(heading,text,context);body.append(article);}
+  $('plan-history-title').textContent=`计划版本 · ${record?.side===1?'做多':'做空'} · ${session?.symbol?.replace('USDT','')||''}`;if(!dialog.open)dialog.showModal();
+}
 function renderTradeTable(trades,symbol,session){
   if(!trades.length){const empty=document.createElement('div');empty.className='empty-journal';empty.textContent='还没有已平仓成交。开仓后推进行情，或手动平仓记录结果。';els['journal-content'].append(empty);return;}
   const wrap=document.createElement('div');wrap.className='table-wrap';const table=document.createElement('table');
-  const thead=document.createElement('thead'),hr=document.createElement('tr');['方向','杠杆 / 保证金','开仓时间','开仓价','入场理由','平仓时间','平仓价','盈亏 USDT','逐仓补差','人工平仓理由','平仓原因'].forEach(t=>{const th=document.createElement('th');th.textContent=t;hr.append(th);});thead.append(hr);table.append(thead);
+  const thead=document.createElement('thead'),hr=document.createElement('tr');['方向','杠杆 / 保证金','开仓时间','开仓价','入场理由','平仓时间','平仓价','盈亏 USDT','逐仓补差','人工平仓理由','平仓原因','计划版本'].forEach(t=>{const th=document.createElement('th');th.textContent=t;hr.append(th);});thead.append(hr);table.append(thead);
   const body=document.createElement('tbody');
   for(const t of [...trades].reverse()){
     const tr=document.createElement('tr');putCell(tr,`${symbol.replace('USDT','')} ${t.side===1?'做多':'做空'}`,t.side===1?'positive':'negative');
-    putCell(tr,leverageMarginText(t),'num');putCell(tr,showTime(t.entryTime,session?.blind,session),'num');putCell(tr,pretty(t.entry),'num');putCell(tr,entryReasonText(t.entryReason),'entry-reason-cell');putCell(tr,showTime(t.exitTime,session?.blind,session),'num');putCell(tr,pretty(t.exit),'num');putCell(tr,pretty(t.pnl),`num ${t.pnl>=0?'positive':'negative'}`);putCell(tr,Number.isFinite(t.isolatedAdjustment)&&t.isolatedAdjustment!==0?`${t.isolatedAdjustment>0?'+':''}${pretty(t.isolatedAdjustment)} U`:'—','num');putCell(tr,t.reason==='手动平仓'?exitReasonText(t.exitReason):'—','exit-reason-cell');putCell(tr,t.reason||'—');body.append(tr);
+    putCell(tr,leverageMarginText(t),'num');putCell(tr,showTime(t.entryTime,session?.blind,session),'num');putCell(tr,pretty(t.entry),'num');putCell(tr,entryReasonText(t.entryReason),'entry-reason-cell');putCell(tr,showTime(t.exitTime,session?.blind,session),'num');putCell(tr,pretty(t.exit),'num');putCell(tr,pretty(t.pnl),`num ${t.pnl>=0?'positive':'negative'}`);putCell(tr,Number.isFinite(t.isolatedAdjustment)&&t.isolatedAdjustment!==0?`${t.isolatedAdjustment>0?'+':''}${pretty(t.isolatedAdjustment)} U`:'—','num');putCell(tr,t.reason==='手动平仓'?exitReasonText(t.exitReason):'—','exit-reason-cell');putCell(tr,t.reason||'—');const reviewCell=document.createElement('td'),planButton=document.createElement('button');planButton.type='button';planButton.className='quiet';planButton.textContent='计划版本';planButton.addEventListener('click',event=>{event.stopPropagation();showPlanHistory(session,t);});reviewCell.append(planButton);const reviewButton=document.createElement('button');reviewButton.type='button';reviewButton.className='quiet';reviewButton.textContent=session?.id===active?.id?'补充复盘':'只读归档';reviewButton.disabled=session?.id!==active?.id;reviewButton.addEventListener('click',event=>{event.stopPropagation();if(session?.id===active?.id)requestPlanSupplement({trade:t,returnFocus:reviewButton});});reviewCell.append(reviewButton);tr.append(reviewCell);body.append(tr);
   }
   table.append(body);wrap.append(table);els['journal-content'].append(wrap);
 }
@@ -646,12 +796,12 @@ function renderJournal(){
   $('position-count').textContent=String(active?.position?1:0);$('order-count').textContent=String((active?.pending?1:0)+(active?.orderHistory?.length||0));
   for(const [id,mode] of [['positions-tab','positions'],['orders-tab','orders'],['current-tab','current'],['history-tab','history']])$(id).classList.toggle('selected',journalMode===mode);
   if(journalMode==='positions'){
-    const p=active?.position;if(!p){const empty=document.createElement('div');empty.className='empty-journal';empty.textContent='当前没有持仓。已提交的限价订单会显示在“订单”中。';els['journal-content'].append(empty);}else{const box=document.createElement('div');box.className='table-wrap';const row=document.createElement('div');row.className='order-row';const text=document.createElement('span');text.textContent=`${active.symbol.replace('USDT','')} ${p.side===1?'买入 / 做多':'卖出 / 做空'} · ${leverageMarginText(p)} · 入场 ${pretty(p.entry)} · 止损 ${protectionText(p.stop)} · 止盈 ${protectionText(p.take)}${Number.isFinite(recordLiquidation(p))?` · 预估强平 ${liquidationText(p)}`:''}`;const close=document.createElement('button');close.textContent='主动平仓';close.addEventListener('click',()=>requestExitReason({returnFocus:close}));row.append(text,close);const reason=document.createElement('p');reason.className='entry-reason-view';reason.textContent=`入场理由：${entryReasonText(p.entryReason)}`;box.append(row,reason);els['journal-content'].append(box);}els.notes.disabled=!active;els.notes.value=active?.notes||'';return;
+    const p=active?.position;if(!p){const empty=document.createElement('div');empty.className='empty-journal';empty.textContent='当前没有持仓。已提交的限价订单会显示在“订单”中。';els['journal-content'].append(empty);}else{const box=document.createElement('div');box.className='table-wrap';const row=document.createElement('div');row.className='order-row';const text=document.createElement('span');text.textContent=`${active.symbol.replace('USDT','')} ${p.side===1?'买入 / 做多':'卖出 / 做空'} · ${leverageMarginText(p)} · 入场 ${pretty(p.entry)} · 止损 ${protectionText(p.stop)} · 止盈 ${protectionText(p.take)}${Number.isFinite(recordLiquidation(p))?` · 预估强平 ${liquidationText(p)}`:''}`;const close=document.createElement('button');close.textContent='主动平仓';close.addEventListener('click',()=>requestExitReason({returnFocus:close}));const supplement=document.createElement('button');supplement.className='quiet';supplement.textContent='追加计划';supplement.addEventListener('click',()=>requestPlanSupplement({returnFocus:supplement}));const versions=document.createElement('button');versions.className='quiet';versions.textContent='计划版本';versions.addEventListener('click',()=>showPlanHistory(active,p));row.append(text,close,supplement,versions);const reason=document.createElement('p');reason.className='entry-reason-view';reason.textContent=`入场理由：${entryReasonText(p.entryReason)}`;box.append(row,reason);els['journal-content'].append(box);}els.notes.disabled=!active;els.notes.value=active?.notes||'';return;
   }
   if(journalMode==='orders'){
     const orders=[...(active?.orderHistory||[])].reverse();if(active?.pending)orders.unshift({...active.pending,status:'pending'});
     if(!orders.length){const empty=document.createElement('div');empty.className='empty-journal';empty.textContent='本轮还没有待成交或已处理订单。';els['journal-content'].append(empty);}
-    else{const list=document.createElement('div');list.className='history-list';for(const order of orders){const row=document.createElement('div');row.className='history-card';const title=document.createElement('strong');title.textContent=`${order.side===1?'买入 / 做多':'卖出 / 做空'} · ${order.type==='limit'?'限价':'市价'} · ${order.status==='pending'?'等待触价':order.status==='filled'?'已成交':'已撤销'}`;const detail=document.createElement('span');detail.textContent=`入场 ${pretty(order.entryPrice)} · 止损 ${protectionText(order.stop)} · 止盈 ${protectionText(order.take)} · ${pretty(order.notional)} U · ${leverageMarginText(order)}${Number.isFinite(recordLiquidation(order))?` · 预估强平 ${liquidationText(order)}`:''}`;const entryReason=document.createElement('span');entryReason.className='entry-reason-view';entryReason.textContent=`入场理由：${entryReasonText(order.entryReason)}`;row.append(title,detail,entryReason);if(order.reason){const outcome=document.createElement('span');outcome.textContent=`处理原因：${order.reason}`;row.append(outcome);}if(order.status==='pending'){const cancel=document.createElement('button');cancel.textContent='撤销';cancel.addEventListener('click',()=>{const before=reviewStateProjection(active);clearModificationDraft();const cancelled=cancelOrder(active,'用户撤单');render();persist({kind:'order-cancelled',before,orderId:cancelled?.id});if(cancelled)toast(`限价单已撤销 · ${active.symbol.replace('USDT','')} ${cancelled.side===1?'做多':'做空'} · ${pretty(cancelled.entryPrice)}`);});row.append(cancel);}list.append(row);}els['journal-content'].append(list);}els.notes.disabled=true;els.notes.value='';return;
+    else{const list=document.createElement('div');list.className='history-list';for(const order of orders){const row=document.createElement('div');row.className='history-card';const title=document.createElement('strong');title.textContent=`${order.side===1?'买入 / 做多':'卖出 / 做空'} · ${order.type==='limit'?'限价':'市价'} · ${order.status==='pending'?'等待触价':order.status==='filled'?'已成交':'已撤销'}`;const detail=document.createElement('span');detail.textContent=`入场 ${pretty(order.entryPrice)} · 止损 ${protectionText(order.stop)} · 止盈 ${protectionText(order.take)} · ${pretty(order.notional)} U · ${leverageMarginText(order)}${Number.isFinite(recordLiquidation(order))?` · 预估强平 ${liquidationText(order)}`:''}`;const entryReason=document.createElement('span');entryReason.className='entry-reason-view';entryReason.textContent=`入场理由：${entryReasonText(order.entryReason)}`;row.append(title,detail,entryReason);if(order.reason){const outcome=document.createElement('span');outcome.textContent=`处理原因：${order.reason}`;row.append(outcome);}if(order.status==='pending'){const cancel=document.createElement('button');cancel.textContent='撤销';cancel.addEventListener('click',()=>{const before=reviewStateProjection(active);clearModificationDraft();const cancelled=cancelOrder(active,'用户撤单',currentData());render();persist({kind:'order-cancelled',before,orderId:cancelled?.id,planId:cancelled?.planId,actor:'user',reason:'用户撤单'});if(cancelled)toast(`限价单已撤销 · ${active.symbol.replace('USDT','')} ${cancelled.side===1?'做多':'做空'} · ${pretty(cancelled.entryPrice)}`);});row.append(cancel);}list.append(row);}els['journal-content'].append(list);}els.notes.disabled=true;els.notes.value='';return;
   }
   if(journalMode==='current'){
     renderTradeTable(active?.trades||[],active?.symbol||'BTCUSDT',active);
@@ -678,6 +828,7 @@ function renderModificationPanel(container=els.position,createIfMissing=true){
   const title=document.createElement('strong');title.textContent='待确认修改';panel.append(title);
   const actual=document.createElement('p');actual.className='modification-values';actual.textContent=`实际：入场 ${pretty(base.entryPrice)} · 止损 ${protectionText(base.stop)} · 止盈 ${protectionText(base.take)}`;
   const next=document.createElement('p');next.className='modification-values preview';next.textContent=`预览：入场 ${pretty(preview.entryPrice??preview.entry)} · 止损 ${protectionText(preview.stop)} · 止盈 ${protectionText(preview.take)}`;panel.append(actual,next);
+  const reasonLabel=document.createElement('label');reasonLabel.className='modification-reason-label';reasonLabel.textContent='修改理由（可选）';const reasonInput=document.createElement('textarea');reasonInput.className='modification-reason';reasonInput.maxLength=2000;reasonInput.rows=2;reasonInput.placeholder='例如：结构变化，调整风险';reasonInput.value=modificationDraft.changeReason||'';reasonInput.addEventListener('input',()=>{modificationDraft.changeReason=reasonInput.value;});reasonLabel.append(reasonInput);panel.append(reasonLabel);
   const actions=document.createElement('div');actions.className='modification-actions';const confirm=document.createElement('button');confirm.type='button';confirm.className='primary';confirm.textContent='确认修改';confirm.disabled=!changed||!!dragState||!modificationIsCurrent(preview);confirm.addEventListener('click',confirmModification);
   const cancel=document.createElement('button');cancel.type='button';cancel.className='quiet';cancel.textContent='取消';cancel.disabled=!!dragState;cancel.addEventListener('click',cancelModification);actions.append(confirm,cancel);panel.append(actions);container.append(panel);
 }
@@ -690,13 +841,19 @@ function confirmModification(){
   const draft=modificationDraft;
   if(!modificationIsCurrent(draft)){clearModificationDraft();render();toast('订单状态已变化，修改预览已取消');return;}
   if(!modificationChanged(draft)){cancelModification();return;}
-  const target=managedTarget(),base=draft._edit.base,changes=modifiedParts(base,draft),side=draft.side,kind=draft._edit.kind;
+  const target=managedTarget(),base=draft._edit.base,changes=modifiedParts(base,draft),side=draft.side,kind=draft._edit.kind,rawChangeReason=typeof draft.changeReason==='string'&&draft.changeReason.trim()?draft.changeReason:null;
   try{
-    const before=reviewStateProjection(active),orderId=target?.order?.id||target?.order?.orderId||null;
+    const before=reviewStateProjection(active),orderId=target?.order?.id||target?.order?.orderId||null,tradeId=target?.order?.tradeId||null,planId=target?.order?.planId||null;
+    const beforeValues={entryPrice:target.order.entryPrice??target.order.entry,stop:target.order.stop??null,take:target.order.take??null,notional:target.order.notional??null,leverage:target.order.leverage??null,margin:target.order.margin??null};
+    const riskCount=Array.isArray(active.riskChanges)?active.riskChanges.length:0,metadata={planId,reason:rawChangeReason,rawReason:rawChangeReason,modelConfigId:reviewModelConfigId(active)};
     let result=null;
-    if(kind==='pending')result=updatePendingOrder(active,currentData(),draft.entryPrice??draft.entry,draft.stop,draft.take);
-    else updateProtection(active,currentData(),draft.stop,draft.take);
-    clearModificationDraft();chart.priceScale('right').applyOptions({autoScale:true});render();persist({kind:kind==='pending'?'order-modified':'protection-changed',before,orderId,capture:true,after:{...reviewStateProjection(active),modification:{changes,result:clone(result||null)}}});
+    if(kind==='pending')result=updatePendingOrder(active,currentData(),draft.entryPrice??draft.entry,draft.stop,draft.take,metadata);
+    else result=updateProtection(active,currentData(),draft.stop,draft.take,metadata);
+    const updatedTarget=managedTarget()?.order||result?.order||active.position||null;
+    const afterValues={entryPrice:updatedTarget?.entryPrice??updatedTarget?.entry,stop:updatedTarget?.stop??null,take:updatedTarget?.take??null,notional:updatedTarget?.notional??null,leverage:updatedTarget?.leverage??null,margin:updatedTarget?.margin??null};
+    const mod=modificationEvidence({before:beforeValues,after:afterValues,reason:rawChangeReason,replayMarketTime:replayClock(),visibleThrough:replayClock(),riskChanges:Array.isArray(active.riskChanges)?active.riskChanges.slice(riskCount):[]});
+    const modification={...mod,changes,result:clone(result||null)};
+    clearModificationDraft();chart.priceScale('right').applyOptions({autoScale:true});render();persist({kind:kind==='pending'?'order-modified':'protection-changed',before,orderId,tradeId,planId,snapshotId:reviewId('snapshot'),actor:'user',timingClass:active.position?'position':'pre-trade',reason:rawChangeReason,modification,capture:true,after:{...reviewStateProjection(active),modification}});
     const coin=active.symbol.replace('USDT',''),direction=side===1?'做多':'做空';
     if(result?.status==='filled')toast(`限价改单成交 · ${coin} ${direction} · ${pretty(result.position?.entry??result.order?.fillPrice)}`);
     else if(kind==='pending')toast(`限价单已修改 · ${coin} ${direction} · ${pretty(result?.order?.entryPrice??draft.entryPrice)} · ${changes.join('，')||'订单参数'}`);
@@ -715,7 +872,7 @@ function renderPosition(){
     const pendingRows=[['杠杆 / 保证金',leverageMarginText(pending)],['限价',pretty(pending.entryPrice)],['开仓手续费',`${pretty(pending.notional*FEE)} U`],['止损价',protectionText(pending.stop)],['止盈价',protectionText(pending.take)]];if(Number.isFinite(recordLiquidation(pending)))pendingRows.push(['预估强平价',liquidationText(pending)]);
     const dl=document.createElement('dl');for(const [label,value] of pendingRows){const dt=document.createElement('dt');dt.textContent=label;const dd=document.createElement('dd');dd.textContent=value;dl.append(dt,dd);}const entryReason=document.createElement('p');entryReason.className='entry-reason-view';entryReason.textContent=`入场理由：${entryReasonText(pending.entryReason)}`;
     const locate=document.createElement('button');locate.className='cancel-pending';locate.textContent='定位订单线';locate.addEventListener('click',locatePlanPrices);
-    const cancel=document.createElement('button');cancel.className='cancel-pending';cancel.textContent='撤销限价单';cancel.addEventListener('click',()=>{const before=reviewStateProjection(active);clearModificationDraft();const cancelled=cancelOrder(active,'用户撤单');chart.priceScale('right').applyOptions({autoScale:true});render();persist({kind:'order-cancelled',before,orderId:cancelled?.id});toast('限价单已撤销');});els.position.append(top,dl,entryReason,locate,cancel);renderModificationPanel(els.position);return;
+    const cancel=document.createElement('button');cancel.className='cancel-pending';cancel.textContent='撤销限价单';cancel.addEventListener('click',()=>{const before=reviewStateProjection(active);clearModificationDraft();const cancelled=cancelOrder(active,'用户撤单',currentData());chart.priceScale('right').applyOptions({autoScale:true});render();persist({kind:'order-cancelled',before,orderId:cancelled?.id,planId:cancelled?.planId,actor:'user',reason:'用户撤单'});toast('限价单已撤销');});els.position.append(top,dl,entryReason,locate,cancel);renderModificationPanel(els.position);return;
   }
   els.position.className='position-live';els['position-badge'].textContent=p.side===1?'做多持仓':'做空持仓';els['position-badge'].className=p.side===1?'positive':'negative';
   const top=document.createElement('div');top.className='pos-top';const side=document.createElement('span');side.textContent=`${active.symbol.replace('USDT','')} ${p.side===1?'买入 / 做多':'卖出 / 做空'}`;const amount=document.createElement('span');amount.textContent=`${pretty(p.notional)} U 名义`;top.append(side,amount);
@@ -734,7 +891,7 @@ function render(resetRange=false,updateChart=true){
   document.querySelectorAll('[data-tf]').forEach(button=>button.classList.toggle('active',Number(button.dataset.tf)===active.tf));
   active.volume=active.volume!==false;els.blind.checked=!!active.blind;els.ma.checked=!!active.ma;els.ma10.checked=!!active.ma10;els.volume.checked=active.volume;
   syncReplayProgress(data);
-  const hasOrder=!!active.position||!!active.pending,ended=replayIsEnded(active,data),reasonOpen=!!pendingOrderRequest;els.play.disabled=ended||reasonOpen||fastForwarding||minuteActionPending&&!isPlaying;els['step-minute'].disabled=ended||reasonOpen||minuteActionPending||fastForwarding;els.step.disabled=ended||reasonOpen||minuteActionPending||fastForwarding;els['cancel-advance'].hidden=!fastForwarding;els['retry-minute'].hidden=!minuteRetryAction;els.long.disabled=ended||hasOrder||reasonOpen;els.short.disabled=ended||hasOrder||reasonOpen;els['size-range'].disabled=hasOrder||reasonOpen;els['leverage-range'].disabled=hasOrder||reasonOpen;syncDirectionSelection();
+  const hasOrder=!!active.position||!!active.pending,ended=replayIsEnded(active,data),reasonOpen=!!pendingOrderRequest,reasonLocked=reasonBlocksReplay();els.play.disabled=ended||reasonLocked||fastForwarding||minuteActionPending&&!isPlaying;els['step-minute'].disabled=ended||reasonLocked||minuteActionPending||fastForwarding;els.step.disabled=ended||reasonLocked||minuteActionPending||fastForwarding;els['cancel-advance'].hidden=!fastForwarding;els['retry-minute'].hidden=!minuteRetryAction;els.long.disabled=ended||hasOrder||reasonOpen;els.short.disabled=ended||hasOrder||reasonOpen;els['size-range'].disabled=hasOrder||reasonOpen;els['leverage-range'].disabled=hasOrder||reasonOpen;syncDirectionSelection();
   els.play.textContent=isPlaying?'Ⅱ':'▶';els.play.setAttribute('aria-label',isPlaying?'暂停回放':'自动播放');els['replay-status'].textContent=ended?'本轮结束':fastForwarding?'快进中':active.position?'持仓中':active.pending?'限价待成交':'盲回放';
   els['new-session'].disabled=reasonOpen;els.symbol.disabled=reasonOpen;els['order-hint'].textContent=modificationDraft?'图上线位修改仅为预览；在右侧确认修改后生效，取消可恢复':active.position?'持仓期间不能重复下单':active.pending?'限价单等待后续行情满足价格条件':'市价立即成交；限价按指定价或更优成交，否则挂起等待';
   const sizePct=Number.isFinite(active.sizePercent)?active.sizePercent:10;els['size-range'].value=String(sizePct);syncSize(sizePct,false);syncLeverage(false);
@@ -752,7 +909,7 @@ function syncReplayProgress(data=currentData()){
 }
 function syncPlaybackControls(){
   if(!active)return;
-  const ended=replayIsEnded(),locked=!!pendingOrderRequest||transitionPending;
+  const ended=replayIsEnded(),locked=reasonBlocksReplay()||transitionPending;
   els.play.disabled=ended||locked||fastForwarding||minuteActionPending&&!isPlaying;
   els['step-minute'].disabled=ended||locked||minuteActionPending||fastForwarding;
   els.step.disabled=ended||locked||minuteActionPending||fastForwarding;
@@ -773,31 +930,44 @@ function minuteResultMessage(result,session=active){
   return messages;
 }
 async function advanceOneMinuteCore(generation,{draw=true,announce=true}={}){
-  if(minuteActionPending||!active||pendingOrderRequest||transitionPending||replayIsEnded())return null;
+  if(minuteActionPending||!active||reasonBlocksReplay()||transitionPending||replayIsEnded())return null;
   const session=active,data=currentData(),beforeTime=replayClock(session,data),beforeCursor=session.cursor,wasFastForwarding=fastForwarding;
   if(!Number.isFinite(beforeTime))return null;
   const requestId=++minuteRequestId;minuteActionPending=true;minuteRetryAction=null;
   els['progress-text'].textContent='正在读取下一根真实分钟行情…';syncPlaybackControls();
   try{
     const candle=await nextMinute(session.symbol,beforeTime-60);
-    if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session||session.cursor!==beforeCursor||replayClock(session,data)!==beforeTime||pendingOrderRequest)return null;
+    if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session||session.cursor!==beforeCursor||replayClock(session,data)!==beforeTime||reasonBlocksReplay())return null;
     const stateBefore=reviewStateProjection(session);
     const result=advanceMinute(session,candle,data);
     void reviewRecorder.appendMinute(session,candle).catch(error=>setReviewStatus(`分钟过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
     syncDraftsAfterMinute();
     const messages=minuteResultMessage(result,session),stop=!!result.ended;
     if(stop)invalidateMinuteWork();
-    const semantic=[];
-    if(result.orderFilled)semantic.push(['order-filled',{orderFilled:clone(result.orderFilled),orderId:result.orderFilled.id}]);
-    if(result.orderCancelled)semantic.push(['order-cancelled',{orderCancelled:clone(result.orderCancelled),orderId:result.orderCancelled.id}]);
-    if(result.trade)semantic.push(['position-auto-closed',{trade:clone(result.trade),tradeId:result.trade.id||result.trade.orderId,orderId:result.trade.orderId}]);
+    const semantic=[],stages=Array.isArray(result.executionEvents)?result.executionEvents:[];
+    if(!stages.length&&result.orderFilled)semantic.push(['order-filled',{orderFilled:clone(result.orderFilled),orderId:result.orderFilled.id}]);
+    if(result.orderCancelled&&!stages.some(item=>item.kind==='order-cancelled'))semantic.push(['order-cancelled',{orderCancelled:clone(result.orderCancelled),orderId:result.orderCancelled.id}]);
+    if(!stages.length&&result.trade)semantic.push(['position-auto-closed',{trade:clone(result.trade),tradeId:result.trade.id||result.trade.orderId,orderId:result.trade.orderId}]);
     if(result.ended)semantic.push(['round-ended',{ended:true}]);
-    if(draw||stop||semantic.length){render();if(draw||stop)persist({audit:false});else persist({audit:false});}
+    if(draw||stop||semantic.length||stages.length){render();persist({audit:false});}
     else syncReplayProgress(data);
     let eventBefore=stateBefore;
+    const progressedState=reviewStateProjection(session);
+    for(const stage of stages){
+      // A minute is one atomic market disclosure. Execution stages happen
+      // against its close, so use the post-advance clock while retaining only
+      // the engine's stage-specific position/order/trade and account fields.
+      // Never spread the final session projection here: a fill followed by an
+      // exit in the same minute must not make the fill snapshot look closed.
+      const snapshots=executionStageSnapshots(stateBefore,progressedState,stage);
+      const stageBefore=snapshots.before,stageAfter={...snapshots.after,event:{executionEvent:clone(stage)}};
+      const eventSnapshotId=reviewId('snapshot'),stagePlanId=stage.position?.planId||stage.after?.position?.planId||stage.before?.position?.planId||null;
+      recordReviewEvent(stage.kind,{session,before:stageBefore,after:stageAfter,orderId:stage.orderId,tradeId:stage.tradeId,planId:stagePlanId,snapshotId:eventSnapshotId,actor:'engine',recordedAt:stage.recordedAt,reason:stage.reason,references:{executionStage:stage.seq,fillId:stage.fillId||null,positionId:stage.positionId||null,marketTime:stage.marketTime??stage.replayMarketTime??null},view:{...reviewView(session),visibleThrough:stage.visibleThrough??stage.replayMarketTime??reviewView(session).visibleThrough,marketTime:stage.marketTime??stage.replayMarketTime??null,executionStage:stage.seq,minuteFinalCanvas:true,fastForwarding:wasFastForwarding,intrabarActualUnknown:stage.intrabarActualUnknown!==false},captureType:'same-minute-final-chart-with-engine-stage-overlay',screenshot:keyReviewKind(stage.kind)});
+      eventBefore=stageAfter;
+    }
     for(const [kind,detail] of semantic){
       const stateAfter=reviewStateProjection(session);
-      recordReviewEvent(kind,{session,before:eventBefore,after:{...stateAfter,event:detail},orderId:detail.orderId,tradeId:detail.tradeId,screenshot:keyReviewKind(kind),view:{...reviewView(session),fastForwarding:wasFastForwarding}});
+      recordReviewEvent(kind,{session,before:eventBefore,after:{...stateAfter,event:detail},orderId:detail.orderId,tradeId:detail.tradeId,planId:detail.orderFilled?.planId||detail.orderCancelled?.planId||detail.trade?.planId||null,snapshotId:reviewId('snapshot'),actor:kind==='round-ended'?'engine':'engine',reason:detail.trade?.reason||detail.orderCancelled?.reason, screenshot:keyReviewKind(kind),view:{...reviewView(session),fastForwarding:wasFastForwarding}});
       eventBefore=stateAfter;
     }
     if(!semantic.length&&(draw||stop))void reviewRecorder.observe(session,{view:reviewView(session)}).catch(error=>setReviewStatus(`过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
@@ -816,20 +986,20 @@ async function advanceOneMinuteCore(generation,{draw=true,announce=true}={}){
 function keyReviewKind(kind){return /^(order-|position-|protection-|drawing-)/.test(kind);}
 async function runAutomaticMinute(generation){
   const result=await advanceOneMinuteCore(generation,{draw:true});
-  if(result?.failed||result?.stop||generation!==minuteGeneration||!isPlaying||pendingOrderRequest)return;
+  if(result?.failed||result?.stop||generation!==minuteGeneration||!isPlaying||reasonBlocksReplay())return;
   playTimer=setTimeout(()=>runAutomaticMinute(generation),Number(els.speed.value));
 }
 function advanceOneMinute(){
-  if(minuteActionPending||fastForwarding||pendingOrderRequest||transitionPending||!active)return;
+  if(minuteActionPending||fastForwarding||reasonBlocksReplay()||transitionPending||!active)return;
   minuteRetryAction=null;return advanceOneMinuteCore(minuteGeneration,{draw:true,action:'minute'});
 }
 async function advanceToTfBoundary(){
-  if(minuteActionPending||fastForwarding||pendingOrderRequest||transitionPending||!active||replayIsEnded())return;
+  if(minuteActionPending||fastForwarding||reasonBlocksReplay()||transitionPending||!active||replayIsEnded())return;
   const generation=minuteGeneration,session=active,startTime=replayClock(),target=intervalStart(startTime,active.tf)+active.tf;
   fastForwarding=true;minuteRetryAction=null;syncPlaybackControls();
   let steps=0,failed=false;const eventMessages=[];
   try{
-    while(generation===minuteGeneration&&active===session&&!pendingOrderRequest&&!transitionPending&&!replayIsEnded()){
+    while(generation===minuteGeneration&&active===session&&!reasonBlocksReplay()&&!transitionPending&&!replayIsEnded()){
       if(replayClock()>=target)break;
       const result=await advanceOneMinuteCore(generation,{draw:false,announce:false});
       if(!result||result.failed||result.stop){failed=!!result?.failed;eventMessages.push(...(result?.messages||[]));break;}
@@ -853,7 +1023,7 @@ function togglePlay(){
 }
 function archiveActive(){
   if(!active)return;
-  if(active.pending)cancelOrder(active,'新一轮开始，未成交挂单撤销');
+  if(active.pending){const before=reviewStateProjection(active),cancelled=cancelOrder(active,'新一轮开始，未成交挂单撤销',currentData());recordReviewEvent('order-cancelled',{before,after:{...reviewStateProjection(active),cancelled:clone(cancelled)},orderId:cancelled?.id,planId:cancelled?.planId,actor:'user',reason:'新一轮开始，未成交挂单撤销'});}
   if(active.position)throw new Error('请先填写平仓理由并完成主动平仓');
   recordReviewEvent('round-archived',{session:active,before:reviewStateProjection(active),after:{...reviewStateProjection(active),archived:true}});
   let result=null;try{if(!invalidSavedActive)result=metrics(active,currentData());}catch{}
@@ -870,7 +1040,7 @@ async function startRound(symbol=active?.symbol||els.symbol.value){
     pause();
     const data=await loadSymbol(symbol);
     const candidate=createSession(symbol,data);
-    clearModificationDraft();archiveActive();candidate.startTime=data[candidate.start][0]+BASE;candidate.sizePercent=10;candidate.leverage=1;candidate.speed=Number(els.speed.value)||1500;candidate.ma10=false;candidate.volume=true;candidate.simulationModel={id:'isolated-v1',marketProduct:'spot',executionModel:'custom-isolated-leverage',feeRate:FEE,slippageRate:SLIP,maintenanceMarginRate:MAINTENANCE_MARGIN_RATE,sizeBudgetSemantics:'balance*percent/100 reserved for margin+entry fee; notional=floor2(budget/(1/leverage+feeRate)); not loss budget',recordedAt:new Date().toISOString()};candidate.modelEvidence={applicableToSession:true,...clone(candidate.simulationModel)};active=candidate;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType='market';pendingSymbol=null;journalMode='positions';selectedHistoryId=null;els.symbol.value=symbol;hideLoading();render(true);persist({kind:'session-created'});return true;
+    clearModificationDraft();archiveActive();candidate.startTime=data[candidate.start][0]+BASE;candidate.sizePercent=10;candidate.leverage=1;candidate.speed=Number(els.speed.value)||1500;candidate.ma10=false;candidate.volume=true;candidate.reviewPlans??=[];active=candidate;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType='market';pendingSymbol=null;journalMode='positions';selectedHistoryId=null;els.symbol.value=symbol;hideLoading();render(true);persist({kind:'session-created'});return true;
   }catch(error){
     toast(`新一轮暂未开始：${error.message}。现有练习和往期记录已保留。`);els.symbol.value=active?.symbol||'BTCUSDT';if(invalidSavedActive)showSavedRecordRecovery(error.message);else{hideLoading();if(active)render();}return false;
   }finally{transitionPending=false;els.symbol.disabled=false;if(active&&!invalidSavedActive)els['new-session'].disabled=false;else if(!active)els['new-session'].disabled=false;drawingTools?.refresh();syncDrawingControls();if(resumeAfterTransition&&active&&!replayIsEnded()&&!invalidSavedActive&&!isPlaying)togglePlayWithAudit();syncPlaybackControls();}
@@ -879,6 +1049,36 @@ function maybeStart(symbol){if(pendingOrderRequest)return;pendingSymbol=symbol;i
 function downloadExport(){
   const payload={version:1,source:{marketData:'Binance 现货公开档案',symbols:['BTCUSDT','ETHUSDT'],interval:BASE,replayInterval:60,replayMode:'真实1分钟OHLC逐步回放；所选周期K线由已披露行情聚合',simulation:'本地练习记录，不代表真实成交',leverageModel:'1x–100x逐仓模拟；新订单记录含leverage、margin、marginMode、liquidationPrice；旧记录缺失时按1x显示且不追溯估算强平价',maintenanceMarginRate:0.005},exportedAt:new Date().toISOString(),current:active?clone(active):null,history:clone(history)};
   const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`K线回放_记录_${new Date().toISOString().slice(0,10)}.json`;document.body.append(a);a.click();a.remove();URL.revokeObjectURL(url);toast('练习记录 JSON 已导出');
+}
+function importedSessionMetrics(session){
+  const trades=Array.isArray(session?.trades)?session.trades:[],pnl=trades.reduce((sum,trade)=>sum+(Number.isFinite(trade?.pnl)?trade.pnl:0),0);
+  return {pnl,trades:trades.length,wins:trades.filter(trade=>trade.pnl>0).length,losses:trades.filter(trade=>trade.pnl<0).length,imported:true};
+}
+function importedHistorySession(session,replayFrom=null){
+  const copy=clone(session);for(const key of ['ledger','fills','accountSnapshots','riskChanges','minuteRows','contextCandles','marketData'])delete copy[key];
+  const displayReplayFrom=Number.isFinite(replayFrom)?replayFrom:(Number.isFinite(copy.startTime)?copy.startTime:null);if(Number.isFinite(displayReplayFrom))copy.displayReplayFrom=displayReplayFrom;return copy;
+}
+async function importReviewFile(file){
+  if(!file||reviewImporting)return;
+  reviewImporting=true;els['review-import'].disabled=true;setReviewStatus('正在校验复盘文件…');
+  try{
+    const parsed=await parseReviewImport(file),results=[];
+    for(const archive of parsed.archives||[]){
+      archive.executionDisabled=true;
+      const contentHash=archive.contentHash||parsed.contentHash||null;
+      const result=await reviewRecorder.importSessionArchive(archive,{contentHash});results.push(result);
+      if(result.status==='imported'||result.status==='duplicate'){
+        const id=String(archive.session.id);
+        if(!history.some(item=>String(item.id)===id))history.push({id,session:{...importedHistorySession(archive.session,archive.coverage?.replayFrom),importedArchive:true},metrics:importedSessionMetrics(archive.session),archivedAt:new Date().toISOString(),imported:true,importContentHash:contentHash});
+      }
+    }
+    persist({audit:false});renderJournal();
+    const imported=results.filter(item=>item.status==='imported').length,duplicates=results.filter(item=>item.status==='duplicate').length,conflicts=results.filter(item=>item.status==='conflict').length;
+    const summary=`导入 ${imported} 轮，已存在 ${duplicates} 轮，冲突 ${conflicts} 轮。导入内容仅作为往期资料，不会恢复或推进行情。`;
+    setReviewStatus(parsed.issues?.length?`${summary} ${parsed.issues.join('；')}`:summary,!!parsed.issues?.length||!!conflicts);
+    toast(conflicts?`导入完成，${conflicts} 轮ID冲突未覆盖现有资料`:`已导入 ${imported} 轮复盘资料`);
+  }catch(error){setReviewStatus(`导入未完成：${error?.message||'文件校验失败'}；现有练习未覆盖。`,true);toast('复盘资料导入失败，请查看页面提示');}
+  finally{reviewImporting=false;els['review-import'].disabled=false;els['review-import-file'].value='';}
 }
 async function downloadReviewPackage(){
   if(reviewExporting)return;
@@ -954,6 +1154,13 @@ function wireEvents(){
     els['entry-reason'].removeAttribute('aria-invalid');els['entry-reason-error'].textContent='';
     els['reason-confirm'].disabled=reasonSubmitting||!value.trim();
   });
+  els['thesis-choice'].addEventListener('change',()=>{els['thesis-label-wrap'].hidden=els['thesis-choice'].value!=='__new__';});
+  els['observation-status'].addEventListener('change',()=>{if(pendingOrderRequest?.mode==='observation')pendingOrderRequest.status=els['observation-status'].value;});
+  els['observation-open'].addEventListener('click',()=>openObservation('judgement'));
+  els['loss-budget'].addEventListener('input',()=>{
+    els['loss-budget-status'].textContent='';
+    if(pendingOrderRequest?.mode==='entry'&&uiPlan&&active){const raw=els['loss-budget'].value.trim();uiPlan.lossBudget=raw===''?null:Number(raw);active.draftPlan=clone(uiPlan);persist({audit:false});}
+  });
   els['reason-confirm'].addEventListener('click',submitOrderReason);
   els['reason-cancel'].addEventListener('click',()=>closeOrderReason(true));
   els['reason-close'].addEventListener('click',()=>closeOrderReason(true));
@@ -964,8 +1171,10 @@ function wireEvents(){
   window.addEventListener('resize',()=>{if(pendingOrderRequest)applyReasonWindowPosition(reasonWindowPosition?.x??window.innerWidth-450,reasonWindowPosition?.y??20,true);});
   els.export.addEventListener('click',downloadExport);els.rules.addEventListener('click',()=>els['info-dialog'].showModal());els['source-details'].addEventListener('click',()=>{$('info-dialog').showModal();$('info-dialog').querySelector('details').open=true;});
   els['review-export'].addEventListener('click',downloadReviewPackage);
+  els['review-import'].addEventListener('click',()=>els['review-import-file'].click());
+  els['review-import-file'].addEventListener('change',()=>void importReviewFile(els['review-import-file'].files?.[0]));
   document.addEventListener('keydown',e=>{
-    if(pendingOrderRequest){if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closeOrderReason(true);}return;}
+    if(pendingOrderRequest){if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closeOrderReason(true);}if(reasonBlocksReplay())return;}
     if(e.target.matches('input,textarea,select')||$('info-dialog').open||$('new-dialog').open)return;
     if(fastForwarding){if(e.key==='Escape'){e.preventDefault();pause();}return;}
     if(e.code==='Space'){e.preventDefault();togglePlayWithAudit();}else if(e.key.toLowerCase()==='n'){e.preventDefault();void manualStep('step-minute');}else if(e.key==='ArrowRight'){e.preventDefault();void manualStep('step-boundary');}
@@ -974,11 +1183,11 @@ function wireEvents(){
 async function boot(){
   readSaved();initChart();wireEvents();
   if(active){
-    try{const data=await loadSymbol(active.symbol);if(!validateSession(active,active.symbol,data))throw new Error('保存的练习状态校验失败，记录已保留');invalidSavedActive=false;if(!active.startTime)active.startTime=data[active.start][0]+BASE;active.ma10=active.ma10===true;active.volume=active.volume!==false;active.speed=Number.isFinite(active.speed)?active.speed:1500;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType=active.selectedOrderType||'market';if(active.draftPlan){uiPlan=clone(active.draftPlan);selectedOrderType=uiPlan.orderType||selectedOrderType;els['plan-actions'].hidden=false;}hideLoading();render(true);persist();return;}
+    try{const data=await loadSymbol(active.symbol);if(!validateSession(active,active.symbol,data))throw new Error('保存的练习状态校验失败，记录已保留');invalidSavedActive=false;if((!Array.isArray(active.modelConfigs)||!active.modelConfigs.length)&&ensureEvidenceBaseline(active,data))persist({audit:false});active.reviewPlans??=[];await ensureLegacyEvidenceBaselines();if(!active.startTime)active.startTime=data[active.start][0]+BASE;active.ma10=active.ma10===true;active.volume=active.volume!==false;active.speed=Number.isFinite(active.speed)?active.speed:1500;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType=active.selectedOrderType||'market';if(active.draftPlan){uiPlan=clone(active.draftPlan);selectedOrderType=uiPlan.orderType||selectedOrderType;els['plan-actions'].hidden=false;}hideLoading();render(true);persist({audit:false});return;}
     catch(error){invalidSavedActive=true;showSavedRecordRecovery(error.message);return;}
   }
   const symbol=active?.symbol||'BTCUSDT';
-  try{await loadSymbol(symbol);await startRound(symbol);}
+  try{await loadSymbol(symbol);await ensureLegacyEvidenceBaselines();await startRound(symbol);}
   catch(error){setLoading(`${error.message}。检查网络或数据文件后重试。`,true);els['new-session'].disabled=false;}
 }
 async function retryRecovery(){

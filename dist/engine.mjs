@@ -6,6 +6,7 @@ export const DEFAULT_LEVERAGE = 1;
 export const MAX_LEVERAGE = 100;
 export const MAINTENANCE_MARGIN_RATE = 0.005;
 export const ISOLATED_MARGIN_MODE = 'isolated-v1';
+export const ENGINE_VERSION = 'paper-engine-v2.0.0';
 export const WARMUP = 365 * 24 * 60 * 60;
 export const LENGTH = 180 * 24 * 60 * 60;
 export const CONTEXT = WARMUP;
@@ -197,11 +198,167 @@ function optionalSavedExitReason(value) {
   return value === undefined || (typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 2000);
 }
 
+function optionalAttemptNumber(value) {
+  return value === undefined || value === null || (Number.isInteger(value) && value >= 1);
+}
+
+function initialRiskValid(record) {
+  if (record.initialStop === undefined && record.initialRiskR0 === undefined) return true;
+  if (!optionalPrice(record.initialStop) || !(record.initialRiskR0 === null || (Number.isFinite(record.initialRiskR0) && record.initialRiskR0 > 0))) return false;
+  const stop = record.initialStop;
+  if (stop === null) return record.initialRiskR0 === null;
+  if (![1, -1].includes(record.side) || !Number.isFinite(record.entry) || !Number.isFinite(record.qty) || record.qty <= 0) return false;
+  const correctlyBracketed = record.side === 1 ? stop < record.entry : stop > record.entry;
+  if (!correctlyBracketed) return record.initialRiskR0 === null;
+  return near(record.initialRiskR0, record.qty * Math.abs(record.entry - stop));
+}
+
 function normalizeExitReason(value) {
   if (typeof value !== 'string') throw new Error('平仓理由必须是非空文本，最多2000字');
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > 2000) throw new Error('平仓理由必须是非空文本，最多2000字');
   return trimmed;
+}
+
+function normalizeMetadata(value = {}) {
+  if (value === undefined || value === null) value = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('交易证据metadata无效');
+  const out = {};
+  for (const key of ['planId', 'thesisId', 'parentTradeId', 'strategyVersion', 'observationId']) {
+    const v = value[key];
+    if (v !== undefined && v !== null && (typeof v !== 'string' || v.trim().length > 200)) throw new Error(`${key}必须是有效文本`);
+    out[key] = typeof v === 'string' && v.trim() ? v.trim() : null;
+  }
+  const lossBudget = value.lossBudget;
+  if (lossBudget !== undefined && lossBudget !== null && (!Number.isFinite(lossBudget) || lossBudget < 0)) throw new Error('亏损预算必须为非负金额或null');
+  out.lossBudget = lossBudget ?? null;
+  const attemptNumber = value.attemptNumber;
+  if (attemptNumber !== undefined && attemptNumber !== null && (!Number.isInteger(attemptNumber) || attemptNumber < 1)) throw new Error('attemptNumber必须是正整数或null');
+  out.attemptNumber = attemptNumber ?? null;
+  const reason = value.changeReason ?? value.reason;
+  if (reason !== undefined && reason !== null && (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 2000)) throw new Error('风险修改理由必须是非空文本且不超过2000字');
+  out.changeReason = typeof reason === 'string' ? reason.trim() : null;
+  if (value.rawReason !== undefined && value.rawReason !== null && (typeof value.rawReason !== 'string' || value.rawReason.length > 2000)) throw new Error('原始理由无效');
+  out.rawReason = typeof value.rawReason === 'string' ? value.rawReason : null;
+  return out;
+}
+
+function simulationModel(modelConfigId, effectiveFrom, baselineOnly = false) {
+  return {modelConfigId, engineVersion: ENGINE_VERSION, productType: 'spot-market-data',
+    executionModel: 'local-isolated-paper-simulator',
+    fee: {openRate: FEE, closeRate: FEE, basis: 'executedNotional', rounding: 'native-float-no-explicit-rounding'},
+    slippage: {rate: SLIP, rule: 'adverse-proportional-on-entry-and-exit'},
+    entry: {market: 'current-disclosed-close', limit: 'marketable-immediate-otherwise-touch'},
+    stopTake: {touchResolution: '1m-OHLC', sameBarStopAndTake: 'stop-first', entryBarStop: 'checked-on-entry-minute', entryBarTake: 'defer-until-next-minute', gapExecution: 'observed-open-price'},
+    intrabar: {resolution: '1m-OHLC', bothStopTake: 'stop-first', entryBarTake: 'defer-until-next-bar', gap: 'open-price'},
+    margin: {mode: ISOLATED_MARGIN_MODE, maintenanceRate: MAINTENANCE_MARGIN_RATE,
+      liquidation: 'estimated-trigger-price-includes-close-fee; execution-uses-disclosed-open-or-threshold'},
+    isolatedLossCap: 'settlement-adjustment-limits-wallet-loss-to-position-margin',
+    markToMarket: 'estimated-close-after-adverse-slip-and-close-fee',
+    rounding: {money: 'none-explicit'}, funding: 'not-simulated', borrow: 'not-simulated',
+    randomness: 'session-range-random-sampling-only-no-trading-randomness', effectiveFrom, baselineOnly};
+}
+
+function currentAccountValues(session, data) {
+  const p = session.position;
+  const mark = replayPrice(session, data) ?? session.accountSnapshots?.at(-1)?.currentPrice ?? null;
+  const exit = p && Number.isFinite(mark) ? mark * (1 - p.side * SLIP) : mark;
+  const unreal = p && Number.isFinite(exit) ? (exit - p.entry) * p.qty * p.side - exit * p.qty * FEE : 0;
+  const usedMargin = p ? (p.marginMode === ISOLATED_MARGIN_MODE ? p.margin : p.notional) : 0;
+  const reservedMargin = session.pending ? (session.pending.marginMode === ISOLATED_MARGIN_MODE
+    ? session.pending.margin + session.pending.notional * FEE : session.pending.notional * (1 + FEE)) : 0;
+  return {equity: session.balance + unreal, availableBalance: session.balance - usedMargin - reservedMargin,
+    usedMargin, reservedMargin, price: mark};
+}
+
+function appendAccountSnapshot(session, data, type = 'account-state') {
+  if (!Array.isArray(session.accountSnapshots)) session.accountSnapshots = [];
+  const values = currentAccountValues(session, data), at = replayTime(session, data) ?? session.accountSnapshots?.at(-1)?.replayMarketTime ?? null;
+  const snapshot = {id: crypto.randomUUID(), seq: session.accountSnapshots.length + 1, type,
+    recordedAt: new Date().toISOString(), replayMarketTime: at, visibleThrough: at,
+    engineVersion: session.activeEngineVersion ?? session.engineVersion ?? null,
+    modelConfigId: session.modelConfigId ?? null,
+    cursor: Array.isArray(data) ? visibleUpperIndex(session, data) : (session.forming15m ? session.cursor + 1 : session.cursor), minuteCursorTime: session.minuteCursorTime ?? null,
+    currentPrice: values.price, balance: session.balance, equity: values.equity,
+    availableBalance: values.availableBalance, usedMargin: values.usedMargin, reservedMargin: values.reservedMargin,
+    positionId: session.position?.positionId ?? null, pendingOrderId: session.pending?.id ?? null,
+    valuation: 'net-close-estimate'};
+  session.accountSnapshots.push(snapshot);
+  return snapshot;
+}
+
+function appendLedger(session, data, type, fields = {}) {
+  if (!Array.isArray(session.ledger)) session.ledger = [];
+  const values = currentAccountValues(session, data), at = replayTime(session, data) ?? session.accountSnapshots?.at(-1)?.replayMarketTime ?? null;
+  const previous = session.ledger.at(-1);
+  const item = {id: crypto.randomUUID(), seq: session.ledger.length + 1, type,
+    recordedAt: new Date().toISOString(), replayMarketTime: at, visibleThrough: at,
+    engineVersion: session.activeEngineVersion ?? session.engineVersion ?? null,
+    cashDelta: 0, balanceAfter: session.balance, equityAfter: values.equity,
+    usedMarginAfter: values.usedMargin, reservedMarginAfter: values.reservedMargin,
+    marginDelta: 0, reservedMarginDelta: 0, grossPnl: 0, fee: 0, isolatedAdjustment: 0,
+    ...(previous ? {} : {baselineBalance: session.balance - (Number.isFinite(fields.cashDelta) ? fields.cashDelta : 0)}), modelConfigId: session.modelConfigId ?? null,
+    ...fields};
+  session.ledger.push(item);
+  return item;
+}
+
+function recordRiskChange(session, data, objectType, object, before, after, metadata = {}) {
+  if (!Array.isArray(session.riskChanges)) session.riskChanges = [];
+  const at = replayTime(session, data);
+  const change = {id: crypto.randomUUID(), seq: session.riskChanges.length + 1,
+    recordedAt: new Date().toISOString(), replayMarketTime: at, visibleThrough: at,
+    objectType, orderId: object?.id ?? object?.orderId ?? null, positionId: object?.positionId ?? null,
+    planId: object?.planId ?? null, before, after, initialRiskR0: object?.initialRiskR0 ?? null,
+    reason: metadata.changeReason ?? null, rawReason: metadata.rawReason ?? null,
+    thesisId: object?.thesisId ?? null, attemptNumber: metadata.attemptNumber ?? object?.attemptNumber ?? null,
+    modelConfigId: session.modelConfigId ?? null};
+  session.riskChanges.push(change);
+  appendLedger(session, data, 'risk-change', {orderId: change.orderId, positionId: change.positionId});
+  appendAccountSnapshot(session, data, 'risk-change');
+  return change;
+}
+
+function initialRiskFields(side, entry, qty, stop) {
+  const r0 = optionalPrice(stop) && stop !== null && Number.isFinite(qty) && qty > 0 &&
+    (side === 1 ? stop < entry : stop > entry) ? qty * Math.abs(entry - stop) : null;
+  return {initialStop: stop ?? null, initialTake: null, initialRiskR0: r0};
+}
+
+function estimatePlannedRisk(side, notional, entry, stop) {
+  if (stop === null || ![side, notional, entry, stop].every(Number.isFinite) || notional <= 0 || entry <= 0 ||
+      (side === 1 ? stop >= entry : stop <= entry)) return null;
+  const qty = notional / entry;
+  const adverseExit = stop * (1 - side * SLIP);
+  const grossLoss = Math.max(0, (entry - adverseExit) * qty * side);
+  return grossLoss + notional * FEE + adverseExit * qty * FEE;
+}
+
+function addEntryFill(session, {orderId, position, price, index, time, executionType}) {
+  if (!Array.isArray(session.fills)) session.fills = [];
+  const fill = {id: crypto.randomUUID(), seq: session.fills.length + 1, orderId: orderId ?? null, positionId: position.positionId, tradeId: null,
+    planId: position.planId ?? null, thesisId: position.thesisId ?? null, parentTradeId: position.parentTradeId ?? null,
+    strategyVersion: position.strategyVersion ?? null, observationId: position.observationId ?? null,
+    attemptNumber: position.attemptNumber ?? null, initialStop: position.initialStop ?? null,
+    initialTake: position.initialTake ?? null, initialRiskR0: position.initialRiskR0 ?? null,
+    side: 'entry', positionSide: position.side, price, qty: position.qty, notional: position.notional, fee: position.entryFee,
+    index, time, replayMarketTime: time, visibleThrough: time, recordedAt: new Date().toISOString(), executionType,
+    modelConfigId: session.modelConfigId ?? null, engineVersion: session.activeEngineVersion ?? session.engineVersion ?? null};
+  session.fills.push(fill);
+  position.entryFillId = fill.id;
+  return fill;
+}
+
+function addExitFill(session, trade, price, index, time, executionType) {
+  if (!Array.isArray(session.fills)) session.fills = [];
+  const exitFee = price * trade.qty * FEE;
+  const fill = {id: crypto.randomUUID(), seq: session.fills.length + 1, orderId: trade.orderId ?? null, positionId: trade.positionId ?? null,
+    tradeId: trade.id, side: 'exit', positionSide: trade.side, price, qty: trade.qty, notional: price * trade.qty, fee: exitFee,
+    index, time, replayMarketTime: time, visibleThrough: time, recordedAt: new Date().toISOString(), executionType,
+    modelConfigId: session.modelConfigId ?? null, engineVersion: session.activeEngineVersion ?? session.engineVersion ?? null};
+  session.fills.push(fill);
+  trade.exitFillId = fill.id;
+  return fill;
 }
 
 function protectionsBracket(side, anchor, stop, take) {
@@ -239,7 +396,7 @@ export function validateSession(session, symbol, data) {
       pending.placedIndex < session.start || pending.placedIndex > visibleIndex || typeof pending.id !== 'string' ||
       (pending.placedTime !== undefined && (!timeMatchesIndex(pending.placedTime, pending.placedIndex, data) || pending.placedTime > replayTime(session, data))) ||
       (pending.modifiedTime !== undefined && (!timeMatchesIndex(pending.modifiedTime, pending.modifiedIndex, data) || pending.modifiedTime > replayTime(session, data))) ||
-      !optionalSavedEntryReason(pending.entryReason) || !marginRecordValid(pending, pending.entryPrice) ||
+      !optionalSavedEntryReason(pending.entryReason) || !optionalAttemptNumber(pending.attemptNumber) || !marginRecordValid(pending, pending.entryPrice) ||
       (pending.marginMode === ISOLATED_MARGIN_MODE
         ? pending.margin + pending.notional * FEE > session.balance + 1e-8
         : pending.notional * (1 + FEE) > session.balance + 1e-8) ||
@@ -248,10 +405,12 @@ export function validateSession(session, symbol, data) {
     const p = session.position;
     if (!p || ![1, -1].includes(p.side) || ![p.entry, p.qty, p.notional, p.entryFee].every(Number.isFinite) ||
         !optionalPrice(p.stop) || !optionalPrice(p.take) || !storedPercent(p.stopPct) || !storedPercent(p.takePct) ||
-        !optionalSavedEntryReason(p.entryReason) || p.entry <= 0 || p.qty <= 0 || p.notional <= 0 || p.entryFee < 0 ||
+        !optionalSavedEntryReason(p.entryReason) || !optionalAttemptNumber(p.attemptNumber) || !initialRiskValid(p) || p.entry <= 0 || p.qty <= 0 || p.notional <= 0 || p.entryFee < 0 ||
         !Number.isInteger(p.entryIndex) || p.entryIndex < session.start || p.entryIndex > visibleIndex || p.entryIndex > session.end || !candleAt(data, p.entryIndex) ||
         (p.entryTime !== undefined && (!timeMatchesIndex(p.entryTime, p.entryIndex, data) || p.entryTime > replayTime(session, data))) ||
         !marginRecordValid(p, p.entry) || (p.marginMode === ISOLATED_MARGIN_MODE && p.margin > session.balance + 1e-8)) return false;
+    if (p.entryFillId !== undefined && (!Array.isArray(session.fills) || !session.fills.some(f => f.id === p.entryFillId &&
+      f.side === 'entry' && f.positionId === p.positionId && f.orderId === (p.orderId ?? null)))) return false;
   }
   if (session.orderHistory !== undefined && (!Array.isArray(session.orderHistory) || !session.orderHistory.every(o => o &&
       ['filled', 'cancelled'].includes(o.status) && ['limit', 'market'].includes(o.type) && typeof o.id === 'string' && [o.side, o.notional, o.entryPrice].every(Number.isFinite) &&
@@ -263,12 +422,109 @@ export function validateSession(session, symbol, data) {
         [o.fillIndex, o.fillPrice].every(Number.isFinite) && o.fillIndex >= session.start && o.fillIndex <= visibleIndex && o.fillPrice > 0) &&
       (o.status !== 'cancelled' || Number.isInteger(o.cancelledIndex) && o.cancelledIndex >= session.start && o.cancelledIndex <= visibleIndex &&
         (o.cancelledTime === undefined || timeMatchesIndex(o.cancelledTime, o.cancelledIndex, data) && o.cancelledTime <= replayTime(session, data)))))) return false;
-  return session.trades.every(t => t && optionalSavedEntryReason(t.entryReason) && optionalSavedExitReason(t.exitReason) && [t.pnl, t.fees, t.entry, t.exit, t.qty].every(Number.isFinite) &&
+  const validTrades = session.trades.every(t => t && optionalSavedEntryReason(t.entryReason) && optionalSavedExitReason(t.exitReason) &&
+    optionalAttemptNumber(t.attemptNumber) && initialRiskValid(t) && [t.pnl, t.fees, t.entry, t.exit, t.qty].every(Number.isFinite) &&
+    (t.triggerEvidence === undefined || (t.triggerEvidence && ['stop', 'take', 'liquidation'].includes(t.triggerEvidence.type) &&
+      Number.isFinite(t.triggerEvidence.triggerPrice) && t.triggerEvidence.triggerPrice > 0 &&
+      Number.isInteger(t.triggerEvidence.referenceMinute) && t.triggerEvidence.referenceMinute % 60 === 0 &&
+      Number.isInteger(t.triggerEvidence.referenceIntervalSeconds) && t.triggerEvidence.referenceIntervalSeconds >= 60 &&
+      t.triggerEvidence.triggerMarketTime === t.triggerEvidence.referenceMinute + t.triggerEvidence.referenceIntervalSeconds &&
+      t.triggerEvidence.triggerMarketTime <= replayTime(session, data) && typeof t.triggerEvidence.ruleId === 'string' &&
+      t.triggerEvidence.ruleId.length > 0 && t.triggerEvidence.actualIntrabarOrderUnknown === true &&
+      (t.triggerEvidence.affectedOrderIds === undefined || Array.isArray(t.triggerEvidence.affectedOrderIds) &&
+        t.triggerEvidence.affectedOrderIds.every(id => typeof id === 'string')))) &&
     (t.entryTime === undefined || timeMatchesIndex(t.entryTime, t.entryIndex, data) && t.entryTime <= replayTime(session, data)) &&
     (t.exitTime === undefined || timeMatchesIndex(t.exitTime, t.exitIndex, data) && t.exitTime <= replayTime(session, data)) &&
     t.entry > 0 && t.exit > 0 && t.qty > 0 && Number.isInteger(t.entryIndex) && Number.isInteger(t.exitIndex) &&
     t.entryIndex >= session.start && t.entryIndex <= t.exitIndex && t.exitIndex <= visibleIndex &&
     !!candleAt(data, t.entryIndex) && !!candleAt(data, t.exitIndex) && marginRecordValid(t, t.entry, {trade: true}));
+  if (!validTrades) return false;
+  if (session.engineVersion !== undefined) {
+    if (typeof session.engineVersion !== 'string' || !Array.isArray(session.modelConfigs) || !session.modelConfigs.length ||
+        !session.modelConfigs.some(m => m?.modelConfigId === session.modelConfigId) || !Array.isArray(session.orders) ||
+        !Array.isArray(session.fills) || !Array.isArray(session.ledger) || !Array.isArray(session.riskChanges) || !Array.isArray(session.accountSnapshots)) return false;
+    if (session.activeEngineVersion !== undefined && typeof session.activeEngineVersion !== 'string') return false;
+    if (new Set(session.modelConfigs.map(m => m?.modelConfigId)).size !== session.modelConfigs.length ||
+        !session.modelConfigs.every(m => typeof m?.modelConfigId === 'string' && typeof m.engineVersion === 'string' &&
+          typeof m.baselineOnly === 'boolean' && m.effectiveFrom && Number.isFinite(m.effectiveFrom.replayMarketTime))) return false;
+    const unique = xs => new Set(xs.map(x => x?.id)).size === xs.length && xs.every(x => typeof x?.id === 'string' && x.id.length > 0);
+    if (![session.orders, session.fills, session.ledger, session.riskChanges, session.accountSnapshots].every(unique)) return false;
+    if (!session.ledger.every((row, i) => Number.isInteger(row.seq) && row.seq === i + 1 && Number.isFinite(row.cashDelta) &&
+      Number.isFinite(row.balanceAfter) && Number.isFinite(row.equityAfter) && typeof row.type === 'string' &&
+      (i === 0 ? Number.isFinite(row.baselineBalance) && near(row.baselineBalance + row.cashDelta, row.balanceAfter)
+        : near(row.balanceAfter, session.ledger[i - 1].balanceAfter + row.cashDelta)))) return false;
+    if (session.ledger.length && !near(session.ledger.at(-1).balanceAfter, session.balance)) return false;
+    const modelIds = new Set(session.modelConfigs.map(m => m.modelConfigId));
+    if (!session.fills.every((f, i) => f.seq === i + 1 && ['entry', 'exit'].includes(f.side) && [f.price, f.qty, f.notional, f.fee].every(Number.isFinite) &&
+      f.price > 0 && f.qty > 0 && f.notional > 0 && f.fee >= 0 && typeof f.positionId === 'string' &&
+      Number.isInteger(f.index) && f.index >= session.start && f.index <= visibleIndex &&
+      (f.time === undefined || (timeMatchesIndex(f.time, f.index, data) && f.time <= replayTime(session, data))) &&
+      (f.visibleThrough === undefined || Number.isFinite(f.visibleThrough) && f.visibleThrough <= replayTime(session, data)) &&
+      (f.modelConfigId == null || modelIds.has(f.modelConfigId)) && optionalAttemptNumber(f.attemptNumber) &&
+      (f.side !== 'entry' || (initialRiskValid({...f, side: f.positionSide, entry: f.price}) && f.tradeId === null)) &&
+      (f.side !== 'exit' || typeof f.tradeId === 'string'))) return false;
+    if (!session.orders.every(o => typeof o.id === 'string' && (o.modelConfigId == null || modelIds.has(o.modelConfigId)) && optionalAttemptNumber(o.attemptNumber) &&
+      (!Number.isFinite(o.placedTime) || Number.isInteger(o.placedIndex) && timeMatchesIndex(o.placedTime, o.placedIndex, data) && o.placedTime <= replayTime(session, data)))) return false;
+    if (!session.accountSnapshots.every(snapshot => Number.isInteger(snapshot.seq) && typeof snapshot.type === 'string' &&
+      Number.isFinite(snapshot.balance) && Number.isFinite(snapshot.equity) && Number.isFinite(snapshot.availableBalance) &&
+      Number.isFinite(snapshot.usedMargin) && Number.isFinite(snapshot.reservedMargin) &&
+      (snapshot.modelConfigId == null || modelIds.has(snapshot.modelConfigId)) &&
+      (snapshot.replayMarketTime === null || Number.isFinite(snapshot.replayMarketTime) && snapshot.replayMarketTime <= replayTime(session, data)) &&
+      (snapshot.visibleThrough === null || Number.isFinite(snapshot.visibleThrough) && snapshot.visibleThrough <= replayTime(session, data)))) return false;
+    if (!session.riskChanges.every((r, i) => r.seq === i + 1 && typeof r.id === 'string' && r.before && r.after &&
+      (r.initialRiskR0 === null || (Number.isFinite(r.initialRiskR0) && r.initialRiskR0 > 0)) &&
+      (r.modelConfigId == null || modelIds.has(r.modelConfigId)) &&
+      (r.replayMarketTime === null || Number.isFinite(r.replayMarketTime) && r.replayMarketTime <= replayTime(session, data)) &&
+      (r.visibleThrough === null || Number.isFinite(r.visibleThrough) && r.visibleThrough <= replayTime(session, data)))) return false;
+    const fillsById = new Map(session.fills.map(f => [f.id, f]));
+    const tradesById = new Map(session.trades.map(t => [t.tradeId ?? t.id, t]));
+    for (const f of session.fills) {
+      const order = f.orderId == null ? null : session.orders.find(o => o.id === f.orderId);
+      const oldOrderHistory = f.orderId == null ? null : session.orderHistory?.find(o => o.id === f.orderId);
+      if (f.orderId != null && !order && !oldOrderHistory) return false;
+      if (f.modelConfigId != null && order?.modelConfigId != null && order.modelConfigId !== f.modelConfigId) return false;
+      if (f.modelConfigId != null && (!modelIds.has(f.modelConfigId) || f.replayMarketTime > replayTime(session, data) ||
+          f.visibleThrough > replayTime(session, data))) return false;
+      if (f.side === 'exit') {
+        const trade = tradesById.get(f.tradeId);
+        if (!trade || trade.exitFillId !== f.id || trade.positionId !== f.positionId) return false;
+      }
+    }
+    for (const trade of session.trades) {
+      if (trade.modelConfigId != null && !modelIds.has(trade.modelConfigId)) return false;
+      if (trade.entryFillId !== undefined) {
+        const entryFill = fillsById.get(trade.entryFillId);
+        if (!entryFill || entryFill.side !== 'entry' || entryFill.positionId !== trade.positionId || entryFill.orderId !== (trade.orderId ?? null)) return false;
+      }
+      if (trade.exitFillId !== undefined) {
+        const exitFill = fillsById.get(trade.exitFillId);
+        if (!exitFill || exitFill.side !== 'exit' || exitFill.tradeId !== (trade.tradeId ?? trade.id)) return false;
+      }
+    }
+    for (const row of session.ledger) {
+      if (row.type === 'entry-fee') {
+        const fill = fillsById.get(row.fillId);
+        if (!fill || fill.side !== 'entry' || !near(row.cashDelta, -fill.fee) || !near(row.fee, fill.fee)) return false;
+      } else if (row.type === 'exit-settlement') {
+        const fill = fillsById.get(row.fillId), trade = tradesById.get(row.tradeId);
+        if (!fill || fill.side !== 'exit' || !trade || fill.tradeId !== (trade.tradeId ?? trade.id) ||
+            !near(row.cashDelta, trade.pnl + trade.entryFee) || !near(row.grossPnl, trade.grossPnl) ||
+            !near(row.fee, fill.fee) || !near(row.isolatedAdjustment, trade.isolatedAdjustment ?? 0)) return false;
+      } else if (row.type === 'margin-reserved' || row.type === 'margin-released') {
+        const fill = fillsById.get(row.fillId);
+        const record = session.position?.positionId === fill?.positionId ? session.position : session.trades.find(t => t.positionId === fill?.positionId);
+        const expectedDelta = (row.type === 'margin-reserved' ? 1 : -1) * record?.margin;
+        if (!fill || !record || fill.side !== (row.type === 'margin-reserved' ? 'entry' : 'exit') ||
+            !near(row.cashDelta, 0) || !near(row.marginDelta, expectedDelta)) return false;
+      } else if (row.type === 'order-margin-reserved' || row.type === 'order-reservation-released') {
+        const order = session.orders.find(o => o.id === row.orderId);
+        const expectedReserved = order?.marginMode === ISOLATED_MARGIN_MODE ? order.margin + order.notional * FEE : order?.notional * (1 + FEE);
+        if (!order || !near(row.cashDelta, 0) || !near(row.reservedMarginDelta,
+          (row.type === 'order-margin-reserved' ? 1 : -1) * expectedReserved)) return false;
+      }
+    }
+  }
+  return true;
 }
 
 export function createSession(symbol, data, random = Math.random) {
@@ -295,10 +551,54 @@ export function createSession(symbol, data, random = Math.random) {
   const roll = random();
   if (!Number.isFinite(roll) || roll < 0 || roll >= 1) throw new Error('随机数必须在[0, 1)范围内');
   const [start, sessionEnd] = candidates[Math.floor(roll * slots)];
+  const created = new Date().toISOString(), modelConfigId = crypto.randomUUID();
   const session = {version: 1, id: crypto.randomUUID(), symbol, start, cursor: start, end: sessionEnd,
-    balance: INITIAL, position: null, pending: null, orderHistory: [], trades: [], tf: 14400, blind: true, ma: false, notes: '', created: new Date().toISOString()};
+    balance: INITIAL, initialBalance: INITIAL, position: null, pending: null, orderHistory: [], orders: [], fills: [], trades: [],
+    ledger: [], accountSnapshots: [], riskChanges: [], modelConfigId, engineVersion: ENGINE_VERSION, activeEngineVersion: ENGINE_VERSION,
+    modelConfigs: [simulationModel(modelConfigId, {recordedAt: created, replayMarketTime: data[start][0] + BASE}, false)],
+    tf: 14400, blind: true, ma: false, notes: '', created};
+  appendLedger(session, data, 'initial-balance', {cashDelta: 0, balanceAfter: INITIAL, baselineBalance: INITIAL});
+  appendAccountSnapshot(session, data, 'session-baseline');
   if (!validateSession(session, symbol, data)) throw new Error('行情数据范围无效');
   return session;
+}
+
+/** Establish a known-at-upgrade baseline for an older snapshot without inventing its historical model or trades. */
+export function ensureEvidenceBaseline(session, data) {
+  if (!session || typeof session !== 'object' || !Array.isArray(data) || !validateSession(session, session.symbol, data)) throw new Error('旧会话基线无效');
+  const existingConfig = session.modelConfigs?.find(m => m?.modelConfigId === session.modelConfigId);
+  if (session.evidenceBaselineId || existingConfig) {
+    let changed = false;
+    if (!session.activeEngineVersion) { session.activeEngineVersion = ENGINE_VERSION; changed = true; }
+    if (session.evidenceBaselineId && existingConfig?.engineVersion === ENGINE_VERSION && existingConfig.baselineOnly) {
+      existingConfig.baselineOnly = false;
+      changed = true;
+    }
+    return changed;
+  }
+  const recordedAt = new Date().toISOString(), modelConfigId = crypto.randomUUID(), marketTime = replayTime(session, data);
+  session.modelConfigs ??= [];
+  session.modelConfigs.push(simulationModel(modelConfigId, {recordedAt, replayMarketTime: marketTime}, false));
+  session.modelConfigId = modelConfigId;
+  session.engineVersion ??= 'legacy-unversioned';
+  session.activeEngineVersion = ENGINE_VERSION;
+  session.modelEvidenceStart = {recordedAt, replayMarketTime: marketTime, visibleThrough: marketTime, reason: '旧存档升级时建立的已知基线；此前模型与操作历史未知'};
+  session.evidenceBaselineId = crypto.randomUUID();
+  session.ledger ??= [];
+  session.orders ??= [];
+  session.fills ??= [];
+  session.riskChanges ??= [];
+  session.accountSnapshots ??= [];
+  const row = {id: crypto.randomUUID(), seq: session.ledger.length + 1, type: 'legacy-baseline',
+    recordedAt, replayMarketTime: marketTime, visibleThrough: marketTime, cashDelta: 0,
+    baselineBalance: session.balance, balanceAfter: session.balance,
+    equityAfter: currentAccountValues(session, data).equity, usedMarginAfter: currentAccountValues(session, data).usedMargin,
+    reservedMarginAfter: currentAccountValues(session, data).reservedMargin, marginDelta: 0, reservedMarginDelta: 0,
+    grossPnl: 0, fee: 0, isolatedAdjustment: 0, modelConfigId: null, legacyHistoryUnknown: true};
+  session.ledger.push(row);
+  appendAccountSnapshot(session, data, 'legacy-upgrade-baseline');
+  if (!validateSession(session, session.symbol, data)) throw new Error('旧会话基线校验失败');
+  return true;
 }
 
 // Aggregate only disclosed base candles. If `from` lands inside an interval,
@@ -381,34 +681,92 @@ export function advanceMinute(session, minuteBar, data) {
     next.forming15m = null;
   }
   let trade = null, orderFilled = null, orderCancelled = null, entryBar = false;
-
+  const executionEvents = [];
+  const stageClock = {cursor: next.cursor, minuteCursorTime: time, forming15m: next.forming15m ? [...next.forming15m] : null,
+    currentPrice: next.currentPrice, replayMarketTime: eventTime, visibleThrough: eventTime};
   if (next.pending) {
     const pending = next.pending;
     const fillPrice = pendingFillPrice(pending, minuteCandle);
     if (fillPrice !== null) {
+      const before = {position: null, pending: structuredClone(pending), balance: next.balance};
+      const released = pending.marginMode === ISOLATED_MARGIN_MODE ? pending.margin + pending.notional * FEE : pending.notional * (1 + FEE);
       next.pending = null;
+      if (next.modelConfigId) appendLedger(next, data, 'order-reservation-released', {reservedMarginDelta: -released, orderId: pending.id});
       positionAtPrice(next, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, eventIndex,
-        pending.id, pending.entryReason, eventTime, pending.leverage ?? DEFAULT_LEVERAGE, pending.marginMode);
+        pending.id, pending.entryReason, eventTime, pending.leverage ?? DEFAULT_LEVERAGE, pending.marginMode, pending, 'limit-touch-1m');
       orderFilled = recordFilledOrder(next, pending, eventIndex, fillPrice, eventTime, next.position);
       entryBar = true;
+      executionEvents.push({seq: executionEvents.length + 1, kind: 'order-filled', recordedAt: new Date().toISOString(),
+        marketTime: eventTime, replayMarketTime: eventTime, visibleThrough: eventTime,
+        replayState: {...stageClock},
+        orderId: pending.id, fillId: orderFilled.fillId ?? next.position.entryFillId, positionId: next.position.positionId,
+        before: {...before, ...stageClock}, after: {position: structuredClone(next.position), pending: null, balance: next.balance, ...stageClock},
+        account: {before: {balance: before.balance, ...currentAccountValues({...next, pending: before.pending, position: before.position}, data)},
+          after: {balance: next.balance, ...currentAccountValues(next, data)}},
+        intrabarActualUnknown: true, rule: {id: 'limit-touch-on-observed-1m', version: next.activeEngineVersion ?? next.engineVersion ?? 'legacy-engine-unversioned'}});
     }
   }
-  if (next.position) trade = exitPositionOnBar(next, data, minuteCandle, eventIndex, entryBar);
+  const positionBeforeExit = next.position ? structuredClone(next.position) : null;
+  const balanceBeforeExit = next.balance;
+  if (next.position) trade = exitPositionOnBar(next, data, minuteCandle, eventIndex, entryBar, 60);
+  if (trade?.triggerEvidence) executionEvents.push({seq: executionEvents.length + 1, kind: 'position-triggered', recordedAt: new Date().toISOString(),
+    marketTime: eventTime, replayMarketTime: eventTime, visibleThrough: eventTime,
+    replayState: {...stageClock},
+    orderId: trade.orderId ?? null, tradeId: trade.tradeId ?? trade.id, positionId: trade.positionId ?? null,
+    before: {position: positionBeforeExit, pending: structuredClone(next.pending), balance: balanceBeforeExit, ...stageClock},
+    after: {position: structuredClone(positionBeforeExit), pending: structuredClone(next.pending), balance: balanceBeforeExit,
+      triggerEvidence: structuredClone(trade.triggerEvidence), ...stageClock},
+    account: {before: {balance: balanceBeforeExit, ...currentAccountValues({...next, position: positionBeforeExit}, data)},
+      after: {balance: balanceBeforeExit, ...currentAccountValues({...next, position: positionBeforeExit}, data)}},
+    reason: trade.reason, affectedOrderIds: trade.triggerEvidence.affectedOrderIds ?? [],
+    intrabarAmbiguous: trade.executionEvidence?.intrabarAmbiguous ?? false,
+    triggerEvidence: structuredClone(trade.triggerEvidence), rule: trade.executionEvidence ?? trade.triggerEvidence,
+    intrabarActualUnknown: trade.triggerEvidence.actualIntrabarOrderUnknown});
+  if (trade) executionEvents.push({seq: executionEvents.length + 1, kind: 'position-auto-closed', recordedAt: new Date().toISOString(),
+    marketTime: eventTime, replayMarketTime: eventTime, visibleThrough: eventTime,
+    replayState: {...stageClock},
+    orderId: trade.orderId ?? null, tradeId: trade.tradeId ?? trade.id, positionId: trade.positionId ?? null, fillId: trade.exitFillId ?? null,
+    before: {position: positionBeforeExit, pending: structuredClone(next.pending), balance: balanceBeforeExit, ...stageClock},
+    after: {position: null, trade: structuredClone(trade), pending: structuredClone(next.pending), balance: next.balance, ...stageClock},
+    account: {before: {balance: balanceBeforeExit, ...currentAccountValues({...next, position: positionBeforeExit}, data)},
+      after: {balance: next.balance, ...currentAccountValues(next, data)}},
+    reason: trade.reason, triggerEvidence: trade.triggerEvidence ? structuredClone(trade.triggerEvidence) : null,
+    affectedOrderIds: trade.executionEvidence?.affectedOrderIds ?? trade.triggerEvidence?.affectedOrderIds ?? [],
+    intrabarAmbiguous: trade.executionEvidence?.intrabarAmbiguous ?? false, rule: trade.executionEvidence ?? null,
+    intrabarActualUnknown: true});
 
   if (next.cursor >= next.end && !next.forming15m) {
-    if (next.position) trade = closePosition(next, data, next.currentPrice, '本轮结束', next.cursor);
-    if (next.pending) orderCancelled = cancelOrder(next, '本轮结束未成交');
+    if (next.position) {
+      const before = structuredClone(next.position), balanceBefore = next.balance;
+      trade = closePosition(next, data, next.currentPrice, '本轮结束', next.cursor);
+      executionEvents.push({seq: executionEvents.length + 1, kind: 'position-auto-closed', recordedAt: new Date().toISOString(),
+        marketTime: eventTime, replayMarketTime: eventTime, visibleThrough: eventTime,
+        replayState: {...stageClock},
+        orderId: trade.orderId ?? null, tradeId: trade.tradeId ?? trade.id, positionId: trade.positionId ?? null, fillId: trade.exitFillId ?? null,
+        before: {position: before, pending: structuredClone(next.pending), balance: balanceBefore, ...stageClock}, after: {position: null, trade: structuredClone(trade), pending: structuredClone(next.pending), balance: next.balance, ...stageClock},
+        account: {before: {balance: balanceBefore, ...currentAccountValues({...next, position: before}, data)},
+          after: {balance: next.balance, ...currentAccountValues(next, data)}},
+        reason: trade.reason, affectedOrderIds: [], intrabarAmbiguous: false, rule: {id: 'session-end-close', version: next.activeEngineVersion ?? next.engineVersion ?? 'legacy-engine-unversioned'}, intrabarActualUnknown: true});
+    }
+    if (next.pending) orderCancelled = cancelOrder(next, '本轮结束未成交', data);
   }
   if (!validateSession(next, next.symbol, data)) throw new Error('分钟推进后状态校验失败');
   Object.assign(session, next);
   const currentTimeframeBoundary = intervalStart(previousCloseTime, session.tf) !== intervalStart(eventTime, session.tf);
+  const values = currentAccountValues(session, data);
+  const minuteAccountSnapshot = {type: 'minute-mark', recordedAt: new Date().toISOString(), replayMarketTime: eventTime,
+    visibleThrough: eventTime, cursor: visibleUpperIndex(session, data), minuteCursorTime: time, currentPrice: minuteBar[4],
+    balance: session.balance, equity: values.equity, availableBalance: values.availableBalance,
+    usedMargin: values.usedMargin, reservedMargin: values.reservedMargin, valuation: 'net-close-estimate'};
   return {ended: replayEnded(session, data), minuteTime: time, replayTime: eventTime, currentPrice: minuteBar[4],
     forming15m: session.forming15m, completed15m, currentTimeframeBoundary, advanced15m: session.cursor - beforeIndex,
-    trade, orderFilled, orderCancelled};
+    trade, orderFilled, orderCancelled, executionEvents, minuteAccountSnapshot,
+    intrabarAmbiguous: Boolean(trade?.executionEvidence?.intrabarAmbiguous),
+    affectedOrderIds: trade?.executionEvidence?.affectedOrderIds ?? [], rule: trade?.executionEvidence ?? null};
 }
 
-export function openPosition(s, data, side, notional, stopPct, takePct, entryReason = '', leverage = DEFAULT_LEVERAGE) {
-  const normalizedReason = normalizeEntryReason(entryReason);
+export function openPosition(s, data, side, notional, stopPct, takePct, entryReason = '', leverage = DEFAULT_LEVERAGE, metadata = {}) {
+  const normalizedReason = normalizeEntryReason(entryReason), meta = normalizeMetadata(metadata);
   if (!validIndexTriplet(s, data)) throw new Error('本轮行情范围无效');
   assertCandle(data, s.cursor);
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
@@ -418,15 +776,30 @@ export function openPosition(s, data, side, notional, stopPct, takePct, entryRea
   if (!Number.isFinite(notional) || notional <= 0 || !optionalPercent(stopPct) || !optionalPercent(takePct) || !validLeverage(leverage))
     throw new Error('请输入有效金额和止盈止损距离（0到50%）；关闭保护请传null');
   if (!Number.isFinite(s.balance) || s.balance < 0 || marginFor(notional, leverage) + notional * FEE > s.balance + 1e-8) throw new Error('保证金加开仓手续费不能超过可用余额');
-  const c = assertCandle(data, s.cursor), currentPrice = replayPrice(s, data), entry = currentPrice * (1 + side * SLIP);
-  const entryFee = notional * FEE;
-  const entryIndex = visibleUpperIndex(s, data);
-  s.position = {side, entry, qty: notional / entry, notional, entryFee, entryIndex, ...withMargin(notional, leverage, entry, side),
-    stop: stopPct === null ? null : entry * (1 - side * stopPct / 100),
-    take: takePct === null ? null : entry * (1 + side * takePct / 100), stopPct, takePct, entryReason: normalizedReason,
-    entryTime: replayTime(s, data)};
-  s.balance -= entryFee;
-  return s.position;
+  const currentPrice = replayPrice(s, data), entry = currentPrice * (1 + side * SLIP);
+  const stop = stopPct === null ? null : entry * (1 - side * stopPct / 100);
+  const take = takePct === null ? null : entry * (1 + side * takePct / 100);
+  const index = visibleUpperIndex(s, data), time = replayTime(s, data);
+  if (!s.modelConfigId) {
+    const entryFee = notional * FEE;
+    s.position = {side, entry, qty: notional / entry, notional, entryFee, entryIndex: index, ...withMargin(notional, leverage, entry, side),
+      stop, take, stopPct, takePct, entryReason: normalizedReason, entryTime: time};
+    s.balance -= entryFee;
+    return s.position;
+  }
+  const orderId = crypto.randomUUID();
+  const order = {id: orderId, modelConfigId: s.modelConfigId ?? null, engineVersion: s.activeEngineVersion ?? s.engineVersion ?? null,
+    type: 'market', side, notional, entryPrice: currentPrice, stop, take,
+    placedIndex: index, placedTime: time, entryReason: normalizedReason, ...meta,
+    riskBudget: {lossBudget: meta.lossBudget, basis: 'user-entered-currency-amount', status: meta.lossBudget == null ? 'not-provided' : 'provided'},
+    pretradeRisk: {reference: 'market-close-estimate', referencePrice: currentPrice, stop,
+      priceRisk: stop === null ? null : notional / entry * Math.abs(entry - stop),
+      plannedRiskIncludingCosts: estimatePlannedRisk(side, notional, entry, stop), margin: marginFor(notional, leverage), leverage},
+    ...withMargin(notional, leverage, currentPrice, side)};
+  s.orders ??= []; s.orders.push(order);
+  const position = positionAtPrice(s, data, side, notional, entry, stop, take, index, orderId, normalizedReason, time, leverage, ISOLATED_MARGIN_MODE, meta, 'market-close');
+  const filled = recordFilledOrder(s, order, index, entry, time, position);
+  return position;
 }
 
 function validateOrderPlan(s, side, notional, entryPrice, stopPrice, takePrice, leverage = DEFAULT_LEVERAGE, marginMode = ISOLATED_MARGIN_MODE) {
@@ -439,23 +812,40 @@ function validateOrderPlan(s, side, notional, entryPrice, stopPrice, takePrice, 
     throw new Error('保证金加开仓手续费不能超过可用余额');
 }
 
-function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, index, orderId = null, entryReason = undefined, entryTime = undefined, leverage = DEFAULT_LEVERAGE, marginMode = null) {
-  const entryFee = notional * FEE;
-  const position = {side, entry: fillPrice, qty: notional / fillPrice, notional, entryFee, entryIndex: index,
+function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, index, orderId = null, entryReason = undefined, entryTime = undefined, leverage = DEFAULT_LEVERAGE, marginMode = null, metadata = {}, executionType = 'market-close') {
+  metadata = normalizeMetadata(metadata);
+  const entryFee = notional * FEE, qty = notional / fillPrice;
+  const positionId = crypto.randomUUID();
+  const position = {positionId, side, entry: fillPrice, qty, notional, entryFee, entryIndex: index,
     ...(marginMode === ISOLATED_MARGIN_MODE ? withMargin(notional, leverage, fillPrice, side) : {}),
     stop: stopPrice, take: takePrice,
     stopPct: stopPrice === null ? null : Math.abs((fillPrice - stopPrice) / fillPrice * 100),
     takePct: takePrice === null ? null : Math.abs((takePrice - fillPrice) / fillPrice * 100), orderId,
-    entryTime: entryTime ?? (data[index]?.[0] + BASE)};
+    entryTime: entryTime ?? (data[index]?.[0] + BASE), modelConfigId: s.modelConfigId ?? null,
+    engineVersion: s.activeEngineVersion ?? s.engineVersion ?? null, ...metadata,
+    ...initialRiskFields(side, fillPrice, qty, stopPrice),
+    initialTake: takePrice ?? null,
+    riskBudget: {lossBudget: metadata.lossBudget ?? null, basis: 'user-entered-currency-amount', status: metadata.lossBudget == null ? 'not-provided' : 'provided'},
+    pretradeRisk: {reference: 'actual-fill', referencePrice: fillPrice, stop: stopPrice ?? null,
+      priceRisk: stopPrice === null ? null : qty * Math.abs(fillPrice - stopPrice),
+      plannedRiskIncludingCosts: estimatePlannedRisk(side, notional, fillPrice, stopPrice), margin: marginFor(notional, leverage), leverage}};
   if (entryReason !== undefined) position.entryReason = entryReason;
   s.position = position;
   s.balance -= entryFee;
+  if (s.modelConfigId) {
+    const fill = addEntryFill(s, {orderId, position, price: fillPrice, index, time: position.entryTime, executionType});
+    appendLedger(s, data, 'entry-fee', {cashDelta: -entryFee, fee: entryFee, orderId, positionId, fillId: fill.id});
+    if (position.marginMode === ISOLATED_MARGIN_MODE) appendLedger(s, data, 'margin-reserved', {marginDelta: position.margin, orderId, positionId, fillId: fill.id});
+    appendAccountSnapshot(s, data, 'position-opened');
+  }
   return position;
 }
 
 function recordFilledOrder(s, order, fillIndex, fillPrice, fillTime = undefined, position = null) {
+  const entryFill = position && s.fills?.find(f => f.id === position.entryFillId);
   const record = {...order, ...(position?.marginMode === ISOLATED_MARGIN_MODE ? {marginMode: position.marginMode, leverage: position.leverage,
-    margin: position.margin, liquidationPrice: position.liquidationPrice} : {}), status: 'filled', fillIndex, fillPrice, ...(fillTime === undefined ? {} : {fillTime})};
+    margin: position.margin, liquidationPrice: position.liquidationPrice} : {}), status: 'filled', fillIndex, fillPrice,
+    ...(entryFill ? {fillId: entryFill.id, positionId: position.positionId} : {}), ...(fillTime === undefined ? {} : {fillTime})};
   s.orderHistory ??= [];
   s.orderHistory.push(record);
   return record;
@@ -463,8 +853,8 @@ function recordFilledOrder(s, order, fillIndex, fillPrice, fillTime = undefined,
 
 // Market orders fill at the already disclosed close. Limit orders stay pending
 // until a future observed 15m candle touches their price.
-export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takePrice, orderType = 'market', entryReason = '', leverage = DEFAULT_LEVERAGE) {
-  const normalizedReason = normalizeEntryReason(entryReason);
+export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takePrice, orderType = 'market', entryReason = '', leverage = DEFAULT_LEVERAGE, metadata = {}) {
+  const normalizedReason = normalizeEntryReason(entryReason), meta = normalizeMetadata(metadata);
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
   if (s.position || s.pending) throw new Error('请先处理当前仓位或挂单');
   if (s.cursor >= s.end) throw new Error('本轮已结束，请开启新一轮');
@@ -472,27 +862,36 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
   const currentPrice = replayPrice(s, data), eventIndex = visibleUpperIndex(s, data), eventTime = replayTime(s, data);
   const planPrice = orderType === 'market' ? currentPrice : entryPrice;
   validateOrderPlan(s, side, notional, planPrice, stopPrice, takePrice, leverage);
-  const order = {id: crypto.randomUUID(), side, notional, entryPrice: planPrice, stop: stopPrice, take: takePrice,
-    type: orderType, placedIndex: eventIndex, placedTime: eventTime, entryReason: normalizedReason,
+  const orderId = crypto.randomUUID();
+  const order = {id: orderId, modelConfigId: s.modelConfigId ?? null, engineVersion: s.activeEngineVersion ?? s.engineVersion ?? null,
+    type: orderType, side, notional, entryPrice: planPrice, stop: stopPrice, take: takePrice,
+    placedIndex: eventIndex, placedTime: eventTime, entryReason: normalizedReason, ...meta,
+    riskBudget: {lossBudget: meta.lossBudget, basis: 'user-entered-currency-amount', status: meta.lossBudget == null ? 'not-provided' : 'provided'},
+    pretradeRisk: {reference: orderType === 'market' ? 'market-close-estimate' : 'limit-price-plan', referencePrice: planPrice,
+      priceRisk: stopPrice === null ? null : notional / planPrice * Math.abs(planPrice - stopPrice),
+      plannedRiskIncludingCosts: estimatePlannedRisk(side, notional, planPrice, stopPrice), margin: marginFor(notional, leverage), leverage},
     ...withMargin(notional, leverage, planPrice, side)};
   const marketableLimit = orderType === 'limit' && (side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice);
   if (orderType === 'market' || marketableLimit) {
     const slippedMarket = currentPrice * (1 + side * SLIP);
-    const fillPrice = orderType === 'market' ? slippedMarket :
-      side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
-    // Immediate fills must leave both protections on the correct side of fill.
+    const fillPrice = orderType === 'market' ? slippedMarket : side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
-    const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, eventIndex, order.id, normalizedReason, eventTime, leverage, ISOLATED_MARGIN_MODE);
+    s.orders ??= []; s.orders.push(order);
+    const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, eventIndex, order.id, normalizedReason, eventTime, leverage, ISOLATED_MARGIN_MODE, meta, orderType === 'limit' ? 'marketable-limit-close' : 'market-close');
     const filled = recordFilledOrder(s, order, eventIndex, fillPrice, eventTime, position);
     return {status: 'filled', order: filled, position};
   }
-  const pending = {...order};
-  s.pending = pending;
-  s.orderHistory ??= [];
-  return {status: 'pending', order: pending};
+  s.orders ??= []; s.orders.push(order);
+  s.pending = {...order};
+  if (s.modelConfigId) {
+    const reserved = order.margin + order.notional * FEE;
+    appendLedger(s, data, 'order-margin-reserved', {reservedMarginDelta: reserved, orderId: order.id});
+    appendAccountSnapshot(s, data, 'order-submitted');
+  }
+  return {status: 'pending', order: s.pending};
 }
 
-export function cancelOrder(s, reason = '用户撤单') {
+export function cancelOrder(s, reason = '用户撤单', data = undefined) {
   if (!s?.pending) return null;
   const cancelledIndex = s.forming15m ? s.cursor + 1 : s.cursor;
   const cancelled = {...s.pending, status: 'cancelled', reason, cancelledIndex,
@@ -500,37 +899,55 @@ export function cancelOrder(s, reason = '用户撤单') {
   s.orderHistory ??= [];
   s.orderHistory.push(cancelled);
   s.pending = null;
+  if (s.modelConfigId) {
+    const reserve = cancelled.marginMode === ISOLATED_MARGIN_MODE ? cancelled.margin + cancelled.notional * FEE : cancelled.notional * (1 + FEE);
+    appendLedger(s, data, 'order-reservation-released', {reservedMarginDelta: -reserve, orderId: cancelled.id});
+    appendAccountSnapshot(s, data, 'order-cancelled');
+  }
   return cancelled;
 }
 
-export function updatePendingOrder(s, data, entryPrice, stopPrice, takePrice) {
+export function updatePendingOrder(s, data, entryPrice, stopPrice, takePrice, metadata = {}) {
+  const meta = normalizeMetadata(metadata);
   if (!validateSession(s, s?.symbol, data) || !s.pending) throw new Error('当前没有有效挂单');
   if (s.cursor >= s.end) throw new Error('本轮已结束，请开启新一轮');
   validateOrderPlan(s, s.pending.side, s.pending.notional, entryPrice, stopPrice, takePrice, s.pending.leverage ?? DEFAULT_LEVERAGE, s.pending.marginMode);
   const currentPrice = replayPrice(s, data), side = s.pending.side, eventIndex = visibleUpperIndex(s, data), eventTime = replayTime(s, data);
+  const before = {entryPrice: s.pending.entryPrice, stop: s.pending.stop, take: s.pending.take};
   const updated = {...s.pending, entryPrice, stop: stopPrice, take: takePrice,
     ...(s.pending.marginMode === ISOLATED_MARGIN_MODE ? withMargin(s.pending.notional, s.pending.leverage, entryPrice, s.pending.side) : {}),
-    modifiedIndex: eventIndex, modifiedTime: eventTime};
+    modifiedIndex: eventIndex, modifiedTime: eventTime,
+    pretradeRisk: {...(s.pending.pretradeRisk ?? {}), reference: 'limit-price-plan', referencePrice: entryPrice,
+      priceRisk: stopPrice === null ? null : s.pending.notional / entryPrice * Math.abs(entryPrice - stopPrice),
+      plannedRiskIncludingCosts: estimatePlannedRisk(s.pending.side, s.pending.notional, entryPrice, stopPrice)}};
   const marketable = side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice;
   if (marketable) {
     const slippedMarket = currentPrice * (1 + side * SLIP);
     const fillPrice = side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
     s.pending = null;
-    const position = positionAtPrice(s, data, side, updated.notional, fillPrice, stopPrice, takePrice, eventIndex, updated.id, updated.entryReason, eventTime, updated.leverage ?? DEFAULT_LEVERAGE, updated.marginMode);
+    if (s.modelConfigId) {
+      const reserved = updated.marginMode === ISOLATED_MARGIN_MODE ? updated.margin + updated.notional * FEE : updated.notional * (1 + FEE);
+      appendLedger(s, data, 'order-reservation-released', {reservedMarginDelta: -reserved, orderId: updated.id});
+    }
+    const position = positionAtPrice(s, data, side, updated.notional, fillPrice, stopPrice, takePrice, eventIndex, updated.id, updated.entryReason, eventTime, updated.leverage ?? DEFAULT_LEVERAGE, updated.marginMode, updated, 'limit-repriced-marketable');
     const filled = recordFilledOrder(s, updated, eventIndex, fillPrice, eventTime, position);
+    if (s.modelConfigId) recordRiskChange(s, data, 'order', updated, before, {entryPrice, stop: stopPrice, take: takePrice}, meta);
     return {status: 'filled', order: filled, position};
   }
   s.pending = updated;
+  if (s.modelConfigId) recordRiskChange(s, data, 'order', updated, before, {entryPrice, stop: stopPrice, take: takePrice}, meta);
   return {status: 'pending', order: s.pending};
 }
 
-export function updateProtection(s, data, stopPrice, takePrice) {
+export function updateProtection(s, data, stopPrice, takePrice, metadata = {}) {
+  const meta = normalizeMetadata(metadata);
   if (!validateSession(s, s?.symbol, data) || !s.position) throw new Error('当前没有有效持仓');
   if (!optionalPrice(stopPrice) || !optionalPrice(takePrice)) throw new Error('保护价格无效；关闭保护请传null');
   const price = replayPrice(s, data), p = s.position;
   if (!protectionsBracket(p.side, price, stopPrice, takePrice)) throw new Error('止盈止损必须分列在当前价格两侧');
   const modifiedIndex = visibleUpperIndex(s, data), modifiedTime = replayTime(s, data);
+  const before = {stop: p.stop, take: p.take, initialStop: p.initialStop ?? null, initialTake: p.initialTake ?? null, initialRiskR0: p.initialRiskR0 ?? null};
   let matchedOrder = null;
   if (typeof p.orderId === 'string' && p.orderId.trim() && Array.isArray(s.orderHistory)) {
     const matches = s.orderHistory.filter(order => order?.id === p.orderId && order.status === 'filled');
@@ -546,6 +963,8 @@ export function updateProtection(s, data, stopPrice, takePrice) {
     matchedOrder.modifiedIndex = modifiedIndex;
     matchedOrder.modifiedTime = modifiedTime;
   }
+  if (s.modelConfigId) recordRiskChange(s, data, 'position', p, before,
+    {stop: stopPrice, take: takePrice, initialStop: p.initialStop ?? null, initialTake: p.initialTake ?? null, initialRiskR0: p.initialRiskR0 ?? null}, meta);
   return p;
 }
 
@@ -598,33 +1017,46 @@ function pendingFillPrice(order, candle) {
   return null;
 }
 
-function exitPositionOnBar(s, data, c, index, entryBar = false) {
+function exitPositionOnBar(s, data, c, index, entryBar = false, referenceIntervalSeconds = 60) {
   const p = s.position;
   if (!p) return null;
   const liquidation = p.marginMode === ISOLATED_MARGIN_MODE ? p.liquidationPrice : null;
   const gapLiquidation = Number.isFinite(liquidation) && (p.side === 1 ? c[1] <= liquidation : c[1] >= liquidation);
-  if (gapLiquidation) return closePosition(s, data, c[1], '强平', index);
+  if (gapLiquidation) return closeOnTrigger(s, data, c, index, c[1], '强平', 'liquidation', c[1], 'minute-gap-liquidation-v1', null, referenceIntervalSeconds);
   const gapStop = p.stop !== null && (p.side === 1 ? c[1] <= p.stop : c[1] >= p.stop);
   const hitStop = p.stop !== null && (p.side === 1 ? c[3] <= p.stop : c[2] >= p.stop);
-  if (gapStop) return closePosition(s, data, c[1], '跳空止损', index);
+  if (gapStop) return closeOnTrigger(s, data, c, index, c[1], '跳空止损', 'stop', c[1], 'minute-gap-stop-at-open-v1', null, referenceIntervalSeconds);
   const gapTake = p.take !== null && (p.side === 1 ? c[1] >= p.take : c[1] <= p.take);
-  if (!entryBar && gapTake) return closePosition(s, data, c[1], '跳空止盈', index);
+  if (!entryBar && gapTake) return closeOnTrigger(s, data, c, index, c[1], '跳空止盈', 'take', c[1], 'minute-gap-take-at-open-v1', null, referenceIntervalSeconds);
   const hitLiquidation = Number.isFinite(liquidation) && (p.side === 1 ? c[3] <= liquidation : c[2] >= liquidation);
-  if (hitLiquidation) {
-    const stopIsCloser = p.stop !== null && (p.side === 1 ? p.stop >= liquidation : p.stop <= liquidation);
-    if (!hitStop || !stopIsCloser) return closePosition(s, data, liquidation, '强平', index);
-  }
-  if (hitStop) {
-    const hitTake = p.take !== null && (p.side === 1 ? c[2] >= p.take : c[3] <= p.take);
-    return closePosition(s, data, p.stop, hitTake ? '双触发，按止损' : entryBar ? '入场同根止损' : '止损', index);
-  }
-  if (entryBar) return null; // Intrabar order is unknown; defer take-profit to the next candle.
   const hitTake = p.take !== null && (p.side === 1 ? c[2] >= p.take : c[3] <= p.take);
-  if (hitTake) return closePosition(s, data, p.take, '止盈', index);
+  const ambiguous = (hitStop && hitTake) || (hitStop && hitLiquidation) || (hitTake && hitLiquidation);
+  const stopIsCloser = hitLiquidation && p.stop !== null && (p.side === 1 ? p.stop >= liquidation : p.stop <= liquidation);
+  const chosen = hitLiquidation && (!hitStop || !stopIsCloser) ? 'liquidation' : hitStop ? 'stop' : hitTake ? 'take' : null;
+  const evidence = ambiguous ? {intrabarAmbiguous: true, affectedOrderIds: p.orderId ? [p.orderId] : [],
+    ruleId: hitLiquidation ? '1m-ohlc-nearest-protective-threshold-v1' : '1m-ohlc-stop-first-v1',
+    ruleVersion: s.activeEngineVersion ?? s.engineVersion ?? 'legacy-engine-unversioned', chosen} : null;
+  if (hitLiquidation) {
+    if (!hitStop || !stopIsCloser) return closeOnTrigger(s, data, c, index, liquidation, '强平', 'liquidation', liquidation,
+      evidence?.ruleId ?? 'minute-intrabar-liquidation-v1', evidence, referenceIntervalSeconds);
+  }
+  if (hitStop) return closeOnTrigger(s, data, c, index, p.stop, hitTake ? '双触发，按止损' : entryBar ? '入场同根止损' : '止损',
+    'stop', p.stop, evidence?.ruleId ?? 'minute-intrabar-stop-v1', evidence, referenceIntervalSeconds);
+  if (entryBar) return null; // Intrabar order is unknown; defer take-profit to the next candle.
+  if (hitTake) return closeOnTrigger(s, data, c, index, p.take, '止盈', 'take', p.take,
+    evidence?.ruleId ?? 'minute-intrabar-take-v1', evidence, referenceIntervalSeconds);
   return null;
 }
 
-export function closePosition(s, data, price, reason = '手动平仓', index = undefined) {
+function closeOnTrigger(s, data, candle, index, exitPrice, reason, type, triggerPrice, ruleId, executionEvidence = null, referenceIntervalSeconds = 60) {
+  const triggerEvidence = {type, triggerPrice, referenceMinute: candle[0], triggerMarketTime: candle[0] + referenceIntervalSeconds,
+    referenceIntervalSeconds,
+    ruleId, actualIntrabarOrderUnknown: true,
+    ...(executionEvidence?.affectedOrderIds ? {affectedOrderIds: [...executionEvidence.affectedOrderIds]} : [])};
+  return closePosition(s, data, exitPrice, reason, index, executionEvidence, triggerEvidence);
+}
+
+export function closePosition(s, data, price, reason = '手动平仓', index = undefined, executionEvidence = null, triggerEvidence = null) {
   if (!s?.position) return null;
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
   index ??= visibleUpperIndex(s, data);
@@ -639,14 +1071,28 @@ export function closePosition(s, data, price, reason = '手动平仓', index = u
     ? Math.max(0, -p.margin - (gross - exitFee)) : 0;
   const settlement = gross - exitFee + isolatedAdjustment;
   const legacyExitTime = c[0] + BASE;
-  const trade = {...p, id: crypto.randomUUID(), exit, exitIndex: index,
+  const tradeId = crypto.randomUUID();
+  const trade = {...p, id: tradeId, tradeId, positionId: p.positionId ?? crypto.randomUUID(), exit, exitIndex: index,
     exitTime: Number.isInteger(s.minuteCursorTime) ? replayTime(s, data) : legacyExitTime,
     entryTime: p.entryTime ?? assertCandle(data, p.entryIndex)[0] + BASE,
-    pnl: settlement - p.entryFee, fees: p.entryFee + exitFee, reason,
+    pnl: settlement - p.entryFee, grossPnl: gross, exitFee, fees: p.entryFee + exitFee, reason,
+    riskChanges: (s.riskChanges ?? []).filter(r => r.positionId === p.positionId || (p.orderId && r.orderId === p.orderId)),
+    ...(executionEvidence ? {executionEvidence: structuredClone(executionEvidence)} : {}),
+    ...(triggerEvidence ? {triggerEvidence: structuredClone(triggerEvidence)} : {}),
     ...(p.marginMode === ISOLATED_MARGIN_MODE ? {isolatedAdjustment} : {})};
   s.balance += settlement;
   s.trades.push(trade);
   s.position = null;
+  if (s.modelConfigId) {
+    const time = Number.isInteger(s.minuteCursorTime) ? replayTime(s, data) : legacyExitTime;
+    const fill = addExitFill(s, trade, exit, index, time, reason === '手动平仓' ? 'manual-close' : reason === '本轮结束' ? 'session-end-close' : 'automatic-protection');
+    appendLedger(s, data, 'exit-settlement', {cashDelta: settlement, grossPnl: gross, fee: exitFee, isolatedAdjustment,
+      orderId: trade.orderId ?? null, positionId: trade.positionId, tradeId: trade.tradeId, fillId: fill.id,
+      usedMarginAfter: p.marginMode === ISOLATED_MARGIN_MODE ? p.margin : 0});
+    if (p.marginMode === ISOLATED_MARGIN_MODE) appendLedger(s, data, 'margin-released', {marginDelta: -p.margin,
+      orderId: trade.orderId ?? null, positionId: trade.positionId, tradeId: trade.tradeId, fillId: fill.id});
+    appendAccountSnapshot(s, data, 'position-closed');
+  }
   return trade;
 }
 
@@ -664,7 +1110,7 @@ export function advance(s, data) {
   if (!validateSession(s, s?.symbol, data)) throw new Error('本轮行情范围无效');
   if (Object.hasOwn(s, 'minuteCursorTime')) throw new Error('分钟回放状态请使用advanceMinute推进');
   if (s.cursor >= s.end) {
-    const orderCancelled = s.pending ? cancelOrder(s, '本轮结束未成交') : null;
+    const orderCancelled = s.pending ? cancelOrder(s, '本轮结束未成交', data) : null;
     return {ended: true, trade: null, orderFilled: null, orderCancelled};
   }
   if (!VALID_TFS.has(s.tf)) throw new Error('周期无效');
@@ -681,17 +1127,21 @@ export function advance(s, data) {
       const fillPrice = pendingFillPrice(pending, c);
       if (fillPrice !== null) {
         s.pending = null;
+        if (s.modelConfigId) {
+          const released = pending.marginMode === ISOLATED_MARGIN_MODE ? pending.margin + pending.notional * FEE : pending.notional * (1 + FEE);
+          appendLedger(s, data, 'order-reservation-released', {reservedMarginDelta: -released, orderId: pending.id});
+        }
         const fillTime = c[0] + BASE;
-        positionAtPrice(s, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, i, pending.id, pending.entryReason, fillTime, pending.leverage ?? DEFAULT_LEVERAGE, pending.marginMode);
+        positionAtPrice(s, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, i, pending.id, pending.entryReason, fillTime, pending.leverage ?? DEFAULT_LEVERAGE, pending.marginMode, pending, 'limit-touch-1m');
         orderFilled = recordFilledOrder(s, pending, i, fillPrice, fillTime, s.position);
         entryBar = true;
       }
     }
-    if (s.position) trade = exitPositionOnBar(s, data, c, i, entryBar);
+    if (s.position) trade = exitPositionOnBar(s, data, c, i, entryBar, BASE);
     if (trade || orderFilled || c[0] + BASE >= nextBoundary) break;
   }
   if (s.cursor === s.end && s.position) trade = closePosition(s, data, assertCandle(data, s.cursor)[4], '本轮结束', s.cursor);
-  if (s.cursor === s.end && s.pending) orderCancelled = cancelOrder(s, '本轮结束未成交');
+  if (s.cursor === s.end && s.pending) orderCancelled = cancelOrder(s, '本轮结束未成交', data);
   return {ended: s.cursor >= s.end, trade, orderFilled, orderCancelled};
 }
 

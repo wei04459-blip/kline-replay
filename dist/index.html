@@ -9,7 +9,7 @@
 <body>
   <header class="app-header">
     <a class="brand" href="./"><span class="brand-mark" aria-hidden="true">↗</span><strong>K线回放</strong><span class="brand-en">REPLAY LAB</span></a>
-    <div class="header-actions"><span class="private-label">个人练习 · 模拟资金</span><button class="quiet" id="rules">使用说明</button><button class="quiet" id="export">导出JSON备份</button><button class="primary review-export-button" id="review-export">导出GPT复盘包</button></div>
+    <div class="header-actions"><span class="private-label">个人练习 · 模拟资金</span><button class="quiet" id="rules">使用说明</button><button class="quiet" id="export">导出JSON备份</button><button class="quiet" type="button" id="review-import">导入复盘包</button><input id="review-import-file" type="file" accept="application/zip,application/json,.zip,.json" hidden><button class="primary review-export-button" id="review-export">导出GPT复盘包</button></div>
   </header>
   <main>
     <section class="session-heading">
@@ -60,6 +60,7 @@
           </div>
           <div class="risk-line"><span>价差估算（未计成本） · 盈亏比</span><span id="risk-preview">—</span></div>
           <div class="trade-buttons"><button type="button" id="long" class="buy" aria-pressed="false" disabled>↗ 买入 / 做多</button><button type="button" id="short" class="sell" aria-pressed="false" disabled>↘ 卖出 / 做空</button></div>
+          <button type="button" id="observation-open" class="quiet full observation-open">记录判断 / 这次不做</button>
           <div id="plan-actions" hidden><p id="plan-hint" class="order-hint">市价单按当前回放收盘价立即成交；限价按指定价或更优成交，否则挂起等待。</p><button type="button" id="confirm-plan" class="primary full" disabled>确认市价做多</button><button type="button" id="locate-plan" class="quiet full" hidden>定位计划价格</button><button type="button" id="cancel-plan" class="quiet full">取消计划</button></div>
           <p class="order-hint" id="order-hint">点击图上的「＋止损」「＋止盈」并向合法一侧拖出；拖动线可调整，点×移除</p>
         </form>
@@ -83,7 +84,15 @@
       <button id="reason-close" class="icon-btn" type="button" aria-label="取消本次下单">×</button>
     </header>
     <p id="order-reason-summary" class="order-reason-summary"></p>
+    <details id="thesis-fields" class="thesis-fields"><summary>想法关联与策略标签（可选）</summary>
+      <label for="thesis-choice">交易想法<select id="thesis-choice"><option value="">不关联想法</option><option value="__new__">新建想法</option></select></label>
+      <label id="thesis-label-wrap" for="thesis-label" hidden>新想法名称<input id="thesis-label" maxlength="120" placeholder="给这组判断起个短名字"></label>
+      <label for="parent-trade">延续自哪笔交易<select id="parent-trade"><option value="">不关联前序交易</option></select></label>
+      <div class="thesis-row"><label for="attempt-number">尝试次数<input id="attempt-number" type="number" min="1" step="1" placeholder="可留空"></label><label for="strategy-version">策略标签<input id="strategy-version" maxlength="80" placeholder="可留空"></label></div>
+    </details>
+    <div id="observation-fields" class="observation-fields" hidden><label for="observation-status">记录类型<select id="observation-status"><option value="judgement">记录判断</option><option value="not-taken">这次不做</option></select></label><label for="observed-conditions">拟观察条件（可选）<textarea id="observed-conditions" rows="2" maxlength="1000" placeholder="例如：回到区间上沿并站稳后再观察"></textarea></label></div>
     <label class="entry-reason-label" for="entry-reason"><span id="reason-prompt">为什么在这里下单？</span><textarea id="entry-reason" maxlength="2000" rows="4" required placeholder="写下你的判断依据…"></textarea></label>
+    <details id="loss-budget-details" class="loss-budget-details"><summary>可选：本笔最多计划亏损</summary><label for="loss-budget">金额（USDT）<input id="loss-budget" type="number" min="0.01" step="0.01" inputmode="decimal" placeholder="留空表示未设预算"></label><small>这是亏损预算，不是保证金比例；留空会记录为未填写。</small><span id="loss-budget-status" aria-live="polite"></span></details>
     <p id="entry-reason-error" class="entry-reason-error" aria-live="polite"></p>
     <div class="reason-actions"><button id="reason-cancel" class="quiet" type="button">取消</button><button id="reason-confirm" class="primary" type="button">确认下单</button></div>
   </section>
@@ -93,6 +102,7 @@
     <button class="primary full" data-close="info-dialog">开始练习</button>
   </dialog>
   <dialog id="new-dialog"><div class="dialog-head"><h2>开始新一轮练习</h2><button class="icon-btn" data-close="new-dialog" aria-label="关闭">×</button></div><p>未成交限价单会撤销并记录；如果当前有持仓，确认后还需填写平仓理由，再按最新已回放价平仓。本轮成交、订单和笔记将归档，新一轮模拟资金为 10,000 USDT。</p><div class="dialog-actions"><button class="quiet" data-close="new-dialog">继续本轮</button><button class="primary" id="confirm-new">归档并开始</button></div></dialog>
+  <dialog id="plan-history-dialog" class="plan-history-dialog"><div class="dialog-head"><h2 id="plan-history-title">计划版本</h2><button class="icon-btn" type="button" data-close="plan-history-dialog" aria-label="关闭">×</button></div><div id="plan-history-body" class="plan-history-body"></div><div class="dialog-actions"><button class="quiet" type="button" data-close="plan-history-dialog">关闭</button></div></dialog>
   <noscript>请开启浏览器 JavaScript 以使用K线回放。</noscript>
   <script type="module" src="./app.mjs"></script>
 </body>

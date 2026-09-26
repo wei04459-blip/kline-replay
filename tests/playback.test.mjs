@@ -41,9 +41,12 @@ function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
     currentData: () => data,
     clone: value => value == null ? value : JSON.parse(JSON.stringify(value)),
     reviewStateProjection: session => ({id: session.id, cursor: session.cursor, minuteCursorTime: session.minuteCursorTime ?? null, position: session.position ?? null, pending: session.pending ?? null, trades: session.trades ?? []}),
+    reviewId: prefix => `${prefix}-test-id`,
+    reasonBlocksReplay: mode => ['entry','exit'].includes(mode??sandbox.pendingOrderRequest?.mode),
     reviewView: session => ({visibleThrough: session.time + 60, tf: session.tf}),
     reviewRecorder: {appendMinute: async (_session, row) => { state.minuteRows.push(row); }, observe: async (_session, options = {}) => { if (options.kind) state.reviewEvents.push(options.kind); }},
     recordReviewEvent: (kind, details) => { state.reviewEvents.push({kind, details}); },
+    executionStageSnapshots: (before, progressed, stage) => ({before, after: {...progressed, ...(stage?.after||{})}}),
     keyReviewKind: kind => /^(order-|position-|protection-|drawing-)/.test(kind),
     intervalStart: (value, seconds) => Math.floor(value / seconds) * seconds,
     nextMinute: nextMinute || (async (_symbol, afterTime) => [afterTime + 60, 100, 101, 99, 100, 1]),
@@ -96,7 +99,7 @@ test('automatic playback continues after limit fill and exit events, scheduling 
   h.state.isPlaying = true;
   await h.api.runAutomaticMinute(h.state.minuteGeneration);
   assert.equal(h.state.advanceCount, 1);
-  assert.equal(h.state.isPlaying, true);
+  assert.equal(h.state.isPlaying, true, h.toasts.at(-1) || 'playback stopped without a toast');
   assert.equal(h.state.minuteGeneration, 0);
   assert.equal(h.timers.filter(timer => !timer.cancelled).length, 1);
   assert.match(h.toasts[0], /BTC/);
@@ -133,7 +136,7 @@ test('opening the order-reason window freezes a minute request even if its respo
   const wait = deferred(), h = harness({nextMinute: () => wait.promise});
   const pending = h.api.advanceOneMinuteCore(h.state.minuteGeneration);
   await Promise.resolve();
-  h.state.pendingOrderRequest = {side: 1};
+  h.state.pendingOrderRequest = {mode: 'entry', side: 1};
   wait.resolve([0, 100, 101, 99, 100, 1]);
   assert.equal(await pending, null);
   assert.equal(h.state.advanceCount, 0);
@@ -171,6 +174,18 @@ test('manual timeframe advance continues past order events and keeps their notic
   assert.deepEqual(h.state.reviewEvents.map(event => event.kind), ['order-filled', 'position-auto-closed'], 'fast-forward records intermediate order and exit events despite draw=false');
   assert.equal(h.state.minuteRows.length, 3, 'every fast-forwarded disclosed minute is captured');
   assert.equal(h.state.reviewEvents[0].details.view.fastForwarding, true, 'snapshots identify events reached by unattended fast-forward');
+});
+
+test('fast-forward renders before capturing each engine trigger stage on the disclosed minute', async () => {
+  const h = harness({tf: 180, results: [{ended:false,trade:{id:'t-1',orderId:'o-1',reason:'止损',exit:98,pnl:-2},executionEvents:[
+    {seq:1,kind:'position-triggered',orderId:'o-1',tradeId:'t-1',positionId:'p-1',position:{orderId:'o-1',entry:100,stop:98,take:null},reason:'止损触发',visibleThrough:60,replayMarketTime:60},
+    {seq:2,kind:'position-auto-closed',orderId:'o-1',tradeId:'t-1',positionId:'p-1',trade:{id:'t-1',orderId:'o-1',reason:'止损',entry:100,stop:98,exit:98,pnl:-2},visibleThrough:60,replayMarketTime:60}
+  ]}]});
+  await h.api.advanceToTfBoundary();
+  assert.ok(h.state.renderCount>=1,'the just-disclosed minute must reach canvas before stage screenshots run');
+  assert.deepEqual(h.state.reviewEvents.map(item=>item.kind),['position-triggered','position-auto-closed']);
+  assert.ok(h.state.reviewEvents.every(item=>item.details.screenshot===true));
+  assert.ok(h.state.reviewEvents.every(item=>item.details.view.fastForwarding===true));
 });
 
 test('natural end remains a stop and still announces the final trade after invalidating playback generation', async () => {
@@ -246,6 +261,11 @@ function exitHarness({playing = true, startResult = false} = {}) {
   controls['entry-reason-error'] = {textContent: ''};
   controls['order-reason-window'] = {hidden: true, offsetWidth: 400, offsetHeight: 250, style: {}, classList: {toggle() {}}};
   controls['order-reason-summary'] = {textContent: ''};
+  controls['loss-budget-details'] = {hidden: true};
+  controls['loss-budget'] = {value: ''};
+  controls['loss-budget-status'] = {textContent: ''};
+  controls['thesis-fields'] = {hidden: true};
+  controls['observation-fields'] = {hidden: true};
   controls['reason-close'] = {setAttribute(name, value) { this[name] = value; }};
   controls['new-session'] = {isConnected: true, hidden: false, focus() {}};
   controls.symbol = {value: 'BTCUSDT'};
@@ -280,6 +300,14 @@ function exitHarness({playing = true, startResult = false} = {}) {
     recordLeverage: p => p?.leverage || 1,
     recordMargin: p => p?.margin || 0,
     pretty: value => Number(value).toFixed(2),
+    reviewId: prefix => `${prefix}-test-id`,
+    reasonBlocksReplay: mode => ['entry','exit'].includes(mode??sandbox.pendingOrderRequest?.mode),
+    positionIdentity: position => String(position?.orderId || 'order-1'),
+    reviewStateProjection: session => JSON.parse(JSON.stringify({id: session.id,position:session.position,trades:session.trades||[],balance:session.balance})),
+    reviewView: () => ({visibleThrough: 600}),
+    reviewAccountSnapshot: () => ({balance: 1000}),
+    recordReviewEvent: (kind,details) => events.push({kind,details}),
+    resumeReasonPlayback: () => {},
     setReasonCopy: mode => sandbox.copyFn(mode),
     copyFn: mode => {
       const exiting = mode === 'exit';

@@ -89,6 +89,49 @@ test('R uses only the submitted initial stop and is unavailable for final-state-
   assert.match(buildReviewReport(payload).reportText, /无法推断此前是否设置过止损/);
 });
 
+test('explicit fill-time null protection does not fall back to an earlier pending-order stop', () => {
+  const payload = makePayload();
+  const trade = payload.sessions[0].session.trades[0];
+  trade.initialStop = null;
+  trade.initialTake = null;
+  trade.initialRiskR0 = null;
+  const metrics = buildReviewReport(payload).metricsBySession[0];
+  assert.equal(metrics.trades[0].initialRisk, null);
+  assert.equal(metrics.trades[0].initialStop, null);
+  assert.equal(metrics.trades[0].initialRiskReason, '成交时未设置初始止损');
+});
+
+test('missing hold minutes keep only a clearly partial MFE/MAE sample and incomplete equity coverage', () => {
+  const payload = makePayload();
+  payload.sessions[0].market.minuteCandles.splice(3, 1); // remove one complete in-position minute
+  const metrics = buildReviewReport(payload).metricsBySession[0];
+  const trade = metrics.trades[0];
+  assert.equal(trade.coverageComplete, false);
+  assert.equal(trade.observedMinutes, 1);
+  assert.equal(trade.expectedMinutes, 2);
+  assert.equal(trade.mfeUnavailableReason, 'partial-minute-coverage');
+  assert.equal(metrics.equityCurveCoverageComplete, false);
+  assert.ok(metrics.equityMissingMinuteCount > 0);
+  assert.match(buildReviewReport(payload).reportText, /不能视为完整持仓极值/);
+});
+
+test('ledger reconciliation checks both baseline and the final wallet snapshot', () => {
+  const payload = makePayload();
+  payload.sessions[0].session.ledger = [
+    {id: 'l1', seq: 1, type: 'initial-balance', baselineBalance: 10000, cashDelta: 0, balanceAfter: 10000, fee: 0, visibleThrough: 0},
+    {id: 'l2', seq: 2, type: 'exit-settlement', cashDelta: 1.92, balanceAfter: 10001.92, fee: 0.08, visibleThrough: 300},
+  ];
+  payload.sessions[0].session.fills = [
+    {id: 'f1', side: 'entry', time: 120, fee: 0.04}, {id: 'f2', side: 'exit', time: 300, fee: 0.04},
+  ];
+  let reconciliation = buildReviewReport(payload).metricsBySession[0].accountLedgerReconciliation;
+  assert.equal(reconciliation.balanced, true);
+  payload.sessions[0].session.ledger[1].balanceAfter += 10;
+  reconciliation = buildReviewReport(payload).metricsBySession[0].accountLedgerReconciliation;
+  assert.equal(reconciliation.balanced, false);
+  assert.match(reconciliation.reason, /末行账本余额与会话钱包余额/);
+});
+
 test('market fill snapshots match the submitted order through position.orderId', () => {
   const payload = makePayload();
   payload.sessions[0].events[0].after = {position: {orderId: 'order-1', side: 1, entry: 100, stop: 90, take: 120}};
@@ -224,6 +267,24 @@ test('same-minute entry and exit plus adjacent same-time close/re-entry remain i
   assert.ok(metrics.equityCurve.some(point => point.time === 120 && point.kind === 'trade-entry-fee'));
   assert.ok(metrics.equityCurve.some(point => point.time === 120 && point.kind === 'trade-exit'));
   assert.equal(metrics.equityCurve.at(-1).equity, 10000.84);
+});
+
+test('minute-close equity includes a position filled exactly at that minute close without restoring its entry fee', () => {
+  const payload = makePayload();
+  const session = payload.sessions[0].session;
+  session.trades = [];
+  session.position = {id: 'position-open', positionId: 'position-open', orderId: 'order-open', side: 1,
+    entry: 100, qty: 10, entryTime: 120, entryFee: 0.04, marginMode: 'isolated-v1', margin: 10, leverage: 1};
+  session.initialBalance = 10000;
+  session.balance = 9999.96;
+  payload.sessions[0].coverage.visibleThrough = 240;
+  payload.sessions[0].market.minuteCandles = [
+    [120, 100, 100, 100, 100, 1], [180, 100, 101, 100, 100.4, 1], [240, 100.4, 100.4, 100.4, 100.4, 1],
+  ];
+  const metrics = buildReviewReport(payload).metricsBySession[0];
+  const minuteClose = metrics.equityCurve.find(point => point.time === 180);
+  assert.equal(minuteClose.kind, 'minute-mark');
+  assert.ok(minuteClose.equity < 10000, 'entry fee and close estimate remain reflected after the fill timestamp');
 });
 
 test('disclosed currentBar is preferred for event volume; reconstruction combines non-overlapping context and minute rows', () => {
