@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   logicalToTimestamp, moveDrawingPoint, projectDrawing, sanitizeDrawings,
   timestampToLogical, translateDrawing, createDrawingTools, resizeZone,
+  DRAWING_PALETTE, resolveDrawingPalette,
 } from '../dist/drawings.mjs';
 
 const bars15 = Array.from({length: 5}, (_, i) => ({time: 1_700_000_000 + i * 900}));
@@ -14,7 +15,10 @@ test('drawing sanitizer keeps valid records and drops bad items independently', 
     {...valid, id: 'bad-price', anchor: {time: 1, price: Infinity}},
     {...valid, id: 'bad-time', anchor: {time: 1.2, price: 1}},
     valid]);
-  assert.deepEqual(result, [valid]);
+  assert.deepEqual(result, [{...valid,colorPreset:'blue'}]);
+  assert.deepEqual(sanitizeDrawings([{...valid,id:'teal',colorPreset:'teal'},{...valid,id:'unsafe',colorPreset:'url(javascript:alert(1))'}]),[
+    {...valid,id:'teal',colorPreset:'teal'},{...valid,id:'unsafe',colorPreset:'blue'},
+  ]);
 });
 
 test('trendlines need two valid points at distinct times', () => {
@@ -25,11 +29,15 @@ test('trendlines need two valid points at distinct times', () => {
 
 test('SMC zones normalize corners, reject zero-area records, project across timeframes, and resize edges', () => {
   const zone={id:'zone-1',type:'zone',start:{time:bars15[3].time,price:42000},end:{time:bars15[1].time,price:43000}};
-  const normalized={id:'zone-1',type:'zone',start:{time:bars15[1].time,price:43000},end:{time:bars15[3].time,price:42000}};
+  const normalized={id:'zone-1',type:'zone',start:{time:bars15[1].time,price:43000},end:{time:bars15[3].time,price:42000},colorPreset:'teal'};
   assert.deepEqual(sanitizeDrawings([zone,{...zone,id:'flat-time',end:{...zone.start,time:zone.start.time}},
     {...zone,id:'flat-price',end:{...zone.start,price:zone.start.price}}]),[normalized]);
+  assert.deepEqual(sanitizeDrawings([{...zone,colorPreset:'nonsense'}]),[normalized]);
+  assert.deepEqual(sanitizeDrawings([{...zone,colorPreset:'purple'}]),[{...normalized,colorPreset:'purple'}]);
+  assert.equal(resolveDrawingPalette('horizontal',undefined).line,DRAWING_PALETTE.blue.line,'legacy horizontal drawings retain the blue fallback');
+  assert.equal(resolveDrawingPalette('zone',undefined).border,DRAWING_PALETTE.teal.border,'legacy zones retain the blue-cyan fallback');
   assert.deepEqual(projectDrawing(normalized,bars30,1800),{id:'zone-1',type:'zone',
-    start:{logical:0.5,price:43000},end:{logical:1.5,price:42000}});
+    start:{logical:0.5,price:43000},end:{logical:1.5,price:42000},colorPreset:'teal'});
   assert.deepEqual(translateDrawing(normalized,900,-25),{...normalized,
     start:{time:normalized.start.time+900,price:42975},end:{time:normalized.end.time+900,price:41975}});
   assert.deepEqual(resizeZone(normalized,'n',{time:normalized.start.time,price:43100}),{...normalized,
@@ -112,15 +120,31 @@ test('SVG renderer creates visible selected horizontal and trend lines with mult
     {id: 'h1', type: 'horizontal', anchor: {time: bars15[0].time, price: 39900}},
     {id: 't1', type: 'trend', start: {time: bars15[1].time, price: 39950}, end: {time: bars15[3].time, price: 39850}},
   ]};
+  const changes=[];
   try {
     const tools = createDrawingTools({chart, series, container, getSession: () => session,
-      getBars: () => bars15, getInterval: () => 900});
+      getBars: () => bars15, getInterval: () => 900,onChange:()=>changes.push(structuredClone(session.drawings))});
     assert.equal(container.children.length, 5);
     const overlay = container.children[0];
     const classes = overlay.children.map(node => node.attributes.class).filter(Boolean);
     assert.ok(classes.includes('drawing-line horizontal'));
     assert.ok(classes.includes('drawing-line trend'));
     assert.ok(overlay.children.some(node => node.attributes.stroke === 'transparent'));
+    assert.equal(overlay.children.find(node=>node.attributes.class==='drawing-line horizontal').attributes.stroke,DRAWING_PALETTE.blue.line);
+    const horizontalHit=overlay.children.find(node=>node.dataset.drawingId==='h1'&&node.attributes.class==='drawing-hit-area');
+    horizontalHit.listeners.pointerdown[0]({button:0,pointerId:2,target:horizontalHit,clientX:0,clientY:100,preventDefault(){},stopPropagation(){}});
+    assert.equal(tools.getSelectedDrawing().colorPreset,'blue');
+    assert.equal(tools.setSelectedColor('purple'),true);
+    assert.equal(session.drawings[0].colorPreset,'purple');
+    assert.equal(overlay.children.find(node=>node.attributes.class==='drawing-line horizontal selected').attributes.stroke,DRAWING_PALETTE.purple.line);
+    assert.equal(container.children[1].children[0].style.borderColor,DRAWING_PALETTE.purple.line,'the horizontal price label follows its line color');
+    assert.equal(changes.length,1,'a color change is an ordinary persisted drawing modification');
+    tools.refresh(bars15);
+    assert.equal(session.drawings[0].colorPreset,'purple','refresh keeps the selected drawing preset');
+    const trendHit=overlay.children.find(node=>node.dataset.drawingId==='t1'&&node.attributes.class==='drawing-hit-area');
+    trendHit.listeners.pointerdown[0]({button:0,pointerId:3,target:trendHit,clientX:100,clientY:50,preventDefault(){},stopPropagation(){}});
+    assert.equal(tools.setSelectedColor('red'),false,'trendline colors remain unchanged');
+    assert.equal(Object.hasOwn(session.drawings[1],'colorPreset'),false);
     tools.destroy();
   } finally {
     for (const [key, value] of Object.entries(previous)) {
@@ -256,10 +280,14 @@ test('SMC zone previews and completes on two clicks, then supports whole drag an
     click(300,150);
     assert.equal(session.drawings.length,1);
     assert.deepEqual(session.drawings[0],{id:session.drawings[0].id,type:'zone',
-      start:{time:bars15[1].time,price:39850},end:{time:bars15[3].time,price:39800}});
+      start:{time:bars15[1].time,price:39850},end:{time:bars15[3].time,price:39800},colorPreset:'teal'});
     assert.equal(tools.getSelectedId(),session.drawings[0].id);
     assert.equal(states.at(-1).tool,null,'completing the area returns to selection mode');
     assert.equal(overlay.children.filter(node=>String(node.attributes.class||'').includes('drawing-zone-handle')).length,8);
+    assert.equal(tools.setSelectedColor('orange'),true);
+    assert.equal(overlay.children.find(node=>String(node.attributes.class||'').includes('drawing-zone-fill selected')).attributes.fill,DRAWING_PALETTE.orange.selectedFill);
+    tools.refresh(bars15);
+    assert.equal(session.drawings[0].colorPreset,'orange','the zone preset survives a timeframe/render refresh');
 
     let body=overlay.children.find(node=>String(node.attributes.class||'').includes('drawing-zone-hit'));
     assert.equal(body.style.pointerEvents,'all','selected zone body can be dragged');

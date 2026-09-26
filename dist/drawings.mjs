@@ -3,6 +3,23 @@ const MIN_PRICE = Number.MIN_VALUE;
 const MAX_DRAWINGS = 500;
 const MIN_ZONE_TIME_SPAN = 1;
 const MIN_ZONE_PRICE_SPAN = 1e-8;
+export const DRAWING_PALETTE = Object.freeze({
+  teal: Object.freeze({label: '蓝青', line: '#69aebd', border: '#69aebd', fill: 'rgba(105,174,189,.13)', selectedFill: 'rgba(105,174,189,.21)', labelBackground: '#24464d'}),
+  blue: Object.freeze({label: '蓝', line: '#6389c6', border: '#6389c6', fill: 'rgba(99,137,198,.13)', selectedFill: 'rgba(99,137,198,.21)', labelBackground: '#273a58'}),
+  purple: Object.freeze({label: '紫', line: '#967dba', border: '#967dba', fill: 'rgba(150,125,186,.13)', selectedFill: 'rgba(150,125,186,.21)', labelBackground: '#403352'}),
+  orange: Object.freeze({label: '橙', line: '#bd895e', border: '#bd895e', fill: 'rgba(189,137,94,.13)', selectedFill: 'rgba(189,137,94,.21)', labelBackground: '#493627'}),
+  red: Object.freeze({label: '红', line: '#bd7078', border: '#bd7078', fill: 'rgba(189,112,120,.13)', selectedFill: 'rgba(189,112,120,.21)', labelBackground: '#4b2e34'}),
+  green: Object.freeze({label: '绿', line: '#6b9d7a', border: '#6b9d7a', fill: 'rgba(107,157,122,.13)', selectedFill: 'rgba(107,157,122,.21)', labelBackground: '#2c4235'}),
+});
+export const NEW_DRAWING_COLOR_PRESET = 'teal';
+
+export function resolveDrawingPalette(type, colorPreset) {
+  const fallback = type === 'horizontal' ? 'blue' : NEW_DRAWING_COLOR_PRESET;
+  const key = Object.hasOwn(DRAWING_PALETTE, colorPreset) ? colorPreset : fallback;
+  return DRAWING_PALETTE[key];
+}
+
+function validColorPreset(value) { return Object.hasOwn(DRAWING_PALETTE, value); }
 
 function validPoint(point) {
   return point && Number.isSafeInteger(point.time) && point.time >= 0 &&
@@ -13,7 +30,8 @@ function cloneDrawing(item) {
   if (!item || typeof item !== 'object' || typeof item.id !== 'string' ||
       !/^[\w-]{1,80}$/.test(item.id)) return null;
   if (item.type === 'horizontal' && validPoint(item.anchor)) {
-    return {id: item.id, type: item.type, anchor: {time: item.anchor.time, price: item.anchor.price}};
+    return {id: item.id, type: item.type, anchor: {time: item.anchor.time, price: item.anchor.price},
+      colorPreset: validColorPreset(item.colorPreset) ? item.colorPreset : 'blue'};
   }
   if (item.type === 'trend' && validPoint(item.start) && validPoint(item.end) &&
       item.start.time !== item.end.time) {
@@ -25,7 +43,8 @@ function cloneDrawing(item) {
     const left = Math.min(item.start.time, item.end.time), right = Math.max(item.start.time, item.end.time);
     const top = Math.max(item.start.price, item.end.price), bottom = Math.min(item.start.price, item.end.price);
     if (right - left < MIN_ZONE_TIME_SPAN || top - bottom < MIN_ZONE_PRICE_SPAN) return null;
-    return {id: item.id, type: 'zone', start: {time: left, price: top}, end: {time: right, price: bottom}};
+    return {id: item.id, type: 'zone', start: {time: left, price: top}, end: {time: right, price: bottom},
+      colorPreset: validColorPreset(item.colorPreset) ? item.colorPreset : NEW_DRAWING_COLOR_PRESET};
   }
   return null;
 }
@@ -94,8 +113,9 @@ export function projectDrawing(drawing, bars, intervalSeconds = 60) {
     logical: timestampToLogical(point.time, bars, intervalSeconds),
     price: point.price,
   });
-  if (valid.type === 'horizontal') return {id: valid.id, type: valid.type, anchor: project(valid.anchor)};
-  return {id: valid.id, type: valid.type, start: project(valid.start), end: project(valid.end)};
+  if (valid.type === 'horizontal') return {id: valid.id, type: valid.type, anchor: project(valid.anchor), colorPreset: valid.colorPreset};
+  return {id: valid.id, type: valid.type, start: project(valid.start), end: project(valid.end),
+    ...(valid.type === 'zone' ? {colorPreset: valid.colorPreset} : {})};
 }
 
 function translatePoint(point, dt, dp) {
@@ -262,7 +282,9 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     } else axisMenu.hidden = true;
   }
   function emitState() {
-    const state = {tool, selectedId, drawingCount: currentDrawings().length,
+    const selectedDrawing = currentDrawings().find(drawing => drawing.id === selectedId) ?? null;
+    const state = {tool, selectedId, selectedType: selectedDrawing?.type ?? null,
+      colorPreset: selectedDrawing?.colorPreset ?? null, drawingCount: currentDrawings().length,
       phase: tool === 'trendline' || tool === 'zone' ? (draftStart ? 'end' : 'start') : null,
       axisMenuOpen};
     const signature = JSON.stringify(state);
@@ -399,12 +421,13 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     if (drawing.type === 'horizontal') {
       const y = priceY(drawing.anchor.price);
       if (!Number.isFinite(y)) return;
+      const palette = resolveDrawingPalette('horizontal', drawing.colorPreset);
       const hit = createSvg('line', {x1: 0, x2: plotWidth(), y1: y, y2: y,
         stroke: 'transparent', 'stroke-width': 12, 'vector-effect': 'non-scaling-stroke'}, 'drawing-hit-area');
       bindHit(hit, drawing.id);
       overlay.append(hit);
       const line = createSvg('line', {x1: 0, x2: plotWidth(), y1: y, y2: y,
-        stroke: chosen ? '#67a8ff' : '#4688e8', 'stroke-width': chosen ? 2 : 1.5,
+        stroke: palette.line, 'stroke-width': chosen ? 2 : 1.5,
         'stroke-dasharray': 'none', 'vector-effect': 'non-scaling-stroke'}, `drawing-line horizontal${chosen ? ' selected' : ''}`);
       line.style.pointerEvents = 'none';
       overlay.append(line);
@@ -413,16 +436,17 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     const a = pointToPixel(drawing.start), b = pointToPixel(drawing.end);
     if (!a || !b) return;
     if (drawing.type === 'zone') {
+      const palette = resolveDrawingPalette('zone', drawing.colorPreset);
       const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
       const width = Math.max(1, Math.abs(b.x - a.x)), height = Math.max(1, Math.abs(b.y - a.y));
       const hit = createSvg('rect', {x, y, width, height, fill: 'transparent', 'fill-opacity': chosen ? '0.015' : '0',
         stroke: 'transparent', 'stroke-width': chosen ? 0 : 12, 'vector-effect': 'non-scaling-stroke'}, 'drawing-zone-hit drawing-hit-area');
       bindHit(hit, drawing.id, chosen ? 'zone-whole' : 'whole');
       overlay.append(hit);
-      const fill = createSvg('rect', {x, y, width, height, fill: chosen ? '#4ca9c733' : '#4ca9c722', stroke: 'none'},
+      const fill = createSvg('rect', {x, y, width, height, fill: chosen ? palette.selectedFill : palette.fill, stroke: 'none'},
         `drawing-zone-fill${chosen ? ' selected' : ''}`);
       fill.style.pointerEvents = 'none'; overlay.append(fill);
-      const border = createSvg('rect', {x, y, width, height, fill: 'none', stroke: chosen ? '#83d2e8' : '#609eb0',
+      const border = createSvg('rect', {x, y, width, height, fill: 'none', stroke: palette.border,
         'stroke-width': chosen ? 1.8 : 1.3, 'vector-effect': 'non-scaling-stroke'}, `drawing-zone-border${chosen ? ' selected' : ''}`);
       border.style.pointerEvents = 'none'; overlay.append(border);
       if (chosen) {
@@ -461,7 +485,8 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     const a = pointToPixel(draftStart.point);
     if (!a) return;
     if (tool === 'horizontal') {
-      const preview = createSvg('line', {x1: 0, x2: plotWidth(), y1: a.y, y2: a.y, stroke: '#7ce0be', 'stroke-width': 1.5, 'stroke-dasharray': '4 3'}, 'drawing-preview');
+      const previewColor = resolveDrawingPalette('horizontal', NEW_DRAWING_COLOR_PRESET).line;
+      const preview = createSvg('line', {x1: 0, x2: plotWidth(), y1: a.y, y2: a.y, stroke: previewColor, 'stroke-width': 1.5, 'stroke-dasharray': '4 3'}, 'drawing-preview');
       preview.style.pointerEvents = 'none';
       overlay.append(preview);
     } else if (tool === 'trendline') {
@@ -475,13 +500,14 @@ export function createDrawingTools({chart, series, container, getSession, getBar
         overlay.append(preview);
       }
     } else if (tool === 'zone') {
+      const previewPalette = resolveDrawingPalette('zone', NEW_DRAWING_COLOR_PRESET);
       const marker = createSvg('circle', {cx: a.x, cy: a.y, r: 4.5, fill: '#b7e5ef', stroke: '#18313a', 'stroke-width': 2}, 'drawing-start-marker');
       marker.style.pointerEvents = 'none'; overlay.append(marker);
       if (!draftStart.current) return;
       const b = pointToPixel(draftStart.current);
       if (b) {
         const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y), width = Math.abs(b.x - a.x), height = Math.abs(b.y - a.y);
-        const preview = createSvg('rect', {x, y, width, height, fill: '#4ca9c733', stroke: '#83d2e8', 'stroke-width': 1.5,
+        const preview = createSvg('rect', {x, y, width, height, fill: previewPalette.selectedFill, stroke: previewPalette.border, 'stroke-width': 1.5,
           'stroke-dasharray': '5 3', 'vector-effect': 'non-scaling-stroke'}, 'drawing-preview drawing-zone-preview');
         preview.style.pointerEvents = 'none'; overlay.append(preview);
       }
@@ -512,9 +538,12 @@ export function createDrawingTools({chart, series, container, getSession, getBar
       if (drawing.type === 'horizontal') {
         const y = priceY(drawing.anchor.price);
         if (Number.isFinite(y) && y >= 0 && y <= paneHeight()) {
+          const palette = resolveDrawingPalette('horizontal', drawing.colorPreset);
           const label = document.createElement('span');
           label.className = `drawing-price-label${selectedId === drawing.id ? ' selected' : ''}`;
           label.textContent = formatPrice(drawing.anchor.price);
+          label.style.backgroundColor = palette.labelBackground;
+          label.style.borderColor = palette.line;
           label.style.left = `${Math.max(0, width + 2)}px`;
           label.style.top = `${y}px`;
           priceLabels.append(label);
@@ -531,7 +560,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   function commitPoint(point) {
     if (!point || isLocked()) return false;
     if (tool === 'horizontal') {
-      return finishDrawing({id: uid(), type: 'horizontal', anchor: point});
+      return finishDrawing({id: uid(), type: 'horizontal', anchor: point, colorPreset: NEW_DRAWING_COLOR_PRESET});
     }
     if (tool === 'trendline') {
       if (!draftStart) {
@@ -550,7 +579,8 @@ export function createDrawingTools({chart, series, container, getSession, getBar
         render();
         return true;
       }
-      return finishDrawing({id: uid(), type: 'zone', start: draftStart.point, end: point});
+      return finishDrawing({id: uid(), type: 'zone', start: draftStart.point, end: point,
+        colorPreset: NEW_DRAWING_COLOR_PRESET});
     }
     return false;
   }
@@ -616,7 +646,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     if (isLocked() || !Number.isFinite(price) || price <= 0) return false;
     const times = barTimes(cachedBars), time = times.at(-1);
     if (!Number.isSafeInteger(time)) return false;
-    return finishDrawing({id: uid(), type: 'horizontal', anchor: {time, price}});
+    return finishDrawing({id: uid(), type: 'horizontal', anchor: {time, price}, colorPreset: NEW_DRAWING_COLOR_PRESET});
   }
   function openAxisMenu(event) {
     event.preventDefault(); event.stopPropagation();
@@ -722,6 +752,14 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     onChange(); render();
     return true;
   }
+  function setSelectedColor(colorPreset) {
+    if (!selectedId || !validColorPreset(colorPreset) || isLocked()) return false;
+    const drawing = currentDrawings().find(item => item.id === selectedId);
+    if (!drawing || !['horizontal', 'zone'].includes(drawing.type) || drawing.colorPreset === colorPreset) return false;
+    if (!replaceDrawing(selectedId, {...drawing, colorPreset})) return false;
+    render();
+    return true;
+  }
   function cancel() {
     releaseCrosshairPin();
     if (drag) {
@@ -768,11 +806,16 @@ export function createDrawingTools({chart, series, container, getSession, getBar
 
   return {
     setTool,
+    setSelectedColor,
     deleteSelected,
     cancel,
     refresh,
     consumeChartClick,
     getSelectedId: () => selectedId,
+    getSelectedDrawing: () => {
+      const drawing = currentDrawings().find(item => item.id === selectedId);
+      return drawing ? cloneDrawing(drawing) : null;
+    },
     destroy() {
       destroyed = true;
       releaseCrosshairPin();

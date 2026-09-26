@@ -63,12 +63,27 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .chart-panel{height:auto;align-self:start}
 .chart-wrap{flex:0 0 clamp(600px,75vh,1000px);height:clamp(600px,75vh,1000px);min-height:600px}
 .order-panel{height:calc(clamp(600px,75vh,1000px) + 225px);max-height:calc(clamp(600px,75vh,1000px) + 225px);align-self:start;overflow-y:auto;overscroll-behavior:contain}
-.drawing-toolbar{height:37px;flex:0 0 37px;display:flex;align-items:center;gap:6px;padding:0 12px;border-bottom:1px solid var(--line);background:#151a1c;color:#889497;font-size:11px}
+.drawing-toolbar{height:37px;flex:0 0 37px;position:relative;z-index:15;display:flex;align-items:center;gap:6px;padding:0 12px;border-bottom:1px solid var(--line);background:#151a1c;color:#889497;font-size:11px}
 .drawing-toolbar>span{margin-right:3px;color:#a8b2b5;font-weight:600}
 .drawing-toolbar button{border:1px solid #30393d;border-radius:3px;background:#1d2427;color:#b8c1c3;padding:4px 8px;font-size:11px;white-space:nowrap}
 .drawing-toolbar button.active{border-color:#4c8e78;background:#20372f;color:#9ee3c7}
 .drawing-toolbar button:disabled{opacity:.4;cursor:not-allowed}
 .drawing-toolbar small{margin-left:auto;color:#778488;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.drawing-color-control{position:relative;display:inline-flex;align-items:center}
+#drawing-color{display:inline-flex;align-items:center;gap:6px}
+#drawing-color-sample{width:10px;height:10px;border:1px solid #dbe5e6;border-radius:50%;background:#69aebd;box-shadow:0 0 0 1px #0005}
+.drawing-color-popover{position:absolute;z-index:30;top:calc(100% + 5px);left:0;display:grid;grid-template-columns:repeat(6,28px);gap:4px;padding:7px;border:1px solid #394548;border-radius:5px;background:#171d20;box-shadow:0 7px 22px #0009}
+.drawing-color-popover[hidden]{display:none}
+.drawing-toolbar .drawing-color-popover button{width:28px;height:28px;display:grid;place-items:center;padding:0;border:1px solid #394347;border-radius:4px;background:#20282b;cursor:pointer}
+.drawing-toolbar .drawing-color-popover button:hover,.drawing-toolbar .drawing-color-popover button:focus-visible{border-color:#a8c3c7;outline:1px solid #83a7ad;outline-offset:1px}
+.drawing-toolbar .drawing-color-popover button[aria-pressed="true"]{border-color:#e0ecee;background:#2a3639;box-shadow:0 0 0 1px #a9c7cb66}
+.drawing-color-popover button span{width:15px;height:15px;border:1px solid #ffffff80;border-radius:50%;box-shadow:0 1px 3px #0008}
+.drawing-color-popover [data-drawing-color-preset="teal"] span{background:#69aebd}
+.drawing-color-popover [data-drawing-color-preset="blue"] span{background:#6389c6}
+.drawing-color-popover [data-drawing-color-preset="purple"] span{background:#967dba}
+.drawing-color-popover [data-drawing-color-preset="orange"] span{background:#bd895e}
+.drawing-color-popover [data-drawing-color-preset="red"] span{background:#bd7078}
+.drawing-color-popover [data-drawing-color-preset="green"] span{background:#6b9d7a}
 .exit-reason-cell{width:220px;max-width:260px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;vertical-align:top}
 .drawing-price-labels{position:absolute;inset:0;z-index:10;pointer-events:none;overflow:visible}
 .drawing-price-label{position:absolute;min-width:62px;transform:translateY(-50%);padding:2px 5px;background:#2869b8;color:#f4f8ff;border:1px solid #6aa7f2;border-radius:2px;font:10px var(--mono);text-align:right;white-space:nowrap}
@@ -80,11 +95,6 @@ body{font-size:16px}.metrics span,.available,.field-label,.exits label,.position
 .drawing-axis-menu-item:hover,.drawing-axis-menu-item:focus-visible{background:#274968;color:#fff;outline:0}
 .drawing-overlay{z-index:7;pointer-events:none;touch-action:none}
 .drawing-overlay line,.drawing-overlay circle,.drawing-overlay rect{vector-effect:non-scaling-stroke}
-.drawing-overlay .drawing-zone-fill{fill:#4ca9c72b}
-.drawing-overlay .drawing-zone-fill.selected{fill:#55b6d633}
-.drawing-overlay .drawing-zone-border{stroke:#609eb0;stroke-width:1.3;fill:none}
-.drawing-overlay .drawing-zone-border.selected{stroke:#83d2e8;stroke-width:1.8}
-.drawing-overlay .drawing-zone-preview{fill:#4ca9c733;stroke:#83d2e8;stroke-width:1.5;stroke-dasharray:5 3}
 .drawing-overlay .drawing-zone-handle{fill:#b7e5ef;stroke:#18313a;stroke-width:1.2;cursor:move}
 .drawing-overlay .drawing-zone-hit{cursor:move}
 .price-line-overlay.drawing-disabled,.price-line-overlay.drawing-disabled *{pointer-events:none!important}

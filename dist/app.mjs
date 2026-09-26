@@ -1,7 +1,7 @@
 import {createChart, CandlestickSeries, HistogramSeries, LineSeries, CrosshairMode, ColorType} from './vendor/charts.mjs';
 import {INITIAL, FEE, SLIP, MAINTENANCE_MARGIN_RATE, BASE, WARMUP, createSession, validateSession, ensureEvidenceBaseline, aggregateReplay, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, manualClosePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, maxNotional, positionLiquidationPrice, estimateOrderRisk, metrics} from './engine.mjs';
 import {nextMinute} from './minute-data.mjs';
-import {createDrawingTools, projectDrawing} from './drawings.mjs';
+import {createDrawingTools, projectDrawing, resolveDrawingPalette} from './drawings.mjs';
 import {createReviewRecorder, reviewStateProjection} from './review-recorder.mjs';
 import {appendPlanVersion, createPlanVersion, executionStageSnapshots, findClosedTradeForPosition, modificationEvidence} from './review-plans.mjs';
 import {buildReviewExport} from './review-export.mjs';
@@ -51,6 +51,7 @@ let reasonResumePlayback = false;
 let drawingTools = null;
 let activeDrawingTool = null;
 let selectedDrawingId = null;
+let drawingColorPopoverOpen = false;
 let drawingAuditSnapshot = null;
 let chart, candleSeries, maSeries, ma10Series, volumeSeries, resizeObserver;
 const reviewRecorder=createReviewRecorder();
@@ -192,12 +193,13 @@ function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
     const plotWidth=chart.timeScale().width(),bars=disclosedBars();
     for(const drawing of active.drawings||[]){
       const projected=projectDrawing(drawing,bars,active.tf);if(!projected)continue;
-      ctx.beginPath();ctx.strokeStyle=drawing.type==='horizontal'?'#65a5ef':'#e6ba69';ctx.lineWidth=1.2;ctx.setLineDash(drawing.type==='horizontal'?[]:[5,4]);
+      const palette=resolveDrawingPalette(drawing.type,drawing.colorPreset);
+      ctx.beginPath();ctx.strokeStyle=drawing.type==='horizontal'?palette.line:'#e6ba69';ctx.lineWidth=1.2;ctx.setLineDash(drawing.type==='horizontal'?[]:[5,4]);
       if(drawing.type==='horizontal'){
         const y=candleSeries.priceToCoordinate(projected.anchor.price);if(Number.isFinite(y)){ctx.moveTo(0,y);ctx.lineTo(plotWidth,y);ctx.stroke();}
       }else if(drawing.type==='zone'){
         const x1=chart.timeScale().logicalToCoordinate(projected.start.logical),y1=candleSeries.priceToCoordinate(projected.start.price),x2=chart.timeScale().logicalToCoordinate(projected.end.logical),y2=candleSeries.priceToCoordinate(projected.end.price);
-        if([x1,y1,x2,y2].every(Number.isFinite)){const x=Math.min(x1,x2),y=Math.min(y1,y2),width=Math.abs(x2-x1),height=Math.abs(y2-y1);ctx.fillStyle='#4ca9c733';ctx.fillRect(x,y,width,height);ctx.strokeStyle='#83d2e8';ctx.setLineDash([]);ctx.strokeRect(x,y,width,height);}
+        if([x1,y1,x2,y2].every(Number.isFinite)){const x=Math.min(x1,x2),y=Math.min(y1,y2),width=Math.abs(x2-x1),height=Math.abs(y2-y1);ctx.fillStyle=palette.selectedFill;ctx.fillRect(x,y,width,height);ctx.strokeStyle=palette.border;ctx.setLineDash([]);ctx.strokeRect(x,y,width,height);}
       }else{
         const x1=chart.timeScale().logicalToCoordinate(projected.start.logical),y1=candleSeries.priceToCoordinate(projected.start.price),x2=chart.timeScale().logicalToCoordinate(projected.end.logical),y2=candleSeries.priceToCoordinate(projected.end.price);
         if([x1,y1,x2,y2].every(Number.isFinite)){ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();}
@@ -452,6 +454,23 @@ function syncDrawingControls(){
     const button=$(id);if(!button)continue;const selected=activeDrawingTool===tool;button.classList.toggle('active',selected);button.setAttribute('aria-pressed',String(selected));button.disabled=locked;
   }
   const del=$('drawing-delete');if(del){del.disabled=locked||!selectedDrawingId;del.setAttribute('aria-disabled',String(del.disabled));}
+  const selected=drawingTools?.getSelectedDrawing?.(),colorable=!!selected&&['horizontal','zone'].includes(selected.type);
+  const colorButton=$('drawing-color'),popover=$('drawing-color-popover'),sample=$('drawing-color-sample');
+  if(!colorable||locked)closeDrawingColorPopover();
+  if(colorButton){colorButton.disabled=locked||!colorable;colorButton.setAttribute('aria-disabled',String(colorButton.disabled));colorButton.setAttribute('aria-expanded',String(drawingColorPopoverOpen));}
+  if(popover){popover.hidden=!drawingColorPopoverOpen;for(const button of popover.querySelectorAll('[data-drawing-color-preset]')){
+    const chosen=colorable&&button.dataset.drawingColorPreset===selected.colorPreset;button.setAttribute('aria-pressed',String(chosen));button.classList.toggle('selected',chosen);
+  }}
+  if(sample)sample.style.backgroundColor=colorable?resolveDrawingPalette(selected.type,selected.colorPreset).line:'#69aebd';
+}
+function closeDrawingColorPopover(){
+  drawingColorPopoverOpen=false;const popover=$('drawing-color-popover'),button=$('drawing-color');
+  if(popover)popover.hidden=true;if(button)button.setAttribute('aria-expanded','false');
+}
+function toggleDrawingColorPopover(){
+  const selected=drawingTools?.getSelectedDrawing?.();
+  if(!selected||!['horizontal','zone'].includes(selected.type)||pendingOrderRequest||transitionPending)return;
+  drawingColorPopoverOpen=!drawingColorPopoverOpen;syncDrawingControls();
 }
 function chooseDrawingTool(tool){
   if(pendingOrderRequest||transitionPending)return;
@@ -1205,6 +1224,12 @@ function wireEvents(){
   document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>$(button.dataset.close).close()));
   document.querySelectorAll('[data-tf]').forEach(button=>button.addEventListener('click',()=>{if(!active||transitionPending)return;active.tf=Number(button.dataset.tf);render(true);persist();}));
   $('drawing-select').addEventListener('click',()=>chooseDrawingTool(null));$('drawing-horizontal').addEventListener('click',()=>chooseDrawingTool('horizontal'));$('drawing-trendline').addEventListener('click',()=>chooseDrawingTool('trendline'));$('drawing-zone').addEventListener('click',()=>chooseDrawingTool('zone'));$('drawing-delete').addEventListener('click',deleteSelectedDrawing);
+  $('drawing-color').addEventListener('click',toggleDrawingColorPopover);
+  $('drawing-color-popover').querySelectorAll('[data-drawing-color-preset]').forEach(button=>button.addEventListener('click',()=>{
+    if(drawingTools?.setSelectedColor(button.dataset.drawingColorPreset)){closeDrawingColorPopover();syncDrawingControls();$('drawing-color').focus();}
+  }));
+  document.addEventListener('pointerdown',event=>{if(drawingColorPopoverOpen&&!event.target.closest?.('.drawing-color-control'))closeDrawingColorPopover();},true);
+  window.addEventListener('keydown',event=>{if(drawingColorPopoverOpen&&event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();closeDrawingColorPopover();$('drawing-color').focus();}},true);
   els.ma.addEventListener('change',()=>{if(active){const enabled=els.ma.checked;active.ma=enabled;if(maDataKey!==maSignature()){maSeries.setData(computeMa(disclosedBars()));maDataKey=maSignature();}maSeries.applyOptions({visible:active.ma});render();persist();}});
   els.ma10.addEventListener('change',()=>{if(active){const enabled=els.ma10.checked;active.ma10=enabled;if(ma10DataKey!==maSignature()){ma10Series.setData(computeMa(disclosedBars(),10));ma10DataKey=maSignature();}ma10Series.applyOptions({visible:active.ma10});render();persist();}});
   els.volume.addEventListener('change',()=>{if(active){active.volume=els.volume.checked;volumeSeries.applyOptions({visible:active.volume});render();persist({kind:'view-setting'});}});
