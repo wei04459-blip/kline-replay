@@ -325,13 +325,68 @@ function initialRiskFields(side, entry, qty, stop) {
   return {initialStop: stop ?? null, initialTake: null, initialRiskR0: r0};
 }
 
-function estimatePlannedRisk(side, notional, entry, stop) {
-  if (stop === null || ![side, notional, entry, stop].every(Number.isFinite) || notional <= 0 || entry <= 0 ||
-      (side === 1 ? stop >= entry : stop <= entry)) return null;
+function activeModelConfig(session) {
+  return (session?.modelConfigs ?? []).find(config => config?.modelConfigId === session?.modelConfigId) ?? null;
+}
+
+function riskRates(modelConfig) {
+  const feeOpenRate = modelConfig?.fee?.openRate ?? FEE;
+  const feeCloseRate = modelConfig?.fee?.closeRate ?? FEE;
+  const slippageRate = modelConfig?.slippage?.rate ?? SLIP;
+  if (![feeOpenRate, feeCloseRate, slippageRate].every(value => Number.isFinite(value) && value >= 0))
+    throw new Error('冻结交易成本模型无效');
+  return {feeOpenRate, feeCloseRate, slippageRate};
+}
+
+function limitFillAtCurrentPrice(side, currentPrice, limitPrice, slippageRate) {
+  const slipped = currentPrice * (1 + side * slippageRate);
+  return side === 1 ? Math.min(limitPrice, slipped) : Math.max(limitPrice, slipped);
+}
+
+function riskAtEntry({side, notional, entry, stop, take, basis, modelConfig = null, referencePrice = entry}) {
+  const {feeOpenRate, feeCloseRate, slippageRate} = riskRates(modelConfig);
   const qty = notional / entry;
-  const adverseExit = stop * (1 - side * SLIP);
-  const grossLoss = Math.max(0, (entry - adverseExit) * qty * side);
-  return grossLoss + notional * FEE + adverseExit * qty * FEE;
+  const entryFee = notional * feeOpenRate;
+  const stopExitPrice = stop === null ? null : stop * (1 - side * slippageRate);
+  const grossStopLoss = stop === null ? null : Math.max(0, (entry - stopExitPrice) * qty * side);
+  const netStopRisk = stop === null ? null : grossStopLoss + entryFee + stopExitPrice * qty * feeCloseRate;
+  const takeExitPrice = take === null ? null : take * (1 - side * slippageRate);
+  const expectedTakeProfitNet = take === null ? null
+    : (takeExitPrice - entry) * qty * side - entryFee - takeExitPrice * qty * feeCloseRate;
+  const priceRisk = stop === null ? null : qty * Math.abs(entry - stop);
+  const netRewardRisk = netStopRisk > 0 && expectedTakeProfitNet !== null ? expectedTakeProfitNet / netStopRisk : null;
+  return {riskCalculationVersion: 'net-stop-risk-v1', basis, referencePrice, estimatedEntryPrice: entry,
+    estimatedQty: qty, priceRisk, priceRiskUnavailableReason: stop === null ? '未设置止损，价格差风险不可计算。' : null,
+    netStopRisk, netStopRiskUnavailableReason: stop === null ? '未设置止损，预计净止损风险不可计算。' : null,
+    // Compatibility alias: this has always been the plan's monetary stop-risk field.
+    plannedRiskIncludingCosts: netStopRisk,
+    expectedTakeProfitNet, expectedTakeProfitNetUnavailableReason: take === null ? '未设置止盈，预计净止盈收益不可计算。' : null,
+    netRewardRisk, netRewardRiskUnavailableReason: stop === null ? '未设置止损，净盈亏比不可计算。'
+      : take === null ? '未设置止盈，净盈亏比不可计算。' : netStopRisk <= 0 ? '预计净止损风险不是正数，净盈亏比不可计算。' : null,
+    costModel: {feeOpenRate, feeCloseRate, slippageRate, feeBasis: 'executed-notional', slippageRule: 'adverse-proportional',
+      modelConfigId: modelConfig?.modelConfigId ?? null, engineVersion: modelConfig?.engineVersion ?? ENGINE_VERSION,
+      executionConfigMatchesRuntime: feeOpenRate === FEE && feeCloseRate === FEE && slippageRate === SLIP}};
+}
+
+/** Estimate a stop/target envelope using the same entry, exit, fee, and slippage rules as fills. */
+export function estimateOrderRisk({side, notional, currentPrice, entryPrice = currentPrice, stop = null, take = null,
+  orderType = 'market', modelConfig = null} = {}) {
+  if (![1, -1].includes(side) || !Number.isFinite(notional) || notional <= 0 ||
+      !Number.isFinite(currentPrice) || currentPrice <= 0 || !optionalPrice(stop) || !optionalPrice(take) ||
+      !['market', 'limit'].includes(orderType) || (orderType === 'limit' && (!Number.isFinite(entryPrice) || entryPrice <= 0)))
+    throw new Error('风险估算输入无效');
+  const {slippageRate} = riskRates(modelConfig);
+  let estimatedEntryPrice, basis;
+  if (orderType === 'market') {
+    estimatedEntryPrice = currentPrice * (1 + side * slippageRate);
+    basis = 'market-expected-adverse-fill';
+  } else {
+    const marketable = side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice;
+    estimatedEntryPrice = marketable
+      ? limitFillAtCurrentPrice(side, currentPrice, entryPrice, slippageRate) : entryPrice;
+    basis = marketable ? 'marketable-limit-capped-fill' : 'limit-price-scenario';
+  }
+  return riskAtEntry({side, notional, entry: estimatedEntryPrice, stop, take, basis, modelConfig, referencePrice: orderType === 'market' ? currentPrice : entryPrice});
 }
 
 function addEntryFill(session, {orderId, position, price, index, time, executionType}) {
@@ -788,13 +843,12 @@ export function openPosition(s, data, side, notional, stopPct, takePct, entryRea
     return s.position;
   }
   const orderId = crypto.randomUUID();
+  const orderRisk = estimateOrderRisk({side, notional, currentPrice, stop, take, orderType: 'market', modelConfig: activeModelConfig(s)});
   const order = {id: orderId, modelConfigId: s.modelConfigId ?? null, engineVersion: s.activeEngineVersion ?? s.engineVersion ?? null,
     type: 'market', side, notional, entryPrice: currentPrice, stop, take,
     placedIndex: index, placedTime: time, entryReason: normalizedReason, ...meta,
     riskBudget: {lossBudget: meta.lossBudget, basis: 'user-entered-currency-amount', status: meta.lossBudget == null ? 'not-provided' : 'provided'},
-    pretradeRisk: {reference: 'market-close-estimate', referencePrice: currentPrice, stop,
-      priceRisk: stop === null ? null : notional / entry * Math.abs(entry - stop),
-      plannedRiskIncludingCosts: estimatePlannedRisk(side, notional, entry, stop), margin: marginFor(notional, leverage), leverage},
+    pretradeRisk: {...orderRisk, reference: 'market-close-estimate', stop, margin: marginFor(notional, leverage), leverage},
     ...withMargin(notional, leverage, currentPrice, side)};
   s.orders ??= []; s.orders.push(order);
   const position = positionAtPrice(s, data, side, notional, entry, stop, take, index, orderId, normalizedReason, time, leverage, ISOLATED_MARGIN_MODE, meta, 'market-close');
@@ -826,9 +880,9 @@ function positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePric
     ...initialRiskFields(side, fillPrice, qty, stopPrice),
     initialTake: takePrice ?? null,
     riskBudget: {lossBudget: metadata.lossBudget ?? null, basis: 'user-entered-currency-amount', status: metadata.lossBudget == null ? 'not-provided' : 'provided'},
-    pretradeRisk: {reference: 'actual-fill', referencePrice: fillPrice, stop: stopPrice ?? null,
-      priceRisk: stopPrice === null ? null : qty * Math.abs(fillPrice - stopPrice),
-      plannedRiskIncludingCosts: estimatePlannedRisk(side, notional, fillPrice, stopPrice), margin: marginFor(notional, leverage), leverage}};
+    pretradeRisk: {...riskAtEntry({side, notional, entry: fillPrice, stop: stopPrice, take: takePrice,
+      basis: 'actual-fill', modelConfig: activeModelConfig(s), referencePrice: fillPrice}),
+      reference: 'actual-fill', stop: stopPrice ?? null, margin: marginFor(notional, leverage), leverage}};
   if (entryReason !== undefined) position.entryReason = entryReason;
   s.position = position;
   s.balance -= entryFee;
@@ -862,19 +916,19 @@ export function placeOrder(s, data, side, notional, entryPrice, stopPrice, takeP
   const currentPrice = replayPrice(s, data), eventIndex = visibleUpperIndex(s, data), eventTime = replayTime(s, data);
   const planPrice = orderType === 'market' ? currentPrice : entryPrice;
   validateOrderPlan(s, side, notional, planPrice, stopPrice, takePrice, leverage);
+  const marketableLimit = orderType === 'limit' && (side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice);
+  const orderRisk = estimateOrderRisk({side, notional, currentPrice, entryPrice: planPrice, stop: stopPrice, take: takePrice,
+    orderType, modelConfig: activeModelConfig(s)});
   const orderId = crypto.randomUUID();
   const order = {id: orderId, modelConfigId: s.modelConfigId ?? null, engineVersion: s.activeEngineVersion ?? s.engineVersion ?? null,
     type: orderType, side, notional, entryPrice: planPrice, stop: stopPrice, take: takePrice,
     placedIndex: eventIndex, placedTime: eventTime, entryReason: normalizedReason, ...meta,
     riskBudget: {lossBudget: meta.lossBudget, basis: 'user-entered-currency-amount', status: meta.lossBudget == null ? 'not-provided' : 'provided'},
-    pretradeRisk: {reference: orderType === 'market' ? 'market-close-estimate' : 'limit-price-plan', referencePrice: planPrice,
-      priceRisk: stopPrice === null ? null : notional / planPrice * Math.abs(planPrice - stopPrice),
-      plannedRiskIncludingCosts: estimatePlannedRisk(side, notional, planPrice, stopPrice), margin: marginFor(notional, leverage), leverage},
+    pretradeRisk: {...orderRisk, reference: orderType === 'market' ? 'market-close-estimate' : 'limit-price-plan',
+      referencePrice: planPrice, margin: marginFor(notional, leverage), leverage},
     ...withMargin(notional, leverage, planPrice, side)};
-  const marketableLimit = orderType === 'limit' && (side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice);
   if (orderType === 'market' || marketableLimit) {
-    const slippedMarket = currentPrice * (1 + side * SLIP);
-    const fillPrice = orderType === 'market' ? slippedMarket : side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
+    const fillPrice = orderType === 'market' ? currentPrice * (1 + side * SLIP) : limitFillAtCurrentPrice(side, currentPrice, entryPrice, SLIP);
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
     s.orders ??= []; s.orders.push(order);
     const position = positionAtPrice(s, data, side, notional, fillPrice, stopPrice, takePrice, eventIndex, order.id, normalizedReason, eventTime, leverage, ISOLATED_MARGIN_MODE, meta, orderType === 'limit' ? 'marketable-limit-close' : 'market-close');
@@ -917,13 +971,11 @@ export function updatePendingOrder(s, data, entryPrice, stopPrice, takePrice, me
   const updated = {...s.pending, entryPrice, stop: stopPrice, take: takePrice,
     ...(s.pending.marginMode === ISOLATED_MARGIN_MODE ? withMargin(s.pending.notional, s.pending.leverage, entryPrice, s.pending.side) : {}),
     modifiedIndex: eventIndex, modifiedTime: eventTime,
-    pretradeRisk: {...(s.pending.pretradeRisk ?? {}), reference: 'limit-price-plan', referencePrice: entryPrice,
-      priceRisk: stopPrice === null ? null : s.pending.notional / entryPrice * Math.abs(entryPrice - stopPrice),
-      plannedRiskIncludingCosts: estimatePlannedRisk(s.pending.side, s.pending.notional, entryPrice, stopPrice)}};
+    pretradeRisk: {...estimateOrderRisk({side, notional: s.pending.notional, currentPrice, entryPrice, stop: stopPrice, take: takePrice,
+      orderType: 'limit', modelConfig: activeModelConfig(s)}), reference: 'limit-price-plan', referencePrice: entryPrice}};
   const marketable = side === 1 ? entryPrice >= currentPrice : entryPrice <= currentPrice;
   if (marketable) {
-    const slippedMarket = currentPrice * (1 + side * SLIP);
-    const fillPrice = side === 1 ? Math.min(entryPrice, slippedMarket) : Math.max(entryPrice, slippedMarket);
+    const fillPrice = limitFillAtCurrentPrice(side, currentPrice, entryPrice, SLIP);
     if (!protectionsBracket(side, fillPrice, stopPrice, takePrice)) throw new Error('止损和止盈必须分列在实际成交价两侧');
     s.pending = null;
     if (s.modelConfigId) {

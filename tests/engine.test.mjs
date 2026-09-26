@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, ENGINE_VERSION, ensureEvidenceBaseline, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, ENGINE_VERSION, ensureEvidenceBaseline, estimateOrderRisk, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
 
 const TEST_ENTRY_REASON = '测试入场理由';
 function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
@@ -1477,4 +1477,103 @@ test('invalid evidence metadata rejects entry and protection changes before any 
   assert.throws(() => updateProtection(s, data, 96, 110, {reason: '   '}), /风险修改理由/);
   assert.equal(JSON.stringify(s), active);
   assert.equal(position.initialStop, 95);
+});
+
+test('market net stop-risk includes adverse entry fill and exactly matches frozen two-direction stop settlement', () => {
+  const samples = [
+    {side: -1, quote: 100, notional: 1000, stop: 101, take: 98},
+    {side: 1, quote: 100, notional: 1000, stop: 99, take: null},
+  ];
+  for (const sample of samples) {
+    const quoteScenario = estimateOrderRisk({side: sample.side, notional: sample.notional,
+      currentPrice: sample.quote + (sample.side === 1 ? 1 : -1), entryPrice: sample.quote,
+      stop: sample.stop, take: sample.take, orderType: 'limit'});
+    assert.equal(quoteScenario.basis, 'limit-price-scenario');
+
+    const marketRisk = estimateOrderRisk({side: sample.side, notional: sample.notional,
+      currentPrice: sample.quote, stop: sample.stop, take: sample.take, orderType: 'market'});
+    assert.equal(marketRisk.estimatedEntryPrice, sample.quote * (1 + sample.side * SLIP));
+    assert.ok(marketRisk.netStopRisk > quoteScenario.netStopRisk,
+      'market risk includes the adverse entry slip missing from a quote-anchored estimate');
+    assert.ok(Math.abs(marketRisk.plannedRiskIncludingCosts - marketRisk.netStopRisk) < 1e-8);
+    assert.equal(marketRisk.costModel.feeOpenRate, FEE);
+    assert.equal(marketRisk.costModel.feeCloseRate, FEE);
+    assert.equal(marketRisk.costModel.slippageRate, SLIP);
+    assert.equal(marketRisk.costModel.executionConfigMatchesRuntime, true);
+    assert.equal(marketRisk.riskCalculationVersion, 'net-stop-risk-v1');
+
+    const data = [[0, sample.quote, sample.quote + 1, sample.quote - 1, sample.quote, 10],
+      [900, sample.quote, sample.quote + 1, sample.quote - 1, sample.quote, 10]];
+    const s = session(data, {end: 1});
+    s.balance = 50000;
+    const opened = enginePlaceOrder(s, data, sample.side, sample.notional, sample.quote, sample.stop, sample.take,
+      'market', TEST_ENTRY_REASON, 1);
+    assert.equal(opened.status, 'filled');
+    assert.equal(opened.position.entry, marketRisk.estimatedEntryPrice);
+    assert.ok(Math.abs(opened.order.pretradeRisk.netStopRisk - marketRisk.netStopRisk) < 1e-8);
+    assert.ok(Math.abs(opened.position.pretradeRisk.netStopRisk - marketRisk.netStopRisk) < 1e-8);
+    assert.equal(opened.position.initialRiskR0, opened.position.qty * Math.abs(opened.position.entry - sample.stop));
+    const trade = closePosition(s, data, sample.stop, 'stop scenario', 0);
+    assert.ok(Math.abs(-trade.pnl - marketRisk.netStopRisk) < 1e-8);
+    assert.ok(Math.abs(trade.initialRiskR0 - opened.position.initialRiskR0) < 1e-8,
+      'standard R0 remains price-only and locked to actual fill');
+  }
+});
+
+test('marketable limit risk uses the same limit-capped fill price and preserves negative net target estimates', () => {
+  const cases = [
+    {side: 1, quote: 100, limit: 100.01, stop: 98, take: 100.025, expected: 100.01},
+    {side: -1, quote: 100, limit: 99.99, stop: 102, take: 99.98, expected: 99.99},
+  ];
+  for (const sample of cases) {
+    const estimate = estimateOrderRisk({side: sample.side, notional: 1000, currentPrice: sample.quote,
+      entryPrice: sample.limit, stop: sample.stop, take: sample.take, orderType: 'limit'});
+    assert.equal(estimate.basis, 'marketable-limit-capped-fill');
+    assert.equal(estimate.estimatedEntryPrice, sample.expected);
+    assert.ok(estimate.expectedTakeProfitNet < 0, 'a target that does not cover costs remains a negative estimate');
+    const data = [[0, sample.quote, sample.quote + 1, sample.quote - 1, sample.quote, 10],
+      [900, sample.quote, sample.quote + 1, sample.quote - 1, sample.quote, 10]];
+    const opened = enginePlaceOrder(session(data, {end: 1}), data, sample.side, 1000, sample.limit, sample.stop, sample.take,
+      'limit', TEST_ENTRY_REASON, 1);
+    assert.equal(opened.status, 'filled');
+    assert.equal(opened.position.entry, sample.expected);
+    assert.deepEqual(opened.position.pretradeRisk.netStopRisk, estimate.netStopRisk);
+    assert.deepEqual(opened.order.pretradeRisk.expectedTakeProfitNet, estimate.expectedTakeProfitNet);
+  }
+});
+
+test('ordinary pending limits estimate the exact limit-price scenario and update the envelope on edit', () => {
+  const data = bars(5), s = session(data, {end: 4});
+  const placed = enginePlaceOrder(s, data, 1, 1000, 98, 95, 101, 'limit', TEST_ENTRY_REASON, 1);
+  assert.equal(placed.status, 'pending');
+  assert.equal(placed.order.pretradeRisk.basis, 'limit-price-scenario');
+  assert.equal(placed.order.pretradeRisk.estimatedEntryPrice, 98);
+  const edited = updatePendingOrder(s, data, 97.5, 94, 101, {});
+  assert.equal(edited.status, 'pending');
+  assert.equal(edited.order.pretradeRisk.basis, 'limit-price-scenario');
+  assert.equal(edited.order.pretradeRisk.estimatedEntryPrice, 97.5);
+  assert.equal(edited.order.pretradeRisk.netStopRisk, edited.order.pretradeRisk.plannedRiskIncludingCosts);
+});
+
+test('risk envelope keeps disabled protections unknown and records whether net target beats costs', () => {
+  const stopOnly = estimateOrderRisk({side: 1, notional: 1000, currentPrice: 100, stop: 98, take: null});
+  assert.ok(Number.isFinite(stopOnly.netStopRisk));
+  assert.equal(stopOnly.expectedTakeProfitNet, null);
+  assert.match(stopOnly.expectedTakeProfitNetUnavailableReason, /未设置止盈/);
+  assert.equal(stopOnly.netRewardRisk, null);
+  assert.match(stopOnly.netRewardRiskUnavailableReason, /未设置止盈/);
+
+  const takeOnly = estimateOrderRisk({side: -1, notional: 1000, currentPrice: 100, stop: null, take: 98});
+  assert.equal(takeOnly.priceRisk, null);
+  assert.equal(takeOnly.netStopRisk, null);
+  assert.equal(takeOnly.plannedRiskIncludingCosts, null);
+  assert.match(takeOnly.netStopRiskUnavailableReason, /未设置止损/);
+  assert.ok(Number.isFinite(takeOnly.expectedTakeProfitNet));
+  assert.equal(takeOnly.netRewardRisk, null);
+
+  const unprotected = estimateOrderRisk({side: 1, notional: 1000, currentPrice: 100, stop: null, take: null});
+  assert.equal(unprotected.netStopRisk, null);
+  assert.equal(unprotected.expectedTakeProfitNet, null);
+  assert.equal(unprotected.netRewardRisk, null);
+  assert.match(unprotected.priceRiskUnavailableReason, /未设置止损/);
 });

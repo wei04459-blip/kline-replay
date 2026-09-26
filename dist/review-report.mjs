@@ -1,4 +1,5 @@
 import {buildReviewSummary, formatReviewSummary} from './review-summary.mjs';
+import {estimateOrderRisk} from './engine.mjs';
 
 const BASE_SECONDS = 60;
 const DEFAULT_CONTEXT_INTERVAL = 900;
@@ -197,6 +198,65 @@ function tradeModelEvidence(session, trade) {
     return {feeRate: null, slippageRate: null, modelConfigId: config.modelConfigId, status: '成交早于模型配置生效时间'};
   return {...rates, status: '按成交关联模型配置'};
 }
+function pretradeRiskEvidence(session, trade, modelEvidence) {
+  const orderId = tradeOrderId(trade);
+  const order = [...(Array.isArray(session?.orders) ? session.orders : []),
+    ...(Array.isArray(session?.orderHistory) ? session.orderHistory : [])].find(item => item?.id === orderId || item?.orderId === orderId) ?? null;
+  const plan = (Array.isArray(session?.reviewPlans) ? session.reviewPlans : []).find(item =>
+    item?.orderId === orderId || item?.tradeId === trade?.id) ?? null;
+  const recorded = order?.pretradeRisk ?? trade?.pretradeRisk ?? null;
+  const budget = numberOrNull(order?.riskBudget?.lossBudget ?? trade?.riskBudget?.lossBudget ?? plan?.risk?.lossBudget);
+  if (recorded?.riskCalculationVersion === 'net-stop-risk-v1') {
+    return {source: 'recorded-at-order-time', basis: recorded.basis ?? null,
+      riskCalculationVersion: recorded.riskCalculationVersion, priceRisk: numberOrNull(recorded.priceRisk),
+      netStopRisk: numberOrNull(recorded.netStopRisk), netStopRiskUnavailableReason: recorded.netStopRiskUnavailableReason ?? null,
+      expectedTakeProfitNet: numberOrNull(recorded.expectedTakeProfitNet),
+      expectedTakeProfitNetUnavailableReason: recorded.expectedTakeProfitNetUnavailableReason ?? null,
+      netRewardRisk: numberOrNull(recorded.netRewardRisk), netRewardRiskUnavailableReason: recorded.netRewardRiskUnavailableReason ?? null,
+      referencePrice: numberOrNull(recorded.referencePrice), estimatedEntryPrice: numberOrNull(recorded.estimatedEntryPrice),
+      estimatedQty: numberOrNull(recorded.estimatedQty), costModel: recorded.costModel ?? null,
+      legacyRecordedPlannedRiskIncludingCosts: numberOrNull(recorded.plannedRiskIncludingCosts), lossBudget: budget,
+      lossBudgetSource: budget === null ? 'not-provided' : order?.riskBudget?.lossBudget != null ? 'order-user-entry' : 'plan-user-entry'};
+  }
+  const configId = trade?.modelConfigId ?? order?.modelConfigId ?? null;
+  const config = modelConfigFor(session, configId);
+  const effective = asEpoch(config?.effectiveFrom?.replayMarketTime);
+  const entryTime = asEpoch(trade?.entryTime);
+  const modelApplies = config && entryTime !== null && (effective === null || entryTime >= effective) &&
+    modelEvidence?.status === '按成交关联模型配置';
+  let recomputed = null, unavailableReason = null;
+  if (modelApplies) {
+    const currentPrice = numberOrNull(recorded?.referencePrice ?? order?.referencePrice ?? order?.pretradeRisk?.referencePrice);
+    const notional = numberOrNull(order?.notional ?? trade?.notional ?? (finite(trade?.entry) && finite(trade?.qty) ? trade.entry * trade.qty : null));
+    const side = order?.side ?? trade?.side;
+    const orderType = order?.type === 'limit' ? 'limit' : 'market';
+    const entryPrice = numberOrNull(order?.entryPrice ?? trade?.entry ?? currentPrice);
+    const stop = Object.hasOwn(recorded ?? {}, 'stop') ? numberOrNull(recorded.stop)
+      : Object.hasOwn(order ?? {}, 'stop') ? numberOrNull(order.stop)
+        : Object.hasOwn(plan?.risk ?? {}, 'initialStop') ? numberOrNull(plan.risk.initialStop) : numberOrNull(trade?.initialStop);
+    const take = Object.hasOwn(recorded ?? {}, 'take') ? numberOrNull(recorded.take)
+      : Object.hasOwn(order ?? {}, 'take') ? numberOrNull(order.take)
+        : Object.hasOwn(plan?.risk ?? {}, 'initialTake') ? numberOrNull(plan.risk.initialTake) : numberOrNull(trade?.initialTake);
+    try {
+      if (currentPrice === null || notional === null) throw new Error('缺少订单参考价格或名义金额');
+      recomputed = estimateOrderRisk({side, notional, currentPrice, entryPrice, stop, take, orderType, modelConfig: config});
+    } catch (error) { unavailableReason = error instanceof Error ? error.message : '风险估算输入无效'; }
+  } else unavailableReason = config ? '成交时点无法证明该冻结模型配置适用' : '旧订单缺少可验证的冻结成本模型';
+  return {source: recomputed ? 'recomputed-frozen-config' : 'unavailable', basis: recomputed?.basis ?? recorded?.basis ?? null,
+    riskCalculationVersion: recomputed?.riskCalculationVersion ?? null,
+    priceRisk: numberOrNull(recomputed?.priceRisk), netStopRisk: numberOrNull(recomputed?.netStopRisk),
+    netStopRiskUnavailableReason: recomputed?.netStopRiskUnavailableReason ?? (recomputed ? null : unavailableReason),
+    expectedTakeProfitNet: numberOrNull(recomputed?.expectedTakeProfitNet),
+    expectedTakeProfitNetUnavailableReason: recomputed?.expectedTakeProfitNetUnavailableReason ?? (recomputed ? null : unavailableReason),
+    netRewardRisk: numberOrNull(recomputed?.netRewardRisk),
+    netRewardRiskUnavailableReason: recomputed?.netRewardRiskUnavailableReason ?? (recomputed ? null : unavailableReason),
+    referencePrice: numberOrNull(recomputed?.referencePrice ?? recorded?.referencePrice),
+    estimatedEntryPrice: numberOrNull(recomputed?.estimatedEntryPrice ?? recorded?.estimatedEntryPrice),
+    estimatedQty: numberOrNull(recomputed?.estimatedQty ?? recorded?.estimatedQty), costModel: recomputed?.costModel ?? recorded?.costModel ?? null,
+    legacyRecordedPlannedRiskIncludingCosts: numberOrNull(recorded?.plannedRiskIncludingCosts), lossBudget: budget,
+    lossBudgetSource: budget === null ? 'not-provided' : order?.riskBudget?.lossBudget != null ? 'order-user-entry' : 'plan-user-entry',
+    unavailableReason};
+}
 function modelEvidence(record, payload) {
   const session = record?.session || {};
   const local = record?.modelEvidence ?? record?.session?.modelEvidence;
@@ -368,31 +428,42 @@ function accountLedgerReconciliation(session, cutoff) {
   const rows = Array.isArray(session.ledger) ? session.ledger : [];
   if (!rows.length) return {available: false, balanced: null, rowCount: 0, balanceDelta: null, feeDelta: null,
     reason: '旧记录没有追加式账户账本；仅保留会话余额快照。'};
+  const missingTimeRows = rows.filter(row => asEpoch(row.visibleThrough ?? row.replayMarketTime) === null).length;
   const visible = rows.filter(row => {
     const time = asEpoch(row.visibleThrough ?? row.replayMarketTime);
-    return cutoff === null || time === null || time <= cutoff;
+    return time !== null && (cutoff === null || time <= cutoff);
   }).sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
   if (!visible.length) return {available: true, balanced: false, rowCount: 0, balanceDelta: null, feeDelta: null,
-    reason: '没有账本行可证明处于本次披露边界内。'};
-  let balanced = true, reason = null;
-  const first = visible[0];
-  if (finite(first.baselineBalance) && finite(first.cashDelta) && finite(first.balanceAfter)) {
+    reason: missingTimeRows ? `${missingTimeRows}条账本记录缺少可验证时间，已排除；没有账本行可证明处于本次披露边界内。` : '没有账本行可证明处于本次披露边界内。'};
+  const legacyBaseline = visible.find(row => row.type === 'legacy-baseline' || row.legacyHistoryUnknown === true) ?? null;
+  const segmentStart = legacyBaseline ? visible.indexOf(legacyBaseline) : 0;
+  const segmentRows = visible.slice(segmentStart);
+  let balanced = missingTimeRows === 0, reason = missingTimeRows ? `${missingTimeRows}条账本记录缺少可验证时间，已排除且不能确认对账完整` : null;
+  const first = segmentRows[0];
+  if (legacyBaseline) {
+    if (!finite(first.balanceAfter)) { balanced = false; reason = '旧记录升级基线缺少余额快照'; }
+    if (first.baselineBalance !== undefined || first.cashDelta !== undefined) {
+      if (!finite(first.baselineBalance) || !finite(first.cashDelta) ||
+          Math.abs(first.baselineBalance + first.cashDelta - first.balanceAfter) > 0.02) {
+        balanced = false; reason = '旧记录升级基线提供的余额与cashDelta不恒等';
+      }
+    }
+  } else if (finite(first.baselineBalance) && finite(first.cashDelta) && finite(first.balanceAfter)) {
     if (Math.abs(first.baselineBalance + first.cashDelta - first.balanceAfter) > 0.02) {
       balanced = false; reason = '首行基线余额与cashDelta不恒等';
     }
   } else if (visible.length === rows.length) {
     balanced = false; reason = '首行缺少可核验的账户基线';
   }
-  for (let i = 1; i < visible.length; i += 1) {
-    if (!finite(visible[i].balanceAfter) || !finite(visible[i - 1].balanceAfter) || !finite(visible[i].cashDelta) ||
-        Math.abs(visible[i].balanceAfter - visible[i - 1].balanceAfter - visible[i].cashDelta) > 0.02) {
+  for (let i = 1; i < segmentRows.length; i += 1) {
+    if (!finite(segmentRows[i].balanceAfter) || !finite(segmentRows[i - 1].balanceAfter) || !finite(segmentRows[i].cashDelta) ||
+        Math.abs(segmentRows[i].balanceAfter - segmentRows[i - 1].balanceAfter - segmentRows[i].cashDelta) > 0.02) {
       balanced = false; reason = '账本相邻余额与cashDelta不恒等'; break;
     }
   }
-  const knownFees = visible.reduce((sum, row) => sum + (finite(row.fee) ? row.fee : 0), 0);
-  const fillIds = new Set(visible.map(row => row.fillId).filter(Boolean));
-  const fills = (Array.isArray(session.fills) ? session.fills : []).filter(fill => fillIds.has(fill.id) ||
-    asEpoch(fill.time) !== null && (cutoff === null || asEpoch(fill.time) <= cutoff));
+  const knownFees = segmentRows.reduce((sum, row) => sum + (finite(row.fee) ? row.fee : 0), 0);
+  const fillIds = new Set(segmentRows.map(row => row.fillId).filter(Boolean));
+  const fills = (Array.isArray(session.fills) ? session.fills : []).filter(fill => fillIds.has(fill.id));
   const fillFeesKnown = fills.length > 0 && fills.every(fill => finite(fill.fee));
   const feeDelta = fillFeesKnown ? knownFees - fills.reduce((sum, fill) => sum + fill.fee, 0) : null;
   if (finite(feeDelta) && Math.abs(feeDelta) > 0.02) { balanced = false; reason = '账本手续费与已披露成交费用不一致'; }
@@ -401,7 +472,14 @@ function accountLedgerReconciliation(session, cutoff) {
     balanceDelta = visible.at(-1).balanceAfter - session.balance;
     if (Math.abs(balanceDelta) > 0.02) { balanced = false; reason = '末行账本余额与会话钱包余额不一致'; }
   }
-  return {available: true, balanced, rowCount: visible.length, balanceAfter: numberOrNull(visible.at(-1)?.balanceAfter),
+  const startBalance = finite(first?.baselineBalance) ? first.baselineBalance : numberOrNull(first?.balanceAfter);
+  const endBalance = numberOrNull(segmentRows.at(-1)?.balanceAfter);
+  return {available: true, balanced, fullHistoryVerified: !legacyBaseline && finite(session.initialBalance),
+    segment: legacyBaseline ? {type: 'post-legacy-baseline', openingBalance: startBalance, endingBalance: endBalance,
+      netChange: finite(startBalance) && finite(endBalance) ? endBalance - startBalance : null,
+      startReplayMarketTime: asEpoch(legacyBaseline.visibleThrough ?? legacyBaseline.replayMarketTime),
+      priorHistory: 'unknown; not included in this ledger segment'} : null,
+    rowCount: segmentRows.length, totalVisibleRows: visible.length, balanceAfter: endBalance,
     balanceDelta, feeDelta, futureLedgerRowsExcluded: rows.length - visible.length, reason};
 }
 function isolatedPnlAt(trade, rawPrice, feeRate, slippage) {
@@ -535,6 +613,10 @@ function buildMinuteEquity(trades, openPosition, accountBalance, minuteIndex, cu
   const firstMinute = Number.isFinite(replayFrom) ? Math.ceil(replayFrom / BASE_SECONDS) * BASE_SECONDS : null;
   const expectedMinuteCount = firstMinute === null || cutoff <= firstMinute ? 0 : Math.max(0, Math.floor((cutoff - firstMinute) / BASE_SECONDS));
   const coveredRows = minuteIndex.candles.filter(row => row[0] >= firstMinute && row[0] + BASE_SECONDS <= cutoff && row[0] < cutoff);
+  if (expectedMinuteCount === 0 || coveredRows.length === 0) return {available: false, points: [], maxDrawdown: null,
+    maxDrawdownPct: null, peak: null, trough: null, peakForPct: null, troughForPct: null,
+    expectedMinuteCount, coveredMinuteCount: coveredRows.length, missingMinuteCount: expectedMinuteCount,
+    reason: '没有可用于采样回撤的完整分钟行情；不以零采样点报告零回撤'};
   let contiguous = coveredRows.length === expectedMinuteCount;
   if (contiguous) for (let i = 0; i < coveredRows.length; i += 1) if (coveredRows[i][0] !== firstMinute + i * BASE_SECONDS) { contiguous = false; break; }
   const missingMinuteCount = Math.max(0, expectedMinuteCount - coveredRows.length);
@@ -572,10 +654,7 @@ function metricsForSession(record, minuteIndex, cutoff, payload) {
   const breakeven = trades.filter(item => finite(item.pnl) && item.pnl === 0).length;
   const grossWins = trades.reduce((sum, item) => sum + (finite(item.pnl) && item.pnl > 0 ? item.pnl : 0), 0);
   const grossLosses = trades.reduce((sum, item) => sum + (finite(item.pnl) && item.pnl < 0 ? -item.pnl : 0), 0);
-  const initialBalance = numberOrNull(session.initialBalance) ??
-    (excludedFutureTrades === 0 && !hiddenFuturePosition && !hiddenFuturePending && finite(session.balance) && netPnl !== null
-      ? session.balance - netPnl + (finite(visiblePosition?.entryFee) ? visiblePosition.entryFee : 0)
-      : numberOrNull(payload?.source?.initialBalance));
+  const initialBalance = numberOrNull(session.initialBalance);
   const feeForReport = feeRate;
   const slipForReport = slippage;
   const visibleCount = visibleMinuteCount(minuteIndex, cutoff);
@@ -589,7 +668,17 @@ function metricsForSession(record, minuteIndex, cutoff, payload) {
     (tradeEntryTimes.length ? Math.min(...tradeEntryTimes) : asEpoch(visiblePosition?.entryTime)) ?? asEpoch(record?.coverage?.visibleFrom);
   const replayMinuteCount = replayFrom === null ? visibleMinutes.length : visibleMinutes.filter(row => row[0] >= replayFrom).length;
   const safeBalance = excludedFutureTrades || hiddenFuturePosition || hiddenFuturePending ? null : numberOrNull(session.balance);
-  const equity = buildMinuteEquity(trades, visiblePosition, safeBalance, minuteIndex, cutoff, replayFrom, initialBalance, feeForReport, slipForReport, currentPrice);
+  const legacyLedgerStart = (Array.isArray(session.ledger) ? session.ledger : []).find(row =>
+    row?.type === 'legacy-baseline' || row?.legacyHistoryUnknown === true) ?? null;
+  const historyBoundary = asEpoch(session.modelEvidenceStart?.visibleThrough ?? session.modelEvidenceStart?.replayMarketTime) ??
+    asEpoch(legacyLedgerStart?.visibleThrough ?? legacyLedgerStart?.replayMarketTime);
+  const legacyHistoryUnknown = !!legacyLedgerStart || !!session.modelEvidenceStart?.reason || session.engineVersion === 'legacy-unversioned';
+  const equityStartBalance = legacyHistoryUnknown ? numberOrNull(legacyLedgerStart?.balanceAfter) : initialBalance;
+  const equityTrades = legacyHistoryUnknown && historyBoundary !== null ? trades.filter(trade => asEpoch(trade.entryTime) >= historyBoundary) : trades;
+  const equityReplayFrom = legacyHistoryUnknown && historyBoundary !== null
+    ? Math.max(replayFrom ?? historyBoundary, historyBoundary) : replayFrom;
+  const equity = buildMinuteEquity(equityTrades, visiblePosition, safeBalance, minuteIndex, cutoff, equityReplayFrom,
+    equityStartBalance, feeForReport, slipForReport, currentPrice);
   const perTrade = trades.map((trade, index) => {
     const tradeModel = tradeModelEvidence(session, trade);
     const tradeFeeRate = finite(tradeModel.feeRate) ? tradeModel.feeRate : feeForReport;
@@ -598,6 +687,7 @@ function metricsForSession(record, minuteIndex, cutoff, payload) {
     const riskEvidence = initialEvidence(trade, events, session);
     const risk = riskEvidence?.risk ?? null;
     const snapshot = initialOrderSnapshot(trade, events);
+    const pretradeRisk = pretradeRiskEvidence(session, trade, tradeModel);
     const eventShots = eventScreenshots(record, trade);
     const id = trade.id ?? trade.orderId ?? `legacy-${trade.side ?? 'x'}-${asEpoch(trade.entryTime) ?? trade.entryIndex ?? 'unknown'}-${asEpoch(trade.exitTime) ?? trade.exitIndex ?? 'unknown'}-${index + 1}`;
     const bookTrade = reviewBookTrade(record, trade);
@@ -618,6 +708,7 @@ function metricsForSession(record, minuteIndex, cutoff, payload) {
       initialStop: riskEvidence ? riskEvidence.stop : finite(snapshot?.stop) ? snapshot.stop : null,
       initialStopEvidence: riskEvidence?.source ?? null, initialRiskReason: riskEvidence?.reason ?? null,
       modelConfigId: tradeModel.modelConfigId ?? null, modelEvidence: tradeModel.status,
+      pretradeRisk,
       initialTake: Object.hasOwn(trade ?? {}, 'initialTake') ? (finite(trade.initialTake) ? trade.initialTake : null)
         : finite(snapshot?.take) ? snapshot.take : null,
       followUpWindows: Array.isArray(trade.followUpWindows) ? trade.followUpWindows : [],
@@ -681,6 +772,7 @@ function metricsForSession(record, minuteIndex, cutoff, payload) {
   };
   const ledgerReconciliation = accountLedgerReconciliation(session, cutoff);
   const metricReasons = [];
+  if (legacyHistoryUnknown) metricReasons.push(`存档升级前的历史账户基线/模型未知；${equity.available ? '权益曲线仅重建已知基线之后的账务区间' : '不计算全历史权益曲线或回撤'}`);
   if (knownPnlCount !== trades.length) metricReasons.push(`${trades.length - knownPnlCount}笔成交缺少可用净盈亏，净盈亏、胜率、盈利因子和最大回撤不完整`);
   if (excludedFutureTrades) metricReasons.push(`${excludedFutureTrades}笔超出本轮可见行情截止的成交已排除；为避免把后续余额带入本轮，期末钱包余额与完整资金曲线不采用当前快照值`);
   if (hiddenFuturePosition || hiddenFuturePending) metricReasons.push('当前持仓/挂单的提交时间晚于本轮披露边界，已从报告隐藏');
@@ -722,6 +814,9 @@ function metricsForSession(record, minuteIndex, cutoff, payload) {
     initialBalance, endingWalletBalance: safeBalance, maxDrawdown: equity.maxDrawdown,
     maxDrawdownPct: equity.maxDrawdownPct, equityCurve: equity.points, equityCurveAvailable: equity.available,
     equityCurveCoverageComplete: equity.coverageComplete ?? false,
+    equityScope: {kind: legacyHistoryUnknown ? 'post-legacy-baseline-segment' : initialBalance !== null ? 'full-session' : 'unknown',
+      startReplayMarketTime: legacyHistoryUnknown ? historyBoundary : replayFrom,
+      startBalance: equityStartBalance, fullHistoryVerified: !legacyHistoryUnknown && initialBalance !== null},
     equityExpectedMinuteCount: equity.expectedMinuteCount ?? null, equityCoveredMinuteCount: equity.coveredMinuteCount ?? null,
     equityMissingMinuteCount: equity.missingMinuteCount ?? null,
     equityCurveReason: equity.reason, drawdownPeak: equity.peak, drawdownTrough: equity.trough,
@@ -787,7 +882,10 @@ function formatTrade(trade, number, symbol) {
   const leverage = trade.leverage === null ? '未记录（旧记录的界面默认值不作为事实）' : `${fmtNum(trade.leverage, 0)}×`;
   const fields = `- 成交：入场 ${fmtNum(trade.entry)} U → 出场 ${fmtNum(trade.exit)} U；数量 ${fmtNum(trade.qty, 8)} ${symbol?.startsWith('ETH') ? 'ETH' : 'BTC'}；名义金额 ${fmtNum(trade.notional)} U；杠杆 ${leverage}；保证金 ${fmtNum(trade.margin)} U。`;
   const protection = `- 保护价：成交时初始 SL ${fmtNum(trade.initialStop)} / TP ${fmtNum(trade.initialTake)}；最终 SL ${fmtNum(trade.finalStop)} / TP ${fmtNum(trade.finalTake)}。初始值优先采用成交/仓位快照；没有成交时证据则不推断。`;
-  return `<a id="${trade.anchor}"></a>\n### ${number}. ${sideName(trade.side)} · 净盈亏 ${fmtNum(trade.pnl)} U\n${bookLink}\n- 交易编号：${trade.id}${trade.orderId ? `（订单 ${trade.orderId}）` : ''}。\n- 时间：入场 ${fmtTime(trade.entryTime)}；出场 ${fmtTime(trade.exitTime)}；退出类型：${trade.reason}。\n${fields}\n${protection}\n- 成本：净手续费 ${fmtNum(trade.fees)} U；R值：${rText}。\n- ${floating}\n- ${volume}${followUp}\n- 本笔关键截图：\n${screenshotText}${reason}${exitReason}`;
+  const risk = trade.pretradeRisk ?? {};
+  const costRisk = `- 事前风险估算（${risk.source === 'recorded-at-order-time' ? '订单当时记录' : risk.source === 'recomputed-frozen-config' ? '按订单冻结模型复算' : '不可计算'}）：价格差风险 ${fmtNum(risk.priceRisk)} U；含入场/退出成本的净止损风险 ${fmtNum(risk.netStopRisk)} U${risk.netStopRiskUnavailableReason ? `（${risk.netStopRiskUnavailableReason}）` : ''}；用户明确填写的亏损预算 ${risk.lossBudget === null ? '未填写' : `${fmtNum(risk.lossBudget)} U`}；预计净止盈 ${fmtNum(risk.expectedTakeProfitNet)} U；净盈亏比 ${fmtNum(risk.netRewardRisk, 3)}。参考价 ${fmtNum(risk.referencePrice)} U，估算成交价 ${fmtNum(risk.estimatedEntryPrice)} U；口径 ${risk.basis ?? '未记录'}。${risk.source === 'recomputed-frozen-config' && finite(risk.legacyRecordedPlannedRiskIncludingCosts) ? `原记录“计划含成本风险”=${fmtNum(risk.legacyRecordedPlannedRiskIncludingCosts)} U（单独保留，未覆盖）。` : ''}`;
+  const r0Evidence = `- 实际R0：${rText}；分母为成交时初始止损与实际成交价的纯价格差×数量，不含手续费/滑点；证据 ${trade.initialStopEvidence ?? '未记录'}，成交时点 ${fmtTime(trade.entryTime)}。该值与上述事前净风险估算、用户预算分开。`;
+  return `<a id="${trade.anchor}"></a>\n### ${number}. ${sideName(trade.side)} · 净盈亏 ${fmtNum(trade.pnl)} U\n${bookLink}\n- 交易编号：${trade.id}${trade.orderId ? `（订单 ${trade.orderId}）` : ''}。\n- 时间：入场 ${fmtTime(trade.entryTime)}；出场 ${fmtTime(trade.exitTime)}；退出类型：${trade.reason}。\n${fields}\n${protection}\n- 成本：净手续费 ${fmtNum(trade.fees)} U。\n${costRisk}\n${r0Evidence}\n- ${floating}\n- ${volume}${followUp}\n- 本笔关键截图：\n${screenshotText}${reason}${exitReason}`;
 }
 function snapshotText(value, path) {
   let serialized;
@@ -803,24 +901,154 @@ function summarizeEvent(event, index, minuteIndex, record, metric, screenshotInd
   const volume = currentBarOrRebuilt(view, minuteIndex, record, cutoff, interval);
   const eventLines = [`### ${index + 1}. ${text(event?.kind, '未分类事件')}`,
     `- 序号：${event?.seq ?? index + 1}；记录时间：${fmtTime(event?.recordedAt)}；行情信息截止：${fmtTime(cutoff)}。`];
+  const refs = [['订单', event?.orderId], ['成交', event?.tradeId], ['计划', event?.planId], ['观察', event?.observationId], ['快照', event?.snapshotId]]
+    .filter(([, value]) => typeof value === 'string' && value);
+  if (refs.length) eventLines.push(`- 关联：${refs.map(([label, value]) => `${label} ${value}`).join('；')}。`);
+  if (event?.references?.screenshotBindingVersion) eventLines.push(`- 截图关联规则：${event.references.screenshotBindingVersion}。`);
+  if (typeof event?.entryReason === 'string' && event.entryReason.trim()) eventLines.push(`- 入场理由原文：\n${quoteUserText(event.entryReason)}`);
+  if (typeof event?.exitReason === 'string' && event.exitReason.trim()) eventLines.push(`- 人工平仓理由原文：\n${quoteUserText(event.exitReason)}`);
+  if (typeof event?.reason === 'string' && event.reason.trim()) eventLines.push(`- 本次操作理由：\n${quoteUserText(event.reason)}`);
   const shownVolume = typeof view.volume === 'boolean' ? (view.volume ? '当时显示' : '当时未显示') : '当时是否显示未记录';
   eventLines.push(`- 成交量指标：${shownVolume}；${volume?.source || '基于已公开分钟'}得出的当前周期量：${volume?.periodVolume === null || !volume ? '不可计算' : `${fmtNum(volume.periodVolume)} ${metric.symbol?.startsWith('ETH') ? 'ETH' : 'BTC'}`}；周期起点 ${fmtTime(volume?.periodStart)}。这是截止时的已知数据量，缺失分钟不补造。`);
   if (volume?.candle) eventLines.push(`- 当时图上已披露周期K线：起点 ${fmtTime(volume.candle[0])}；O/H/L/C ${volume.candle.slice(1, 5).map(value => fmtNum(value)).join(' / ')}；截至当时已知量 ${fmtNum(volume.candle[5])} ${metric.symbol?.startsWith('ETH') ? 'ETH' : 'BTC'}。`);
   else if (volume?.last) eventLines.push(`- 截止前最后完整分钟：${fmtTime(volume.last[0])}；O/H/L/C ${volume.last.slice(1, 5).map(value => fmtNum(value)).join(' / ')}；基础资产成交量 ${fmtNum(volume.last[5])} ${metric.symbol?.startsWith('ETH') ? 'ETH' : 'BTC'}。`);
   else eventLines.push('- 截止时没有可用的完整分钟行情，未用后续价格补齐。');
-  if (view.forming15m && Array.isArray(view.forming15m)) eventLines.push(`- 当时未完成15分钟K线（仅当时已公开部分）：${safeJson(view.forming15m, 300)}。`);
-  if (event?.before !== undefined) eventLines.push(`- 操作前（摘要）：\n${snapshotText(event.before, `/sessions/${sessionIndex}/events/${index}/before`)}`);
-  if (event?.after !== undefined) eventLines.push(`- 操作后（摘要）：\n${snapshotText(event.after, `/sessions/${sessionIndex}/events/${index}/after`)}`);
-  if (event?.view !== undefined) eventLines.push(`- 当时图表/指标状态快照（摘要）：\n${snapshotText(event.view, `/sessions/${sessionIndex}/events/${index}/view`)}`);
+  if (view.forming15m && Array.isArray(view.forming15m)) eventLines.push('- 当时存在未完成15分钟K线；只在完整记录JSON保存其当时已披露的形成值。');
+  const rawEventIndex = (record?.events ?? []).findIndex(item => item?.id === event?.id);
+  if (rawEventIndex >= 0) {
+    eventLines.push(`- 完整原始事件（含before/after/view）见完整记录.json：/sessions/${sessionIndex}/events/${rawEventIndex}。`);
+    for (const key of ['before', 'after', 'view']) {
+      let serialized = '';
+      try { serialized = JSON.stringify(event?.[key] ?? null); } catch { /* pointer remains useful */ }
+      if (serialized.length > 1500) eventLines.push(`- ${key}快照较大，阅读版不重复展开；原始内容位置（JSON Pointer）：\`/sessions/${sessionIndex}/events/${rawEventIndex}/${key}\`。`);
+    }
+  }
   if (event?.screenshotId) {
     const screenshot = screenshotIndex.get(event.screenshotId);
     eventLines.push(`- 关键截图：${event.screenshotId}${screenshot?.path ? `（导出包内路径：${screenshot.path}）` : '（截图文件或索引未附带）'}。`);
   }
   return eventLines.join('\n');
 }
+function summarizeEventStream(events, minuteIndex, record, metric, screenshotIndex, sessionIndex) {
+  const lines = [];
+  let displayIndex = 0;
+  for (let i = 0; i < events.length;) {
+    if (events[i]?.kind !== 'order-plan') {
+      lines.push(summarizeEvent(events[i], displayIndex++, minuteIndex, record, metric, screenshotIndex, sessionIndex));
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < events.length && events[i]?.kind === 'order-plan') i += 1;
+    const run = events.slice(start, i);
+    const changedFields = new Set();
+    for (const event of run) {
+      for (const field of ['draftPlan', 'sizePercent', 'orderType', 'leverage']) {
+        if (JSON.stringify(event?.before?.[field]) !== JSON.stringify(event?.after?.[field])) changedFields.add(field);
+      }
+    }
+    const fromSeq = run[0]?.seq ?? start + 1, toSeq = run.at(-1)?.seq ?? i;
+    const startIndex = (record?.events ?? []).findIndex(item => item?.id === run[0]?.id);
+    const endIndex = (record?.events ?? []).findIndex(item => item?.id === run.at(-1)?.id);
+    const replayTimes = run.map(event => asEpoch(event.replayMarketTime ?? event.visibleThrough)).filter(finite);
+    const recordedTimes = run.map(event => asEpoch(event.recordedAt)).filter(finite);
+    lines.push([`### 连续计划草稿交互（${run.length} 条；不等于决策次数）`,
+      `- 序号范围：${fromSeq}–${toSeq}；记录时间：${fmtTime(recordedTimes[0])} 至 ${fmtTime(recordedTimes.at(-1))}。`,
+      `- 行情时点范围：${fmtTime(replayTimes[0])} 至 ${fmtTime(replayTimes.at(-1))}。`,
+      `- 观察到的草稿/下单字段变化：${changedFields.size ? [...changedFields].join('、') : '字段未变化或无法归纳'}。`,
+      `- ${startIndex >= 0 && endIndex >= 0 ? `这 ${run.length} 条草稿事件仍保存在完整记录.json，原始序号与before/after均未删；定位起止事件：/sessions/${sessionIndex}/events/${startIndex} 与 /sessions/${sessionIndex}/events/${endIndex}。` : '完整草稿事件仍原样保存在完整记录.json。'}`
+    ].join('\n'));
+    displayIndex += 1;
+  }
+  return lines.length ? lines.join('\n\n') : '本轮没有可导出的逐步操作事件。仅凭最终快照无法推断此前是否设置过止损/止盈、如何修改或当时查看了什么。';
+}
+function reportEvidenceCoverage(record, disclosedEvents, cutoff) {
+  const raw = record?.coverage || {}, session = record?.session || {};
+  const allTrades = Array.isArray(session.trades) ? session.trades : [];
+  const trades = allTrades.filter(item => cutoff === null || !((asEpoch(item.entryTime) !== null && asEpoch(item.entryTime) > cutoff) ||
+    (asEpoch(item.exitTime) !== null && asEpoch(item.exitTime) > cutoff)));
+  const allOrders = Array.isArray(session.orders) ? session.orders : [];
+  const orders = allOrders.filter(item => cutoff === null || asEpoch(item.placedTime ?? item.recordedAt) === null || asEpoch(item.placedTime ?? item.recordedAt) <= cutoff);
+  const orderIds = new Set(orders.map(item => item?.id ?? item?.orderId).filter(Boolean));
+  const missingTradeIds = trades.filter(item => !item?.orderId || !orderIds.has(item.orderId))
+    .map((item, index) => item?.id ?? item?.tradeId ?? `legacy-${index + 1}`);
+  const boundary = asEpoch(session.modelEvidenceStart?.visibleThrough ?? session.modelEvidenceStart?.replayMarketTime ??
+    raw.captureReplayStart ?? raw.replayFrom);
+  const captured = boundary === null ? null : trades.filter(item => asEpoch(item.entryTime) !== null && asEpoch(item.entryTime) >= boundary);
+  const capturedLinked = captured === null ? null : captured.filter(item => item.orderId && orderIds.has(item.orderId)).length;
+  const historical = boundary === null ? null : trades.filter(item => asEpoch(item.entryTime) !== null && asEpoch(item.entryTime) < boundary).length;
+  const stored = raw.evidenceCoverage || {};
+  const immutableOrders = {...(stored.immutableOrders || {}), expected: trades.length,
+    available: trades.length - missingTradeIds.length, missingTradeIds, captureReplayStart: boundary,
+    capturedRangeExpected: captured?.length ?? null, capturedRangeAvailable: capturedLinked,
+    preCaptureHistoricalTradeCount: historical,
+    scope: boundary === null ? '历史与采集范围无法区分' : `全量交易关联；采集期从 ${fmtTime(boundary)} 起`};
+  if (missingTradeIds.length) immutableOrders.status = captured !== null && capturedLinked === captured.length ? 'partial-history' : 'incomplete';
+  const events = Array.isArray(disclosedEvents) ? disclosedEvents : [];
+  const drawingEvents = events.filter(item => String(item?.kind ?? '').startsWith('drawing-'));
+  const currentDrawingCount = Array.isArray(session.drawings) ? session.drawings.length : null;
+  const versionRows = Array.isArray(session.drawingVersions) ? session.drawingVersions.length : null;
+  const storedDrawingEvidence = stored.drawings || {};
+  let drawingStatus = storedDrawingEvidence.status;
+  if (versionRows !== null || storedDrawingEvidence.versionRows != null) drawingStatus = 'version-recorded';
+  else if (Array.isArray(storedDrawingEvidence.currentStateOnlyIds) || Array.isArray(storedDrawingEvidence.eventBackedCurrentIds)) {
+    drawingStatus = storedDrawingEvidence.status ??
+      (storedDrawingEvidence.currentStateOnlyIds?.length ? 'event-backed-partial' : 'event-backed-range');
+  }
+  else if (drawingEvents.length && currentDrawingCount !== null)
+    drawingStatus = drawingEvents.length >= currentDrawingCount ? 'event-backed-range' : 'event-backed-partial';
+  else if (drawingEvents.length) drawingStatus = 'event-backed-range';
+  else if (currentDrawingCount) drawingStatus = 'current-state-only';
+  else if (!drawingStatus || drawingStatus === 'unknown-legacy') drawingStatus = 'not-recorded';
+  const drawings = {...storedDrawingEvidence, status: drawingStatus,
+    currentDrawingCount: storedDrawingEvidence.currentDrawingCount ?? currentDrawingCount,
+    createdOrChangedEventCount: storedDrawingEvidence.createdOrChangedEventCount ?? drawingEvents.length,
+    eventBackedCurrentCount: storedDrawingEvidence.eventBackedCurrentCount ?? null,
+    currentStateOnlyIds: storedDrawingEvidence.currentStateOnlyIds ?? null,
+    eventOnlyIds: storedDrawingEvidence.eventOnlyIds ?? null, versionRows,
+    scope: '绘图事件与当前状态分开计数；缺失的历史版本不补造'};
+  const priorShots = raw.screenshotCoverage || {};
+  const disclosedEventIds = new Set(events.map(item => item?.id).filter(Boolean));
+  const screenshots = (Array.isArray(record?.auditScreenshots) ? record.auditScreenshots : [])
+    .filter(item => item?.eventId && disclosedEventIds.has(item.eventId));
+  const keyKinds = new Set(['order-submitted','order-filled','order-modified','order-cancelled','protection-changed',
+    'position-opened','position-closed','position-auto-closed','position-triggered','observation-recorded',
+    'order-plan-locked','plan-supplemented','position-close-requested']);
+  const keyEvents = events.filter(item => keyKinds.has(item?.kind));
+  const shotEvents = new Set(screenshots.map(item => item?.eventId).filter(Boolean));
+  const shotIds = new Set(screenshots.map(item => item?.id).filter(Boolean));
+  const auditStartedAt = asEpoch(raw.auditRecordingStartedAt ?? raw.recordingStartedAt);
+  const capturedKeyEvents = auditStartedAt === null ? keyEvents : keyEvents.filter(item => {
+    const recorded = asEpoch(item.recordedAt);
+    return recorded !== null && recorded >= auditStartedAt;
+  });
+  const missingEventIds = capturedKeyEvents.filter(item => !shotEvents.has(item.id) && !shotIds.has(item.screenshotId))
+    .map(item => item.id ?? item.seq ?? 'unknown');
+  const expectedKeyActionCount = auditStartedAt === null ? priorShots.expectedKeyActionCount ?? capturedKeyEvents.length : capturedKeyEvents.length;
+  const availableScreenshotCount = expectedKeyActionCount - missingEventIds.length;
+  const screenshotCoverage = {...priorShots, availableScreenshotCount, expectedKeyActionCount,
+    missingScreenshotCount: missingEventIds.length, missingEventIds,
+    captureStartedAt: raw.auditRecordingStartedAt ?? raw.recordingStartedAt ?? null,
+    scope: `操作采集起点 ${fmtTime(auditStartedAt)} 后的范围 ${availableScreenshotCount}/${expectedKeyActionCount}；不代表旧历史均有截图`,
+    historicalStatus: historical === null ? '历史范围未知' : historical ? 'legacy-unverified' : 'capture-started-at-session-start',
+    preCaptureTradesWithoutVerifiableCapture: historical};
+  const legacyImageBindingWarning = historical > 0 && screenshots.some(image => {
+    const event = events.find(item => item?.id === image?.eventId);
+    return event && !event?.references?.screenshotBindingVersion;
+  });
+  const keyCaptureComplete = screenshotCoverage.missingScreenshotCount === 0 &&
+    screenshotCoverage.availableScreenshotCount >= screenshotCoverage.expectedKeyActionCount;
+  const historicalEvidenceComplete = missingTradeIds.length === 0 && historical === 0 && keyCaptureComplete &&
+    drawingStatus !== 'event-backed-partial' && drawingStatus !== 'current-state-only' &&
+    ['fills', 'ledger', 'plans', 'snapshots', 'references'].every(key =>
+      !stored[key] || ['complete', 'present', 'not-applicable'].includes(stored[key].status));
+  return {...raw, evidenceCoverage: {...stored, immutableOrders, drawings}, screenshotCoverage,
+    historicalEvidenceComplete, legacyImageBindingWarning};
+}
 function sessionReport(record, metric, payload, minuteIndex) {
   const session = record?.session || {};
   const events = (Array.isArray(record?.events) ? record.events : []).filter(event => eventIsWithinExport(event, metric.coverage.visibleThrough, payload));
+  const coverage = reportEvidenceCoverage(record, events, metric.coverage.visibleThrough);
   const market = record?.market || {};
   const notes = text(session.notes, '无练习笔记');
   const state = metric.openPosition ? '仍有未平仓仓位' : metric.pendingOrder ? '仍有未成交限价挂单' : '无未平仓仓位/挂单';
@@ -833,17 +1061,19 @@ function sessionReport(record, metric, payload, minuteIndex) {
     `- 本轮参数证据：${metric.modelEvidence}${metric.modelEvidenceReason ? `；${metric.modelEvidenceReason}` : ''}。当前引擎声明费率 ${finite(modelDeclaration.feeRate) ? `${fmtNum(modelDeclaration.feeRate * 100, 5)}%` : '未记录'} / 滑点 ${finite(modelDeclaration.slippageRate) ? `${fmtNum(modelDeclaration.slippageRate * 100, 5)}%` : '未记录'}，仅当明确标为适用本轮时用于复算。`,
     `- 强平与额外成本：维持保证金率 ${finite(metric.maintenanceMarginRate) ? `${fmtNum(metric.maintenanceMarginRate * 100, 4)}%` : '未记录'}；资金费/借贷成本状态 ${text(source.fundingCostStatus ?? source.borrowCostStatus, '未记录，不能假定为零')}。`,
     `- 账本对账：${metric.accountLedgerReconciliation.available
-      ? metric.accountLedgerReconciliation.balanced ? `追加式账本 ${metric.accountLedgerReconciliation.rowCount} 行通过余额与手续费校验。`
+      ? metric.accountLedgerReconciliation.balanced ? metric.accountLedgerReconciliation.segment
+        ? `已知基线后的账本段 ${metric.accountLedgerReconciliation.rowCount} 行对账通过：起始余额 ${fmtNum(metric.accountLedgerReconciliation.segment.openingBalance)} U，结束余额 ${fmtNum(metric.accountLedgerReconciliation.segment.endingBalance)} U，区间变化 ${fmtNum(metric.accountLedgerReconciliation.segment.netChange)} U；基线前账户轨迹未知，不能视作全历史余额核验。`
+        : `追加式账本 ${metric.accountLedgerReconciliation.rowCount} 行通过余额与手续费校验。`
         : `账本 ${metric.accountLedgerReconciliation.rowCount} 行未通过校验：${metric.accountLedgerReconciliation.reason ?? '原因未知'}。`
       : metric.accountLedgerReconciliation.reason}`,
-    `- 权益曲线：${metric.equityCurveAvailable ? '按已披露分钟收盘与交易事件重建，为采样估值，不是逐笔真实权益轨迹。' : metric.equityCurveReason ?? '不可验证。'}`,
+    `- 权益曲线：${metric.equityCurveAvailable ? `${metric.equityScope.kind === 'post-legacy-baseline-segment' ? `仅自 ${fmtTime(metric.equityScope.startReplayMarketTime)} 的已知基线段` : '按本轮基线'}按已披露分钟收盘与交易事件重建，为采样估值，不是逐笔真实权益轨迹。` : metric.equityCurveReason ?? '不可验证。'}`,
   ];
   const header = [`## 本轮 ${record?.id ?? session.id ?? '未命名'} · ${metric.symbol ?? '标的未记录'}`,
     `- 回合状态：${state}；当前钱包余额 ${fmtNum(metric.endingWalletBalance)} U；本轮已平仓净盈亏 ${fmtNum(metric.netPnl)} U。`,
     `- 已平仓交易 ${metric.tradeCount} 笔；胜/负/平 ${metric.wins}/${metric.losses}/${metric.breakeven}；胜率 ${metric.winRate === null ? '—' : `${fmtNum(metric.winRate * 100, 2)}%`}；盈利因子 ${profitFactor}。`,
     `- 平均盈利/平均亏损：${fmtNum(metric.averageWin)} / ${fmtNum(metric.averageLoss)} U；平均 netR：${fmtNum(metric.averageR, 2)}R（R0样本 ${metric.eligibleCounts.averageR.eligibleCount}/${metric.eligibleCounts.averageR.totalCount}）；最多连续亏损 ${metric.maxConsecutiveLosses} 笔。`,
     `- 事前计划覆盖：${metric.planCoverage}/${metric.tradeCount} 笔交易关联到保留的计划版本；用户亏损预算、计划含成本风险与成交后R0是不同口径，不互相替代。`,
-    `- 分钟收盘盯市最大绝对回撤 ${fmtNum(metric.maxDrawdown)} U（峰值 ${fmtNum(metric.drawdownPeak?.equity)} U → ${fmtNum(metric.drawdownTrough?.equity)} U，谷值 ${fmtTime(metric.drawdownTrough?.time)}）；最大百分比回撤 ${metric.maxDrawdownPct === null ? '不可计算' : `${fmtNum(metric.maxDrawdownPct * 100, 2)}%`}（独立峰值 ${fmtNum(metric.drawdownPctPeak?.equity)} U → ${fmtNum(metric.drawdownPctTrough?.equity)} U，谷值 ${fmtTime(metric.drawdownPctTrough?.time)}）。按分钟收盘采样 ${metric.minutePointCount} 个点，并加入成交费用/平仓事件点。累计手续费 ${fmtNum(metric.fees)} U。`,
+    `- ${metric.equityScope.kind === 'post-legacy-baseline-segment' ? `仅已知基线之后区间（${fmtTime(metric.equityScope.startReplayMarketTime)}），非本轮全程` : '本轮全程'}分钟收盘盯市最大绝对回撤 ${fmtNum(metric.maxDrawdown)} U（峰值 ${fmtNum(metric.drawdownPeak?.equity)} U → ${fmtNum(metric.drawdownTrough?.equity)} U，谷值 ${fmtTime(metric.drawdownTrough?.time)}）；最大百分比回撤 ${metric.maxDrawdownPct === null ? '不可计算' : `${fmtNum(metric.maxDrawdownPct * 100, 2)}%`}（独立峰值 ${fmtNum(metric.drawdownPctPeak?.equity)} U → ${fmtNum(metric.drawdownPctTrough?.equity)} U，谷值 ${fmtTime(metric.drawdownPctTrough?.time)}）。按分钟收盘采样 ${metric.minutePointCount} 个点，并加入成交费用/平仓事件点。累计手续费 ${fmtNum(metric.fees)} U。${metric.equityScope.fullHistoryVerified ? '' : '旧账务区间未知，不将该回撤描述为完整历史回撤。'}`,
     `- 模型与账务参数：\n${modelLines.join('\n')}`,
     `- 练习笔记：\n${quoteUserText(notes)}`,
     `- 行情覆盖：\n${formatCoverage(record, metric)}`];
@@ -858,16 +1088,26 @@ function sessionReport(record, metric, payload, minuteIndex) {
   const issues = Array.isArray(record?.issues) ? record.issues : [];
   const baseline = record?.coverage?.baseline ?? record?.coverage?.baselineCoverage ?? record?.coverage?.dataBaseline ?? null;
   const issuesSection = issues.length ? issues.map((issue, index) => `- ${index + 1}. ${typeof issue === 'string' ? issue : safeJson(issue, 1000)}`).join('\n') : '未记录数据或复盘问题；这不代表没有潜在限制。';
-  const eventsSection = events.length
-    ? events.map((event, index) => summarizeEvent(event, index, minuteIndex, record, metric, screenshotMap(record),
-      Array.isArray(payload.sessions) ? payload.sessions.indexOf(record) : 0)).join('\n\n')
-    : '本轮没有可导出的逐步操作事件。仅凭最终快照无法推断此前是否设置过止损/止盈、如何修改或当时查看了什么。';
+  const eventsSection = summarizeEventStream(events, minuteIndex, record, metric, screenshotMap(record),
+    Array.isArray(payload.sessions) ? payload.sessions.indexOf(record) : 0);
   const screenshotSection = screenshots.length
     ? screenshots.map(item => `- ${item.id ?? '无ID'}：${item.path ?? '未记录路径'}；关联事件 ${item.eventId ?? '未记录'}；${item.mimeType ?? '格式未记录'}；图像类型 ${item.captureType ?? '未注明实际截图或重建图'}。`).join('\n')
     : '未附带关键截图。';
   const summarySection = metric.reviewSummary ? formatReviewSummary(metric.reviewSummary) : '### 明确想法、策略版本与观察\n\n汇总证据缺失。';
+  const integrity = coverage.evidenceCoverage ?? {};
+  const orderEvidence = integrity.immutableOrders ?? {};
+  const screenshotCoverage = coverage.screenshotCoverage ?? {};
+  const drawingEvidence = integrity.drawings ?? {};
+  const integritySection = [
+    `- 不可变订单快照：全程 ${orderEvidence.available ?? 0}/${orderEvidence.expected ?? metric.tradeCount}；范围 ${orderEvidence.scope ?? '未记录'}；采集基线后 ${orderEvidence.capturedRangeAvailable ?? '未知'}/${orderEvidence.capturedRangeExpected ?? '未知'}。缺失关联成交：${(orderEvidence.missingTradeIds ?? []).join('、') || '无'}。${orderEvidence.preCaptureHistoricalTradeCount == null ? '' : `基线前${orderEvidence.preCaptureHistoricalTradeCount}笔为旧记录，不能以采集期计数代替全程完整。`}`,
+    `- 关键截图：采集范围 ${screenshotCoverage.availableScreenshotCount ?? 0}/${screenshotCoverage.expectedKeyActionCount ?? 0}；${screenshotCoverage.scope ?? '范围未记录'}；采集前交易截图状态 ${screenshotCoverage.historicalStatus ?? '未知'}（${screenshotCoverage.preCaptureTradesWithoutVerifiableCapture ?? '未知'}笔历史交易未能由本次采集证明）。${(screenshotCoverage.missingEventIds ?? []).length ? `缺图事件：${screenshotCoverage.missingEventIds.join('、')}` : ''}`,
+    `- 绘图证据：${drawingEvidence.status ?? '未知'}；本次 ${drawingEvidence.createdOrChangedEventCount ?? 0} 条绘图事件；当前绘图 ${drawingEvidence.currentDrawingCount ?? '未记录'} 条；专用版本记录 ${drawingEvidence.versionRows ?? '未提供'}。当前状态与完整历史版本分别计数。`,
+    ...(coverage.legacyImageBindingWarning ? ['- 旧版截图提示：截图可能混入上一笔交易卡片；图中的价格/保护价/盈亏不能单独证明本笔状态，应以同一事件的结构化记录为准。原始截图未改写。'] : []),
+    `- 历史完整性结论：${coverage.historicalEvidenceComplete ? '有可核验的完整证据范围' : '部分对象仅覆盖采集期或缺少关联；不要将采集期完整等同全历史完整'}。`,
+  ].join('\n');
   return [...header, '### 事前计划版本（保留原文，不自动补全）', plansSection,
     summarySection,
+    '### 证据完整性与范围', integritySection,
     `### 基线覆盖与数据问题\n- 基线覆盖：${baseline ? safeJson(baseline, 1000) : '未单独记录基线覆盖范围。'}\n${issuesSection}`,
     '### 逐笔交易', tradeSection, '### 决策与操作事件（按事件序号）', eventsSection,
     '### 截图索引', screenshotSection].join('\n\n');
