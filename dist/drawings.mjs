@@ -537,7 +537,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     overlay.append(hit);
     const line = createSvg('line', {x1: a.x, y1: a.y, x2: b.x, y2: b.y,
       stroke: chosen ? '#f3cd73' : '#90a6ab', 'stroke-width': chosen ? 2 : 1.5,
-      'stroke-dasharray': chosen ? 'none' : '5 4', 'vector-effect': 'non-scaling-stroke'}, `drawing-line trend${chosen ? ' selected' : ''}`);
+      'stroke-dasharray': 'none', 'vector-effect': 'non-scaling-stroke'}, `drawing-line trend${chosen ? ' selected' : ''}`);
     line.style.pointerEvents = 'none';
     overlay.append(line);
     if (chosen) {

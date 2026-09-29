@@ -248,7 +248,7 @@ function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
     for(const drawing of active.drawings||[]){
       const projected=projectDrawing(drawing,bars,active.tf);if(!projected)continue;
       const palette=resolveDrawingPalette(drawing.type,drawing.colorPreset);
-      ctx.beginPath();ctx.strokeStyle=drawing.type==='horizontal'?palette.line:'#e6ba69';ctx.lineWidth=1.2;ctx.setLineDash(drawing.type==='horizontal'?[]:[5,4]);
+      ctx.beginPath();ctx.strokeStyle=drawing.type==='horizontal'?palette.line:'#e6ba69';ctx.lineWidth=1.2;ctx.setLineDash(['horizontal','trend'].includes(drawing.type)?[]:[5,4]);
       if(drawing.type==='horizontal'){
         const y=candleSeries.priceToCoordinate(projected.anchor.price);if(Number.isFinite(y)){ctx.moveTo(0,y);ctx.lineTo(plotWidth,y);ctx.stroke();}
       }else if(drawing.type==='zone'){
