@@ -21,6 +21,7 @@ DIST_FILES = (
     "minute-data.mjs",
     "second-data.mjs",
     "drawings.mjs",
+    "trade-markers.mjs",
     "review-export.mjs",
     "review-report.mjs",
     "review-import.mjs",

@@ -1,8 +1,9 @@
-import {createChart, CandlestickSeries, HistogramSeries, LineSeries, CrosshairMode, ColorType} from './vendor/charts.mjs';
+import {createChart, createSeriesMarkers, CandlestickSeries, HistogramSeries, LineSeries, CrosshairMode, ColorType} from './vendor/charts.mjs';
 import {INITIAL, FEE, SLIP, MAINTENANCE_MARGIN_RATE, BASE, WARMUP, createSession, validateSession, ensureEvidenceBaseline, aggregateReplay, aggregateDisclosedMinutes, aggregateDisclosedSeconds, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, advanceSecond, manualClosePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, maxNotional, positionLiquidationPrice, estimateOrderRisk, metrics} from './engine.mjs';
 import {nextMinute, readMinuteRange} from './minute-data.mjs';
 import {nextSecond, readSecondRange, secondSourceFor} from './second-data.mjs';
 import {createDrawingTools, projectDrawing, resolveDrawingPalette, fibonacciPriceLevels, DRAWING_LINE_STYLES} from './drawings.mjs';
+import {buildTradeMarkers, buildTradeMarkersThroughStage, tradeMarkerSignature} from './trade-markers.mjs';
 import {createReviewRecorder, reviewStateProjection} from './review-recorder.mjs';
 import {appendPlanVersion, createPlanVersion, executionStageSnapshots, findClosedTradeForPosition, modificationEvidence} from './review-plans.mjs';
 import {buildReviewExport} from './review-export.mjs';
@@ -28,6 +29,8 @@ let playTimer = 0;
 let persistTimer = 0;
 let pendingPersistOptions = null;
 let chartDataContext = '';
+let tradeMarkers = null;
+let tradeMarkersKey = '';
 let chartBarCount = 0;
 let chartLastBarTime = null;
 let chartFirstBarTime = null;
@@ -221,7 +224,10 @@ function reviewView(session=active){
 function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
   if(!chart||!active)return Promise.resolve(null);
   try{
-    const source=chart.takeScreenshot();
+    const stage=annotation?.executionEvent||null,originalMarkers=tradeMarkers?.markers?.()||null;
+    if(stage&&tradeMarkers)tradeMarkers.setMarkers(buildTradeMarkersThroughStage(active,disclosedBars(),active.tf,stage));
+    let source;
+    try{source=chart.takeScreenshot();}finally{if(stage&&tradeMarkers&&originalMarkers)tradeMarkers.setMarkers(originalMarkers);}
     if(!(source instanceof HTMLCanvasElement))return Promise.resolve(null);
     const host=$('chart'),canvas=document.createElement('canvas'),scaleY=source.height/Math.max(1,host.clientHeight),headerHeight=Math.round(34*scaleY);canvas.width=source.width;canvas.height=source.height+headerHeight;
     const ctx=canvas.getContext('2d');if(!ctx)return Promise.resolve(null);
@@ -1045,6 +1051,7 @@ function initChart(){
   const host=$('chart');
   chart=createChart(host,{width:host.clientWidth||800,height:host.clientHeight||418,layout:{background:{type:ColorType.Solid,color:'#171b1e'},textColor:'#879397',fontFamily:'Inter, -apple-system, sans-serif',fontSize:12},grid:{vertLines:{color:'#22292c'},horzLines:{color:'#22292c'}},crosshair:{mode:CrosshairMode.Normal,vertLine:{color:'#566469',labelBackgroundColor:'#39474b'},horzLine:{color:'#566469',labelBackgroundColor:'#39474b'}},rightPriceScale:{borderColor:'#313a3d',scaleMargins:{top:.08,bottom:.23}},timeScale:{borderColor:'#313a3d',timeVisible:true,secondsVisible:false,tickMarkFormatter:(time)=>formatChartTime(time),rightOffset:4,barSpacing:7},localization:{locale:'zh-CN',timeFormatter:(time)=>formatChartTime(time),priceFormatter:(price)=>pretty(price,2)}});
   candleSeries=chart.addSeries(CandlestickSeries,{upColor:'#22c58b',downColor:'#f06d78',borderUpColor:'#22c58b',borderDownColor:'#f06d78',wickUpColor:'#22c58b',wickDownColor:'#f06d78',priceLineVisible:false,autoscaleInfoProvider:original=>{const info=original?.();if(!info?.priceRange)return info;const levels=getPlanLevels();if(!levels.length)return info;return {...info,priceRange:{minValue:Math.min(info.priceRange.minValue,...levels),maxValue:Math.max(info.priceRange.maxValue,...levels)}};}});
+  tradeMarkers=createSeriesMarkers(candleSeries,[],{autoScale:false});
   maSeries=chart.addSeries(LineSeries,{color:'#e6ba69',lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,autoscaleInfoProvider:()=>null});
   ma10Series=chart.addSeries(LineSeries,{color:'#65a9ff',lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,autoscaleInfoProvider:()=>null});
   volumeSeries=chart.addSeries(HistogramSeries,{priceScaleId:'review-volume',priceFormat:{type:'volume'},base:0,priceLineVisible:false,lastValueVisible:false});
@@ -1076,6 +1083,8 @@ function renderChart(fit=false,resetRange=false){
   else if(nextBar){const closed=bars[chartBarCount-1];candleSeries.update(candlePoint(closed));volumeSeries.update(volumePoint(closed));candleSeries.update(candlePoint(last));volumeSeries.update(volumePoint(last));}
   else {candleSeries.setData(bars.map(candlePoint));volumeSeries.setData(bars.map(volumePoint));chartDataContext=context;}
   chartBarCount=bars.length;chartLastBarTime=last?.time??null;chartFirstBarTime=firstTime;
+  const nextTradeMarkersKey=tradeMarkerSignature(active,bars,active.tf);
+  if(tradeMarkers&&nextTradeMarkersKey!==tradeMarkersKey){tradeMarkers.setMarkers(buildTradeMarkers(active,bars,active.tf));tradeMarkersKey=nextTradeMarkersKey;}
   volumeSeries.applyOptions({visible:active.volume!==false});
   drawingTools?.refresh(bars);
   const key=maSignature();

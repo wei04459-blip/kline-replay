@@ -16,8 +16,8 @@ from second_data import SecondDataError, SecondDataService, SecondDataUnavailabl
 
 APP_ID = "com.yuwan.local.kline-replay"
 VERSIONED_MODULES = ("app.mjs", "engine.mjs", "minute-data.mjs", "second-data.mjs", "drawings.mjs",
-                     "second-data.mjs", "review-export.mjs", "review-report.mjs", "review-import.mjs", "review-recorder.mjs", "review-plans.mjs", "review-summary.mjs")
-IMPORT_PATTERN = re.compile(rb"(['\"])[.]\/(engine|minute-data|second-data|drawings|review-export|review-report|review-import|review-recorder|review-plans|review-summary)[.]mjs\1")
+                     "trade-markers.mjs", "second-data.mjs", "review-export.mjs", "review-report.mjs", "review-import.mjs", "review-recorder.mjs", "review-plans.mjs", "review-summary.mjs")
+IMPORT_PATTERN = re.compile(rb"(['\"])[.]\/(engine|minute-data|second-data|drawings|trade-markers|review-export|review-report|review-import|review-recorder|review-plans|review-summary)[.]mjs\1")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -135,7 +135,7 @@ def create_server(bind: str, port: int, directory: str | Path, cache_directory: 
     if bind_address != ipaddress.IPv4Address("127.0.0.1"):
         raise ValueError("服务只允许绑定 127.0.0.1。")
     version_digest = hashlib.sha256()
-    for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs", "second-data.mjs", "drawings.mjs",
+    for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs", "second-data.mjs", "drawings.mjs", "trade-markers.mjs",
                  "review-export.mjs", "review-report.mjs", "review-import.mjs", "review-recorder.mjs", "review-plans.mjs", "review-summary.mjs"):
         path = Path(directory) / name
         if path.is_file():

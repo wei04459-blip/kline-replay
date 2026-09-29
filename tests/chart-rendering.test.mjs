@@ -8,25 +8,32 @@ const start=source.indexOf('function renderChart('),end=source.indexOf('\nfuncti
 assert.ok(start>=0&&end>start,'renderChart should remain identifiable');
 
 test('chart updates the tail, closes the previous bucket, and resets on rolling windows or timeframe changes',()=>{
-  const calls={candleSet:[],candleUpdate:[],volumeSet:[],volumeUpdate:[],maSet:[],maUpdate:[],ma10Set:[],ma10Update:[]};
+  const calls={candleSet:[],candleUpdate:[],volumeSet:[],volumeUpdate:[],maSet:[],maUpdate:[],ma10Set:[],ma10Update:[],markerSet:[]};
   const series=(set,update)=>({setData(rows){calls[set].push(rows);},update(row){calls[update].push(row);},applyOptions(){}});
   const context={
-    active:{id:'s1',symbol:'BTCUSDT',tf:120,volume:true,ma:true,ma10:true},candleSeries:series('candleSet','candleUpdate'),
+    active:{id:'s1',symbol:'BTCUSDT',tf:120,volume:true,ma:true,ma10:true,fills:[],trades:[]},candleSeries:series('candleSet','candleUpdate'),
     volumeSeries:series('volumeSet','volumeUpdate'),maSeries:series('maSet','maUpdate'),ma10Series:series('ma10Set','ma10Update'),
     chart:{applyOptions(){},timeScale(){return {fitContent(){},setVisibleLogicalRange(){}};}},
-    chartDataContext:'',chartBarCount:0,chartLastBarTime:null,chartFirstBarTime:null,maDataKey:'',ma10DataKey:'',
+    chartDataContext:'',chartBarCount:0,chartLastBarTime:null,chartFirstBarTime:null,maDataKey:'',ma10DataKey:'',tradeMarkersKey:'',
     SMALL_TIMEFRAMES:new Set([60,120,180,300]),replayResolution:()=> '1s',
     disclosedBars:()=>context.bars,maSignature:()=>`${context.active.id}|${context.active.tf}|${context.bars[0]?.time}|${context.bars.length}`,
     computeMa:(bars,period=20)=>bars.slice(period-1).map((bar,index)=>({time:bar.time,value:index+1})),
+    tradeMarkers:{setMarkers(rows){calls.markerSet.push(rows);}},
+    tradeMarkerSignature:(session,bars,tf)=>`${session.id}|${tf}|${bars[0]?.time}|${session.fills.length}|${session.trades.length}`,
+    buildTradeMarkers:session=>session.fills.map(fill=>({id:fill.id,time:fill.time})),
     drawingTools:null,renderPlanOverlay(){},updateQuote(){},formatChartTime(){},activeDrawingTool:null
   };
   context.bars=Array.from({length:500},(_,index)=>({time:100+index*120,open:10,high:12,low:9,close:11,volume:5,complete:false}));
   const render=vm.runInNewContext(`${source.slice(start,end)}; renderChart;`,context);
   render();
   assert.equal(calls.candleSet.length,1);
+  assert.equal(calls.markerSet.length,1);
   for(let tick=0;tick<100;tick++){context.bars[499]={...context.bars[499],high:14,close:13+tick/100,volume:9};render();}
   assert.equal(calls.candleSet.length,1,'100 same-bucket renders do not resend historical chart data');
   assert.equal(calls.candleUpdate.length,100);
+  assert.equal(calls.markerSet.length,1,'same-bucket playback does not rebuild the full marker collection');
+  context.active.fills.push({id:'fill-1',time:context.bars.at(-1).time});render();
+  assert.equal(calls.markerSet.length,2,'a new fill refreshes markers once');
   context.bars=[...context.bars,{time:context.bars.at(-1).time+120,open:13,high:15,low:12,close:14,volume:6,complete:false}];render();
   assert.deepEqual(calls.candleUpdate.slice(-2).map(row=>row.time),[context.bars[499].time,context.bars[500].time]);
   assert.deepEqual(calls.maUpdate.slice(-2).map(row=>row.time),[context.bars[499].time,context.bars[500].time]);
