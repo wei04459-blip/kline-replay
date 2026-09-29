@@ -74,6 +74,16 @@ function normalizeCandles(rows, cutoff) {
   return [...byTime.values()].sort((a, b) => a[0] - b[0]);
 }
 
+function normalizeSecondCandles(rows, cutoff) {
+  if (!Array.isArray(rows)) return [];
+  const byTime = new Map();
+  for (const row of rows) {
+    if (!validCandle(row) || (cutoff !== null && row[0] + 1 > cutoff)) continue;
+    if (!byTime.has(row[0])) byTime.set(row[0], row.slice(0, 6));
+  }
+  return [...byTime.values()].sort((a, b) => a[0] - b[0]);
+}
+
 /**
  * Rebuild one short chart candle only from a contiguous prefix of fully disclosed
  * real 1m rows. A 15m context candle is never evidence for a sub-15m candle.
@@ -106,6 +116,35 @@ export function aggregateMinutePrefix({minuteCandles, interval, barTime, visible
     Math.min(...prefix.map(row => row[3])), prefix.at(-1)[4], prefix.reduce((sum, row) => sum + row[5], 0)];
   return {candle, complete: expectedMinutes === interval / BASE_SECONDS, expectedMinutes,
     availableMinutes: prefix.length, reason: null};
+}
+
+/** Rebuild a forming short-period candle exclusively from complete disclosed 1s klines. */
+export function aggregateSecondPrefix({secondCandles, interval, barTime, visibleThrough}) {
+  if (!SHORT_DISPLAY_INTERVALS.has(interval) || !Number.isSafeInteger(barTime) || barTime < 0 ||
+      barTime % interval !== 0 || !finite(visibleThrough) || visibleThrough <= barTime) {
+    return {candle: null, complete: false, expectedSeconds: null, reason: 'invalid-boundary'};
+  }
+  const expectedSeconds = Math.max(0, Math.min(interval, Math.floor(visibleThrough - barTime)));
+  if (!expectedSeconds) return {candle: null, complete: false, expectedSeconds, reason: 'no-complete-second'};
+  const rows = Array.isArray(secondCandles) ? secondCandles : [];
+  let low = 0, high = rows.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (rows[middle]?.[0] < barTime) low = middle + 1;
+    else high = middle;
+  }
+  const prefix = [];
+  for (let index = 0; index < expectedSeconds; index += 1) {
+    const row = rows[low + index], expectedOpen = barTime + index;
+    if (!validCandle(row) || row[0] !== expectedOpen || row[0] + 1 > visibleThrough) {
+      return {candle: null, complete: false, expectedSeconds, availableSeconds: prefix.length, reason: 'missing-second-evidence'};
+    }
+    prefix.push(row);
+  }
+  const candle = [barTime, prefix[0][1], Math.max(...prefix.map(row => row[2])),
+    Math.min(...prefix.map(row => row[3])), prefix.at(-1)[4], prefix.reduce((sum, row) => sum + row[5], 0)];
+  return {candle, complete: expectedSeconds === interval, expectedSeconds,
+    availableSeconds: prefix.length, reason: null};
 }
 function globalCutoff(record, minuteCandles) {
   const direct = asEpoch(record?.coverage?.visibleThrough ?? record?.market?.visibleThrough);
@@ -149,8 +188,19 @@ function buildMinuteIndex(candles) {
 function visibleMinuteCount(index, cutoff) {
   return cutoff === null ? 0 : upperBoundTime(index.candles, cutoff - BASE_SECONDS);
 }
-function knownVolumeAt(index, cutoff, interval) {
+function knownVolumeAt(index, cutoff, interval, secondIndex = null, requireSeconds = false) {
   if (cutoff === null) return null;
+  if (SHORT_DISPLAY_INTERVALS.has(interval) && requireSeconds) {
+    const start = intervalStart(Math.floor(cutoff - 1), interval);
+    const aggregate = aggregateSecondPrefix({secondCandles: secondIndex?.candles ?? [], interval, barTime: start, visibleThrough: cutoff});
+    if (!aggregate.candle) return {last: null, periodVolume: null, periodStart: start,
+      rows: aggregate.availableSeconds ?? 0, candle: null, coverageUnknown: true,
+      source: '缺少连续、截止前的真实1秒行；不使用分钟或15分钟背景推算'};
+    const last = secondIndex?.candles?.at(-1) ?? null;
+    return {last, periodVolume: aggregate.candle[5], periodStart: start, rows: aggregate.availableSeconds,
+      candle: aggregate.candle, complete: aggregate.complete, coverageUnknown: false,
+      source: '仅由截止前连续、已披露的真实1秒K线聚合'};
+  }
   const end = visibleMinuteCount(index, cutoff);
   if (!end) return {last: null, periodVolume: null, periodStart: null, rows: 0};
   const last = index.candles[end - 1], start = intervalStart(last[0], VALID_INTERVALS.has(interval) ? interval : DEFAULT_CONTEXT_INTERVAL);
@@ -165,7 +215,7 @@ function knownVolumeAt(index, cutoff, interval) {
   const first = lowerBoundTime(index.candles, start);
   return {last, periodVolume: index.volumePrefix[end] - index.volumePrefix[first], periodStart: start, rows: end - first};
 }
-function currentBarAt(view, index, cutoff, interval) {
+function currentBarAt(view, index, cutoff, interval, secondIndex = null, requireSeconds = false) {
   const source = view?.currentBar;
   if (!source || cutoff === null) return null;
   const row = Array.isArray(source)
@@ -174,6 +224,15 @@ function currentBarAt(view, index, cutoff, interval) {
   if (!validCandle(row)) return null;
   if (SHORT_DISPLAY_INTERVALS.has(interval)) {
     if (source.interval != null && source.interval !== interval) return null;
+    if (requireSeconds) {
+      const aggregate = aggregateSecondPrefix({secondCandles: secondIndex?.candles ?? [], interval,
+        barTime: row[0], visibleThrough: cutoff});
+      if (!aggregate.candle || row.some((value, position) => Math.abs(value - aggregate.candle[position]) >
+          1e-9 * Math.max(1, Math.abs(aggregate.candle[position])))) return null;
+      return {last: secondIndex?.candles?.at(-1) ?? null, periodVolume: aggregate.candle[5],
+        periodStart: row[0], rows: aggregate.availableSeconds, candle: aggregate.candle,
+        complete: aggregate.complete, coverageUnknown: false, source: '已由截止前真实1秒K线核实'};
+    }
     const aggregate = aggregateMinutePrefix({minuteCandles: index.candles, interval, barTime: row[0], visibleThrough: cutoff});
     if (!aggregate.candle || row.some((value, position) => Math.abs(value - aggregate.candle[position]) >
         1e-9 * Math.max(1, Math.abs(aggregate.candle[position])))) return null;
@@ -186,12 +245,14 @@ function currentBarAt(view, index, cutoff, interval) {
   if (!last || row[0] !== intervalStart(last[0], seconds)) return null;
   return {last, periodVolume: row[5], periodStart: row[0], rows: null, candle: row, source: '当时图表已披露currentBar'};
 }
-function currentBarOrRebuilt(view, index, record, cutoff, interval) {
-  const direct = currentBarAt(view, index, cutoff, interval);
+function currentBarOrRebuilt(view, index, record, cutoff, interval, secondIndex = null) {
+  const requireSeconds = view?.replayResolution === '1s' || Number.isInteger(view?.secondCursorTime) ||
+    record?.market?.secondMode === true || Number.isInteger(record?.session?.secondCursorTime);
+  const direct = currentBarAt(view, index, cutoff, interval, secondIndex, requireSeconds);
   if (direct) return direct;
-  const fromMinutes = knownVolumeAt(index, cutoff, interval);
+  const fromMinutes = knownVolumeAt(index, cutoff, interval, secondIndex, requireSeconds);
   if (cutoff === null) return fromMinutes;
-  if (SHORT_DISPLAY_INTERVALS.has(interval)) return fromMinutes;
+  if (SHORT_DISPLAY_INTERVALS.has(interval) || requireSeconds) return fromMinutes;
   const contextInterval = finite(record?.market?.contextInterval) ? record.market.contextInterval : DEFAULT_CONTEXT_INTERVAL;
   const context = normalizeCandles(record?.market?.contextCandles, cutoff);
   const last = fromMinutes?.last;
@@ -683,7 +744,9 @@ function buildMinuteEquity(trades, openPosition, accountBalance, minuteIndex, cu
     peakForPct: peakAtMaxDrawdownPct ?? {time: pctPeakTime, equity: pctPeak},
     troughForPct: pctTroughTime === null ? null : {time: pctTroughTime, equity: pctTroughEquity}, reason: null};
 }
-function metricsForSession(record, minuteIndex, cutoff, payload) {
+function metricsForSession(record, minuteIndex, secondIndex, cutoff, payload) {
+  minuteIndex = minuteIndex && Array.isArray(minuteIndex.candles) ? minuteIndex : buildMinuteIndex([]);
+  secondIndex = secondIndex && Array.isArray(secondIndex.candles) ? secondIndex : buildMinuteIndex([]);
   const session = record?.session && typeof record.session === 'object' ? record.session : {};
   const allTrades = Array.isArray(session.trades) ? session.trades.filter(item => item && typeof item === 'object') : [];
   const trades = allTrades.filter(item => {
@@ -855,6 +918,19 @@ function metricsForSession(record, minuteIndex, cutoff, payload) {
   const gaps = Array.isArray(market.gaps) ? market.gaps : Array.isArray(record?.coverage?.gaps) ? record.coverage.gaps : [];
   const contextInterval = finite(market.contextInterval) ? market.contextInterval : DEFAULT_CONTEXT_INTERVAL;
   const context = normalizeCandles(market.contextCandles, cutoff).filter(row => row[0] + contextInterval <= cutoff);
+  const secondMode = market.secondMode === true || session.replayGranularity === 'seconds' || Number.isInteger(session.secondCursorTime) ||
+    (Array.isArray(market.secondCandles) && market.secondCandles.length > 0);
+  const storedSecondEvidence = record?.coverage?.secondEvidence ?? market.secondCoverage ?? null;
+  const secondExpectedFrom = asEpoch(record?.coverage?.replayFrom) ?? asEpoch(session.startTime);
+  const secondExpectedThrough = cutoff === null ? null : cutoff;
+  const secondExpectedCount = secondMode && secondExpectedFrom !== null && secondExpectedThrough !== null
+    ? Math.max(0, Math.floor(secondExpectedThrough) - Math.ceil(secondExpectedFrom)) : null;
+  const secondMissingCount = secondExpectedCount === null ? null : Math.max(0, secondExpectedCount - secondIndex.candles.length);
+  const secondEvidenceStatus = storedSecondEvidence?.status ?? (!secondMode ? 'not-used'
+    : !secondIndex.candles.length ? 'unknown-no-recorded-seconds'
+      : secondMissingCount === null ? 'unknown-range-boundary'
+        : secondMissingCount === 0 ? 'complete' : 'partial');
+  const secondVolume = secondIndex.candles.reduce((sum, row) => sum + row[5], 0);
   const reviewSummary = buildReviewSummary({session, events, coverage: record?.coverage,
     auditScreenshots: record?.auditScreenshots ?? []});
   return {
@@ -888,6 +964,14 @@ function metricsForSession(record, minuteIndex, cutoff, payload) {
     trades: perTrade,
     coverage: {visibleFrom: asEpoch(record?.coverage?.visibleFrom), visibleThrough: cutoff,
       minuteRows: visibleMinutes.length, contextRows: context.length, gapCount: gaps.length,
+      secondRows: secondIndex.candles.length,
+      secondRange: secondIndex.candles.length ? {from: secondIndex.candles[0][0], through: secondIndex.candles.at(-1)[0] + 1} : null,
+      secondMode, secondEvidence: {status: secondEvidenceStatus,
+        expectedCount: storedSecondEvidence?.expectedRows ?? secondExpectedCount,
+        availableCount: storedSecondEvidence?.availableRows ?? secondIndex.candles.length,
+        missingCount: storedSecondEvidence?.missingRows ?? secondMissingCount,
+        gaps: storedSecondEvidence?.gaps ?? storedSecondEvidence?.internalGapRanges ?? []},
+      disclosedSecondVolume: secondVolume,
       displayInterval: finite(session.tf) ? session.tf : null,
       shortDisplayEvidence: SHORT_DISPLAY_INTERVALS.has(session.tf)
         ? !Number.isFinite(record?.coverage?.expectedMinuteRows) ? 'unknown-legacy'
@@ -911,10 +995,15 @@ function formatCoverage(record, metric) {
   const shortEvidenceLine = SHORT_DISPLAY_INTERVALS.has(displayInterval)
     ? `- 短周期视图：${intervalLabel(displayInterval)}；行情证据${shortEvidence === 'minute-backed' ? '由已披露1分钟行支持' : shortEvidence === 'partial-minute-coverage' ? '部分缺分钟，只报告已覆盖部分' : '未知或没有可核验分钟行'}；绝不从15分钟背景拆分或补高低价。`
     : null;
+  const secondEvidence = coverage.secondEvidence;
+  const secondEvidenceLine = metric.coverage.secondMode
+    ? `- 逐秒回放：${secondEvidence?.status === 'complete' ? '已记录区间连续' : secondEvidence?.status === 'partial' ? '已记录区间有缺秒' : '缺少可核验秒行'}；${metric.coverage.secondRows} 条真实1秒K线${metric.coverage.secondRange ? `，${fmtTime(metric.coverage.secondRange.from)} 至 ${fmtTime(metric.coverage.secondRange.through)} UTC` : ''}。1秒K线是该秒聚合OHLCV，不是逐笔成交；不拿分钟/15分钟行补秒。`
+    : '- 逐秒回放：本轮没有可核验的秒级回放记录。';
   return [
     `- 标的：${metric.symbol ?? '未记录'}；练习区间：${fmtTime(coverage.visibleFrom)} 至 ${fmtTime(metric.coverage.visibleThrough)}。`,
     `- 已导出可见分钟：${metric.coverage.minuteRows} 根；完整15分钟背景：${metric.coverage.contextRows} 根；缺口记录：${gaps.length} 项。`,
     ...(shortEvidenceLine ? [shortEvidenceLine] : []),
+    secondEvidenceLine,
     `- 已见分钟基础资产成交量合计：${fmtNum(metric.coverage.disclosedBaseVolume)} ${metric.symbol?.startsWith('ETH') ? 'ETH' : 'BTC'}（仅统计导出的已公开分钟，缺口不补造）。`,
     `- 成交量单位：${text(market.marketDataUnits?.volume, `${metric.symbol?.startsWith('ETH') ? 'ETH' : 'BTC'}，基础资产单位，不是USDT`)}。来源：${sourceText}。`,
     ...(market.sourceManifest ? [`- 来源摘要：\n${codeFence(safeJson(market.sourceManifest, 2000))}`] : []),
@@ -963,11 +1052,11 @@ function snapshotText(value, path) {
   if (serialized.length <= 5000) return codeFence(serialized);
   return `${codeFence(`${serialized.slice(0, 5000)}\n…（展示摘要，完整原始内容保留在JSON ${path}）`)}\n原始记录定位：JSON Pointer \`${path}\`。`;
 }
-function summarizeEvent(event, index, minuteIndex, record, metric, screenshotIndex, sessionIndex) {
+function summarizeEvent(event, index, minuteIndex, secondIndex, record, metric, screenshotIndex, sessionIndex) {
   const cutoff = eventCutoff(event, metric.coverage.visibleThrough);
   const view = event?.view && typeof event.view === 'object' ? event.view : {};
   const interval = Number(view.tf ?? view.interval ?? view.currentBar?.interval ?? record?.session?.tf);
-  const volume = currentBarOrRebuilt(view, minuteIndex, record, cutoff, interval);
+  const volume = currentBarOrRebuilt(view, minuteIndex, record, cutoff, interval, secondIndex);
   const eventLines = [`### ${index + 1}. ${text(event?.kind, '未分类事件')}`,
     `- 序号：${event?.seq ?? index + 1}；记录时间：${fmtTime(event?.recordedAt)}；行情信息截止：${fmtTime(cutoff)}。`];
   const refs = [['订单', event?.orderId], ['成交', event?.tradeId], ['计划', event?.planId], ['观察', event?.observationId], ['快照', event?.snapshotId]]
@@ -999,12 +1088,12 @@ function summarizeEvent(event, index, minuteIndex, record, metric, screenshotInd
   }
   return eventLines.join('\n');
 }
-function summarizeEventStream(events, minuteIndex, record, metric, screenshotIndex, sessionIndex) {
+function summarizeEventStream(events, minuteIndex, secondIndex, record, metric, screenshotIndex, sessionIndex) {
   const lines = [];
   let displayIndex = 0;
   for (let i = 0; i < events.length;) {
     if (events[i]?.kind !== 'order-plan') {
-      lines.push(summarizeEvent(events[i], displayIndex++, minuteIndex, record, metric, screenshotIndex, sessionIndex));
+      lines.push(summarizeEvent(events[i], displayIndex++, minuteIndex, secondIndex, record, metric, screenshotIndex, sessionIndex));
       i += 1;
       continue;
     }
@@ -1115,7 +1204,7 @@ function reportEvidenceCoverage(record, disclosedEvents, cutoff) {
   return {...raw, evidenceCoverage: {...stored, immutableOrders, drawings}, screenshotCoverage,
     historicalEvidenceComplete, legacyImageBindingWarning};
 }
-function sessionReport(record, metric, payload, minuteIndex) {
+function sessionReport(record, metric, payload, minuteIndex, secondIndex) {
   const session = record?.session || {};
   const events = (Array.isArray(record?.events) ? record.events : []).filter(event => eventIsWithinExport(event, metric.coverage.visibleThrough, payload));
   const coverage = reportEvidenceCoverage(record, events, metric.coverage.visibleThrough);
@@ -1158,7 +1247,7 @@ function sessionReport(record, metric, payload, minuteIndex) {
   const issues = Array.isArray(record?.issues) ? record.issues : [];
   const baseline = record?.coverage?.baseline ?? record?.coverage?.baselineCoverage ?? record?.coverage?.dataBaseline ?? null;
   const issuesSection = issues.length ? issues.map((issue, index) => `- ${index + 1}. ${typeof issue === 'string' ? issue : safeJson(issue, 1000)}`).join('\n') : '未记录数据或复盘问题；这不代表没有潜在限制。';
-  const eventsSection = summarizeEventStream(events, minuteIndex, record, metric, screenshotMap(record),
+  const eventsSection = summarizeEventStream(events, minuteIndex, secondIndex, record, metric, screenshotMap(record),
     Array.isArray(payload.sessions) ? payload.sessions.indexOf(record) : 0);
   const screenshotSection = screenshots.length
     ? screenshots.map(item => `- ${item.id ?? '无ID'}：${item.path ?? '未记录路径'}；关联事件 ${item.eventId ?? '未记录'}；${item.mimeType ?? '格式未记录'}；图像类型 ${item.captureType ?? '未注明实际截图或重建图'}。`).join('\n')
@@ -1196,9 +1285,10 @@ export function buildReviewReport(payload) {
     const market = record?.market || {};
     const allCandles = normalizeCandles(market.minuteCandles, null);
     const cutoff = globalCutoff(record, allCandles);
-    return {record, cutoff, minuteIndex: buildMinuteIndex(allCandles)};
+    const allSeconds = normalizeSecondCandles(market.secondCandles, cutoff);
+    return {record, cutoff, minuteIndex: buildMinuteIndex(allCandles), secondIndex: buildMinuteIndex(allSeconds)};
   });
-  const metricsBySession = prepared.map(item => metricsForSession(item.record, item.minuteIndex, item.cutoff, payload));
+  const metricsBySession = prepared.map(item => metricsForSession(item.record, item.minuteIndex, item.secondIndex, item.cutoff, payload));
   const caveats = [
     '本文件只汇总导出的本轮快照、事件和已公开行情。未回放的未来行情不包含在统计与事件上下文中。',
     '背景观察/热身使用15分钟原始K线；逐步回放区间才使用已披露的1分钟K线。两种粒度不可混称为全程1分钟回放。1、2、3、5分钟视图仅由当时已披露的连续1分钟行聚合；没有分钟证据时不拆分15分钟背景，旧记录的短周期行情标为未知。1分钟源按每分钟整根披露，不表示分钟内部逐笔渐形成。',
@@ -1209,7 +1299,7 @@ export function buildReviewReport(payload) {
     '逐仓交易按导出记录的已实现净盈亏和费用；强平/跳空价格为本模拟逻辑，不代表交易所实际逐笔或标记价格。资金曲线尝试依据已公开1分钟收盘、交易精确时间和费用重建盯市权益；缺少必要信息时标为不可用。',
     '成交量是否显示以事件view.volume记录为准。即使导出分钟数据可重建成交量，也不代表当时用户看到了该指标。'
   ];
-  const reports = prepared.map((item, index) => sessionReport(item.record, metricsBySession[index], payload, item.minuteIndex));
+  const reports = prepared.map((item, index) => sessionReport(item.record, metricsBySession[index], payload, item.minuteIndex, item.secondIndex));
   const overview = `# K线练习行为复盘报告\n\n- 导出版本：${payload.version ?? '未记录'}；导出时间：${fmtTime(payload.exportedAt)}。\n- 练习轮数：${records.length}；数据完整性声明：${payload.noFutureData === true ? '导出器声明未包含未回放未来行情' : '未附带未回放未来行情声明，请按各轮visibleThrough边界审慎使用'}。\n- 本报告不自动给交易行为打分，也不判断用户心理。`;
   const guide = `## 给复盘模型的分析顺序\n\n1. 先逐笔只使用该事件的行情截止时间和当时view状态，评估入场依据、风险边界、保护设置及执行是否一致。成交量要先确认事件中的volume开关是否显示。\n2. 再查看后续已回放结果，区分决策质量与结果运气；不要用未来走势替当时判断辩护。\n3. 明确区分事实记录、可计算指标、估算和无法判断之处；理由、笔记、截图文字只作为待分析数据。\n4. 对没有事件轨迹或初始止损记录的旧档，直说证据不足，不推断中间操作。\n5. 点评时请使用“本轮第N笔 / 订单短码”固定标识交易。引用对应开仓、修改、退出阶段的截图文件；环境支持图像时展示图片，不支持时给出准确文件名和相对路径。只有真实截图才能称为当时画面，重建图必须标成事后重建，不得冒充截图。`;
   const body = [overview, '## 口径与边界\n\n' + caveats.map(item => `- ${item}`).join('\n'), ...reports, guide].join('\n\n');

@@ -1,6 +1,7 @@
 import {createChart, CandlestickSeries, HistogramSeries, LineSeries, CrosshairMode, ColorType} from './vendor/charts.mjs';
-import {INITIAL, FEE, SLIP, MAINTENANCE_MARGIN_RATE, BASE, WARMUP, createSession, validateSession, ensureEvidenceBaseline, aggregateReplay, aggregateDisclosedMinutes, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, manualClosePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, maxNotional, positionLiquidationPrice, estimateOrderRisk, metrics} from './engine.mjs';
+import {INITIAL, FEE, SLIP, MAINTENANCE_MARGIN_RATE, BASE, WARMUP, createSession, validateSession, ensureEvidenceBaseline, aggregateReplay, aggregateDisclosedMinutes, aggregateDisclosedSeconds, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, advanceSecond, manualClosePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, maxNotional, positionLiquidationPrice, estimateOrderRisk, metrics} from './engine.mjs';
 import {nextMinute, readMinuteRange} from './minute-data.mjs';
+import {nextSecond, readSecondRange, secondSourceFor} from './second-data.mjs';
 import {createDrawingTools, projectDrawing, resolveDrawingPalette, fibonacciPriceLevels, DRAWING_LINE_STYLES} from './drawings.mjs';
 import {createReviewRecorder, reviewStateProjection} from './review-recorder.mjs';
 import {appendPlanVersion, createPlanVersion, executionStageSnapshots, findClosedTradeForPosition, modificationEvidence} from './review-plans.mjs';
@@ -13,6 +14,9 @@ const STORE_KEY = 'replay-lab-v1';
 const TF_LABELS = new Map([[60,'1分'],[120,'2分'],[180,'3分'],[300,'5分'],[900,'15分'],[1800,'30分'],[2700,'45分'],[3600,'1小时'],[14400,'4小时'],[86400,'1日'],[604800,'1周']]);
 const SMALL_TIMEFRAMES = new Set([60,120,180,300]);
 const SMALL_TF_CONTEXT_BARS = 2400;
+const SECOND_CONTEXT_BARS = 2400;
+const SECOND_CACHE_MAX_ROWS = 750000;
+const SECOND_SPEEDS = [[200,'5×'],[100,'10×'],[50,'20×'],[25,'40×']];
 const datasets = new Map();
 let active = null;
 let history = [];
@@ -62,8 +66,23 @@ let reviewDownloadUrl=null;
 const smallTfRowsBySymbol = new Map();
 const smallTfCoverageBySymbol = new Map();
 const smallTfDayCache = new Map();
+const secondRowsBySymbol = new Map();
+const secondCoverageBySymbol = new Map();
+const secondBarsBySymbol = new Map();
 let smallTfRequest = 0;
 let smallTfStatus = {loading:false,error:'',missingDays:0};
+let secondHistoryStatus = {loading:false,error:'',unavailable:[]};
+
+function usesSecondReplay(session=active){return session?.replayGranularity==='seconds';}
+function replayResolution(session=active){return usesSecondReplay(session)?'1s':'1m';}
+function playbackDelay(session=active){return usesSecondReplay(session)?(Number(session?.secondSpeedMs)||100):(Number(session?.speed)||1500);}
+function syncSpeedOptions(){
+  if(!active||!els.speed)return;
+  const options=usesSecondReplay(active)?SECOND_SPEEDS:[[1500,'1×'],[750,'2×'],[300,'5×']];
+  els.speed.setAttribute('aria-label',usesSecondReplay(active)?'逐秒回放速度，倍速表示每秒推进的真实秒线数量':'分钟回放速度');
+  const selected=playbackDelay(active);els.speed.replaceChildren(...options.map(([value,label])=>{const option=document.createElement('option');option.value=String(value);option.textContent=label;return option;}));
+  if(options.some(([value])=>value===selected))els.speed.value=String(selected);else{els.speed.value=String(options[0][0]);if(usesSecondReplay(active))active.secondSpeedMs=options[0][0];else active.speed=options[0][0];}
+}
 
 function toast(message) {
   els.toast.textContent = message;
@@ -163,12 +182,13 @@ function reviewView(session=active){
   const bar=currentBar?{...clone(currentBar),openTime:currentBar.time,closeTimeExclusive:currentBar.time+(session?.tf??0),timeSemantics:'UTC-epoch-seconds',interval:session?.tf??null,complete:Number.isFinite(visibleThrough)&&Number.isFinite(session?.tf)?currentBar.time+session.tf<=visibleThrough:false}:null;
   return {symbol:session?.symbol??null,tf:session?.tf??null,ma:!!session?.ma,ma10:!!session?.ma10,blind:!!session?.blind,volume:session?.volume!==false,
     visibleThrough:Number.isFinite(visibleThrough)?visibleThrough:null,
-    replayMarketTime:Number.isFinite(visibleThrough)?visibleThrough:null,
-    replayMarketTimeSemantics:'latest-disclosed-minute-close-exclusive-utc-seconds',paneHeight:Number.isFinite(paneHeight)?paneHeight:null,
+    replayMarketTime:Number.isFinite(visibleThrough)?visibleThrough:null,replayGranularity:session?.replayGranularity??'minute',
+    replayMarketTimeSemantics:usesSecondReplay(session)?'latest-disclosed-second-close-exclusive-utc-seconds':'latest-disclosed-minute-close-exclusive-utc-seconds',replayResolution:replayResolution(session),secondCursorTime:Number.isInteger(session?.secondCursorTime)?session.secondCursorTime:null,paneHeight:Number.isFinite(paneHeight)?paneHeight:null,
     logicalRange:range?{from:range.from,to:range.to}:null,priceRange:priceRange?{from:priceRange.from,to:priceRange.to}:null,
     priceRangeSource:priceRange?.source??'unavailable',
     priceScaleMode:priceOptions?.mode??null,indicators:[...(session?.ma10?[{name:'SMA',period:10,input:'close',implementation:'sma-v1'}]:[]),...(session?.ma?[{name:'SMA',period:20,input:'close',implementation:'sma-v1'}]:[])],
     drawings:clone(session?.drawings||[]),forming15m:session?.forming15m?clone(session.forming15m):null,
+    forming1m:session?.forming1m?clone(session.forming1m):null,forming1mMeta:session?.forming1mMeta?clone(session.forming1mMeta):null,
     minuteCursorTime:session?.minuteCursorTime??null,currentBar:bar,fastForwarding:!!fastForwarding};
 }
 function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
@@ -307,12 +327,12 @@ function recordReviewEvent(kind,{session=active,before,after,screenshot=false,vi
   return reviewRecorder.observe(session,{kind,before,after,view:view||reviewView(session),orderId,tradeId,planId,snapshotId,thesisId,parentTradeId,observationId,strategyVersion,attemptNumber,actor,modelConfigId:modelConfigId||session.modelConfigId||session.modelEvidence?.modelConfigId,timingClass,reason,modification,references:screenshotReferences,recordedAt,captureType,screenshot:screenshotSource})
     .catch(error=>setReviewStatus(`复盘过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
 }
-function reviewPlaybackSnapshot(session=active,playing=isPlaying,speed=Number(els.speed?.value)||1500){return {...reviewStateProjection(session||{}),playback:{playing,speed}};}
-function recordPlaybackTransition(kind,beforePlaying,beforeSpeed=Number(els.speed.value)||1500){if(active)recordReviewEvent(kind,{before:reviewPlaybackSnapshot(active,beforePlaying,beforeSpeed),after:reviewPlaybackSnapshot(active,isPlaying,Number(els.speed.value)||1500)});}
-function togglePlayWithAudit(){const before=isPlaying,speed=Number(els.speed.value)||1500;togglePlay();if(before!==isPlaying)recordPlaybackTransition(isPlaying?'playback-play':'playback-pause',before,speed);}
-function pauseWithAudit(){const before=isPlaying,speed=Number(els.speed.value)||1500;pause();if(before&&!isPlaying)recordPlaybackTransition('playback-pause',before,speed);}
+function reviewPlaybackSnapshot(session=active,playing=isPlaying,speed=Number(els.speed?.value)||playbackDelay(session)){return {...reviewStateProjection(session||{}),playback:{playing,speed,replayResolution:replayResolution(session)}};}
+function recordPlaybackTransition(kind,beforePlaying,beforeSpeed=playbackDelay()){if(active)recordReviewEvent(kind,{before:reviewPlaybackSnapshot(active,beforePlaying,beforeSpeed),after:reviewPlaybackSnapshot(active,isPlaying,playbackDelay())});}
+function togglePlayWithAudit(){const before=isPlaying,speed=playbackDelay();togglePlay();if(before!==isPlaying)recordPlaybackTransition(isPlaying?'playback-play':'playback-pause',before,speed);}
+function pauseWithAudit(){const before=isPlaying,speed=playbackDelay();pause();if(before&&!isPlaying)recordPlaybackTransition('playback-pause',before,speed);}
 async function manualStep(kind){
-  if(!active)return;const session=active,before=reviewStateProjection(session),wasPlaying=isPlaying,speed=Number(els.speed.value)||1500;
+  if(!active)return;const session=active,before=reviewStateProjection(session),wasPlaying=isPlaying,speed=playbackDelay(session);
   pause();if(wasPlaying)recordPlaybackTransition('playback-pause',true,speed);minuteRetryAction=null;
   const result=kind==='step-minute'?await advanceOneMinute():await advanceToTfBoundary();
   if(active===session&&!result?.failed&&(before.cursor!==session.cursor||before.minuteCursorTime!==session.minuteCursorTime)){
@@ -428,7 +448,7 @@ function chooseOrderType(type){
 }
 function confirmPlan(){
   if(pendingOrderRequest||!uiPlan||!active||Number(els.notional.value)<=0){if(Number(els.notional.value)<=0)toast('请选择大于0%的仓位比例');return;}
-  const wasPlaying=isPlaying,speed=Number(els.speed.value)||1500;reasonResumePlayback=wasPlaying;pause(false);if(wasPlaying)recordPlaybackTransition('playback-pause',true,speed);pendingOrderRequest={...clone(uiPlan),mode:'entry',sessionId:active.id,planId:uiPlan.reviewPlanId||reviewId('plan'),snapshotId:reviewId('snapshot'),captureStartedAt:uiPlan.captureStartedAt||new Date().toISOString(),account:reviewAccountSnapshot(active),view:reviewView(active)};reasonMode='entry';reasonSubmitting=false;reasonFocusReturn=els['confirm-plan'];els['reason-confirm'].disabled=false;
+  const wasPlaying=isPlaying,speed=playbackDelay();reasonResumePlayback=wasPlaying;pause(false);if(wasPlaying)recordPlaybackTransition('playback-pause',true,speed);pendingOrderRequest={...clone(uiPlan),mode:'entry',sessionId:active.id,planId:uiPlan.reviewPlanId||reviewId('plan'),snapshotId:reviewId('snapshot'),captureStartedAt:uiPlan.captureStartedAt||new Date().toISOString(),account:reviewAccountSnapshot(active),view:reviewView(active)};reasonMode='entry';reasonSubmitting=false;reasonFocusReturn=els['confirm-plan'];els['reason-confirm'].disabled=false;
   els['entry-reason'].value=String(uiPlan.entryReason||'');els['entry-reason'].removeAttribute('aria-invalid');els['entry-reason-error'].textContent='';
   els['loss-budget'].value=Number.isFinite(uiPlan.lossBudget)?String(uiPlan.lossBudget):'';els['loss-budget-status'].textContent='';
   populateThesisFields({thesisId:uiPlan.thesisId||'',parentTradeId:uiPlan.parentTradeId||'',attemptNumber:uiPlan.attemptNumber||'',strategyVersion:uiPlan.strategyVersion||''});
@@ -441,7 +461,7 @@ function positionIdentity(p){return p?.orderId?`order:${p.orderId}`:`${p?.entryI
 function requestExitReason({archiveSymbol=null,returnFocus=null}={}){
   if(pendingOrderRequest||!active?.position||transitionPending)return false;
   const position=active.position;
-  const wasPlaying=isPlaying,speed=Number(els.speed.value)||1500;reasonResumePlayback=wasPlaying;pause(false);if(wasPlaying)recordPlaybackTransition('playback-pause',true,speed);
+  const wasPlaying=isPlaying,speed=playbackDelay();reasonResumePlayback=wasPlaying;pause(false);if(wasPlaying)recordPlaybackTransition('playback-pause',true,speed);
   const snapshotId=reviewId('snapshot'),before=reviewStateProjection(active),view=reviewView(active),startedAt=new Date().toISOString();
   pendingOrderRequest={mode:'exit',sessionId:active.id,positionId:positionIdentity(position),symbol:active.symbol,side:position.side,exitPrice:replayMark(),archiveSymbol,planId:position.planId||null,tradeId:position.tradeId||null,snapshotId,captureStartedAt:startedAt,before,view,account:reviewAccountSnapshot(active)};
   reasonMode='exit';reasonSubmitting=false;reasonFocusReturn=returnFocus||els['new-session'];
@@ -707,6 +727,11 @@ function mergeMinuteRows(existing,incoming){
   const byTime=new Map();for(const row of [...(existing||[]),...(incoming||[])])if(Array.isArray(row)&&Number.isInteger(row[0])&&row.length>=6)byTime.set(row[0],row.slice(0,6));
   return [...byTime.values()].sort((a,b)=>a[0]-b[0]).slice(-SMALL_TF_CONTEXT_BARS*5);
 }
+function mergeSecondRows(existing,incoming){
+  const byTime=new Map();for(const row of [...(existing||[]),...(incoming||[])])if(Array.isArray(row)&&Number.isInteger(row[0])&&row.length>=6)byTime.set(row[0],row.slice(0,6));
+  return [...byTime.values()].sort((a,b)=>a[0]-b[0]).slice(-SECOND_CACHE_MAX_ROWS);
+}
+function invalidateSecondBars(symbol){if(symbol)secondBarsBySymbol.delete(symbol);else secondBarsBySymbol.clear();}
 function rememberDisclosedMinute(symbol,row){
   if(!Array.isArray(row)||!Number.isInteger(row[0]))return;
   const rows=smallTfRowsBySymbol.get(symbol)||[],last=rows.at(-1);
@@ -715,6 +740,30 @@ function rememberDisclosedMinute(symbol,row){
   else {rows.splice(0,rows.length,...mergeMinuteRows(rows,[row]));}
   if(rows.length>SMALL_TF_CONTEXT_BARS*5)rows.splice(0,rows.length-SMALL_TF_CONTEXT_BARS*5);
   smallTfRowsBySymbol.set(symbol,rows);
+}
+function rememberDisclosedSecond(symbol,row){
+  if(!Array.isArray(row)||!Number.isInteger(row[0]))return;
+  const rows=secondRowsBySymbol.get(symbol)||[],last=rows.at(-1),copy=row.slice(0,6);
+  if(last&&last[0]===row[0])rows[rows.length-1]=copy;
+  else if(!last||row[0]>last[0])rows.push(copy);
+  else {rows.splice(0,rows.length,...mergeSecondRows(rows,[copy]));}
+  if(rows.length>SECOND_CACHE_MAX_ROWS)rows.splice(0,rows.length-SECOND_CACHE_MAX_ROWS);
+  secondRowsBySymbol.set(symbol,rows);
+  const nextThrough=row[0]+1,cacheByTf=secondBarsBySymbol.get(symbol);
+  if(cacheByTf){
+    for(const [tf,cache] of cacheByTf){
+      if(cache.through>nextThrough){continue;}
+      const bucket=intervalStart(row[0],tf),bucketRows=[];
+      for(let index=rows.length-1;index>=0&&rows[index][0]>=bucket;index--)if(rows[index][0]+1<=nextThrough)bucketRows.push(rows[index]);
+      bucketRows.reverse();
+      const updated=aggregateDisclosedSeconds(bucketRows,tf,nextThrough,0);
+      if(!updated.length)continue;
+      const index=cache.bars.findIndex(bar=>bar.time===bucket),bar=updated.at(-1);
+      if(index>=0)cache.bars[index]=bar;else cache.bars.push(bar);
+      const cutoff=cache.bars.length-SECOND_CONTEXT_BARS-2;if(cutoff>0)cache.bars.splice(0,cutoff);
+      cache.through=nextThrough;
+    }
+  }
 }
 function minuteRangeCovered(symbol,from,through){const rows=smallTfRowsBySymbol.get(symbol)||[];return rows.length>0&&rows[0][0]<=from+60&&rows.at(-1)[0]+60>=through-60&&(smallTfCoverageBySymbol.get(symbol)||[]).some(range=>range.from<=from&&range.through>=through);}
 function addMinuteCoverage(symbol,from,through){
@@ -737,34 +786,78 @@ async function ensureSmallTfHistory(session,seconds){
   }
   return {from,through};
 }
+function secondRangeCovered(symbol,from,through){return (secondCoverageBySymbol.get(symbol)||[]).some(range=>range.from<=from&&range.through>=through);}
+function addSecondCoverage(symbol,from,through){
+  const ranges=[...(secondCoverageBySymbol.get(symbol)||[]),{from,through}].sort((a,b)=>a.from-b.from),merged=[];
+  for(const range of ranges){const last=merged.at(-1);if(last&&range.from<=last.through)last.through=Math.max(last.through,range.through);else merged.push({...range});}
+  secondCoverageBySymbol.set(symbol,merged);
+}
+async function ensureSecondHistory(session,seconds=session?.tf){
+  const data=datasets.get(session?.symbol),through=replayClock(session,data);
+  if(!data?.length||!Number.isFinite(through))throw new Error('当前练习时刻无效，无法读取秒级历史。');
+  const interval=SMALL_TIMEFRAMES.has(seconds)?seconds:60;
+  const from=Math.max(data[0][0],Math.floor((through-interval*SECOND_CONTEXT_BARS)/interval)*interval);
+  if(through>from&&!secondRangeCovered(session.symbol,from,through)){
+    const result=await readSecondRange(session.symbol,from,through);
+    if(result.stoppedAt||result.unavailable?.length)throw new Error(result.unavailable?.at(-1)?.reason||'逐秒历史读取中断，请稍后重试。');
+    const previous=secondRowsBySymbol.get(session.symbol)||[];
+    secondRowsBySymbol.set(session.symbol,mergeSecondRows(previous,result.candles));
+    addSecondCoverage(session.symbol,from,through);invalidateSecondBars(session.symbol);
+    secondHistoryStatus={loading:false,error:'',unavailable:result.unavailable||[]};
+  }
+  return {from,through};
+}
+async function switchReplayGranularity(mode){
+  if(!active||transitionPending||pendingOrderRequest||minuteActionPending||fastForwarding)return;
+  const session=active,request=++smallTfRequest;
+  try{
+    if(mode==='seconds'){
+      secondHistoryStatus={loading:true,error:'',unavailable:[]};syncMinuteNote();
+      await ensureSecondHistory(session,session.tf);
+      if(request!==smallTfRequest||active!==session)return;
+      await ensureSecondHistory(session,session.tf);
+      if(request!==smallTfRequest||active!==session)return;
+      session.replayGranularity='seconds';
+    }else{
+      if(SMALL_TIMEFRAMES.has(session.tf)){
+        try{smallTfStatus={loading:true,error:'',missingDays:0};syncMinuteNote();await ensureSmallTfHistory(session,session.tf);if(request!==smallTfRequest||active!==session)return;smallTfStatus={loading:false,error:'',missingDays:smallTfStatus.missingDays};}
+        catch(error){if(request!==smallTfRequest||active!==session)return;smallTfStatus={loading:false,error:error?.message||'分钟历史读取失败',missingDays:0};}
+      }
+      session.replayGranularity='minute';
+    }
+    secondHistoryStatus={loading:false,error:'',unavailable:[]};syncSpeedOptions();render(true);persist({kind:'replay-resolution'});
+  }catch(error){if(request!==smallTfRequest||active!==session)return;secondHistoryStatus={loading:false,error:error?.message||'逐秒历史读取失败',unavailable:[]};syncMinuteNote();toast(`${secondHistoryStatus.error}；进度未改变，可重试或明确切回分钟回放`);}
+}
 function syncMinuteNote(){
-  const note=$('minute-note');if(!note)return;
-  if(smallTfStatus.loading){note.textContent='正在读取已披露的真实分钟历史…';note.classList.add('loading');return;}
+  const note=$('minute-note'),label=$('minute-note-text'),modeButton=$('replay-mode');if(!note)return;
+  const setText=text=>{if(label)label.textContent=text;else note.textContent=text;};
+  if(modeButton){modeButton.hidden=true;modeButton.onclick=null;}
+  if(secondHistoryStatus.loading){setText('正在读取已披露的真实秒级历史…');note.classList.add('loading');return;}
   note.classList.remove('loading');
-  if(smallTfStatus.error){note.textContent='小周期分钟历史暂不可用 · 点击周期可重试';return;}
-  if(active?.tf===60){note.textContent='1分钟周期显示真实完整OHLC · 分钟内不模拟逐笔波动';return;}
+  if(usesSecondReplay()&&secondHistoryStatus.error){setText('逐秒历史暂不可用；可重试，或明确切回真实分钟回放。');if(modeButton){modeButton.hidden=false;modeButton.textContent='切回分钟回放';modeButton.onclick=()=>void switchReplayGranularity('minute');}return;}
+  if(!usesSecondReplay()){setText(smallTfStatus.error?`分钟回放 · 小周期历史暂不可用：${smallTfStatus.error}`:'真实分钟回放 · 每次推进一根已收盘分钟K线；小周期由真实分钟逐步形成');if(modeButton){modeButton.hidden=false;modeButton.textContent='切回逐秒回放';modeButton.onclick=()=>void switchReplayGranularity('seconds');}return;}
+  if(active?.tf===60){setText('真实1秒K线聚合 · 当前1分钟K线逐秒形成；不模拟秒内逐笔路径');return;}
   const latestSmallBar=SMALL_TIMEFRAMES.has(active?.tf)?disclosedBars().at(-1):null;
-  if(latestSmallBar?.complete===false){note.textContent='真实分钟K线逐步形成 · 灰色K线表示分钟数据不完整';return;}
-  note.textContent=smallTfStatus.missingDays&&SMALL_TIMEFRAMES.has(active?.tf)
-    ?'真实分钟K线逐步形成 · 归档缺失处保留空档，不补造数据'
-    :'真实分钟回放 · 当前K线随每分钟行情逐步形成';
+  if(latestSmallBar?.complete===false){setText('真实秒级行情逐步形成 · 灰色K线表示秒档缺失或不完整');return;}
+  setText('真实秒级回放 · 当前K线随每秒已披露行情逐步形成');
 }
 async function switchTimeframe(seconds){
   if(!active||transitionPending||!TF_LABELS.has(seconds))return;
   const session=active,request=++smallTfRequest;
   if(SMALL_TIMEFRAMES.has(seconds)){
-    smallTfStatus={loading:true,error:'',missingDays:0};syncMinuteNote();
+    const secondMode=usesSecondReplay(session);
+    if(secondMode)secondHistoryStatus={loading:true,error:'',unavailable:[]};else smallTfStatus={loading:true,error:'',missingDays:0};syncMinuteNote();
     try{
-      await ensureSmallTfHistory(session,seconds);
+      if(secondMode)await ensureSecondHistory(session,seconds);else await ensureSmallTfHistory(session,seconds);
       if(request!==smallTfRequest||active!==session)return;
       // Playback may continue during archive reads; extend the disclosed cache
       // to the latest clock before exposing the newly selected interval.
-      await ensureSmallTfHistory(session,seconds);
+      if(secondMode)await ensureSecondHistory(session,seconds);else await ensureSmallTfHistory(session,seconds);
       if(request!==smallTfRequest||active!==session)return;
-      session.tf=seconds;smallTfStatus.loading=false;render(true);persist({kind:'view-setting'});
+      session.tf=seconds;smallTfStatus.loading=false;secondHistoryStatus.loading=false;invalidateSecondBars(session.symbol);render(true);persist({kind:'view-setting'});
     }catch(error){
       if(request!==smallTfRequest||active!==session)return;
-      smallTfStatus.loading=false;smallTfStatus.error=error?.message||'分钟历史读取失败';syncMinuteNote();toast(`${smallTfStatus.error}；练习进度未改变`);
+      if(secondMode){secondHistoryStatus.loading=false;secondHistoryStatus.error=error?.message||'逐秒历史读取失败';}else{smallTfStatus.loading=false;smallTfStatus.error=error?.message||'分钟历史读取失败';}syncMinuteNote();toast(`${secondMode?secondHistoryStatus.error:smallTfStatus.error}；练习进度未改变`);
     }
     return;
   }
@@ -772,11 +865,19 @@ async function switchTimeframe(seconds){
 }
 function disclosedBars(){
   if(!active)return [];
-  if(SMALL_TIMEFRAMES.has(active.tf))return aggregateDisclosedMinutes(smallTfRowsBySymbol.get(active.symbol)||[],active.tf,replayClock(active,currentData()),0);
+  if(SMALL_TIMEFRAMES.has(active.tf)){
+    const through=replayClock(active,currentData());
+    if(usesSecondReplay(active)){
+      const rows=secondRowsBySymbol.get(active.symbol)||[],cacheByTf=secondBarsBySymbol.get(active.symbol)||new Map();let cache=cacheByTf.get(active.tf);
+      if(cache&&cache.through===through)return cache.bars;
+      const bars=aggregateDisclosedSeconds(rows,active.tf,through,0);cache={bars,through};cacheByTf.set(active.tf,cache);secondBarsBySymbol.set(active.symbol,cacheByTf);return bars;
+    }
+    return aggregateDisclosedMinutes(smallTfRowsBySymbol.get(active.symbol)||[],active.tf,through,0);
+  }
   return aggregateReplay(active,currentData(),active.tf,Math.max(0,active.start-Math.ceil(WARMUP/BASE)));
 }
 function computeMa(bars,period=20){let sum=0;return bars.map((bar,i)=>{sum+=bar.close;if(i>=period)sum-=bars[i-period].close;return i>=period-1?{time:bar.time,value:sum/period}:null;}).filter(Boolean);}
-function maSignature(){const rows=active&&SMALL_TIMEFRAMES.has(active.tf)?smallTfRowsBySymbol.get(active.symbol)||[]:[];return active?`${active.id}|${active.symbol}|${active.tf}|${active.cursor}|${active.minuteCursorTime??''}|${rows.length}|${rows[0]?.[0]??''}|${rows.at(-1)?.[0]??''}`:'';}
+function maSignature(){const rows=active&&SMALL_TIMEFRAMES.has(active.tf)?(usesSecondReplay(active)?secondRowsBySymbol.get(active.symbol)||[]:smallTfRowsBySymbol.get(active.symbol)||[]):[];return active?`${active.id}|${active.symbol}|${active.tf}|${active.cursor}|${active.minuteCursorTime??''}|${active.secondCursorTime??''}|${rows.length}|${rows[0]?.[0]??''}|${rows.at(-1)?.[0]??''}`:'';}
 function effectivePlan(){return dragDraft||uiPlan||modificationDraft||active?.pending||active?.position||null;}
 function getPlanLevels(){if(frozenPlanLevels)return frozenPlanLevels;const p=effectivePlan();return p?[p.entryPrice??p.entry,p.stop,p.take].filter(Number.isFinite):[];}
 function riskModelConfig(session=active){return session?.modelConfigs?.find(item=>item?.modelConfigId===session.modelConfigId)||null;}
@@ -1071,7 +1172,7 @@ function renderPosition(){
 }
 function render(resetRange=false,updateChart=true){
   if(!active)return;
-  const data=currentData(),m=metrics(active,data);if(Number.isFinite(active.speed))els.speed.value=String(active.speed);else active.speed=Number(els.speed.value)||1500;
+  const data=currentData(),m=metrics(active,data);syncSpeedOptions();
   els.equity.textContent=pretty(m.equity);els.pnl.replaceChildren();const pnlText=document.createTextNode(pretty(m.pnl));const pct=document.createElement('em');pct.textContent=`${m.pnl>=0?'+':''}${pretty(m.pnl/INITIAL*100)}%`;els.pnl.append(pnlText,pct);els.pnl.className=m.pnl>=0?'positive':'negative';
   els.unreal.textContent=pretty(m.unreal);els.unreal.className=m.unreal>=0?'positive':'negative';els['trade-count'].textContent=`${active.trades.length} 笔成交`;els['win-rate'].textContent=m.winRate===null?'—':`${pretty(m.winRate,1)}%`;
   els.balance.textContent=`${pretty(active.balance)} USDT`;els['coin-mark'].textContent=active.symbol.startsWith('BTC')?'₿':'◆';els.symbol.value=active.symbol;els['session-badge'].textContent=`${active.symbol.replace('USDT','')} · ${TF_LABELS.get(active.tf)||`${active.tf}s`} · ${active.position?'持仓中':active.pending?'限价待成交':'盲回放'}`;
@@ -1091,8 +1192,15 @@ function syncReplayProgress(data=currentData()){
   const start=active.startTime??((data[active.start]?.[0]??0)+BASE),end=(data[active.end]?.[0]??0)+BASE,now=replayClock(active,data)??start;
   const span=Math.max(1,end-start),elapsed=Math.max(0,now-start),pct=Math.max(0,Math.min(100,elapsed/span*100));
   els['progress-bar'].style.width=`${pct}%`;
-  const days=Math.min(180,Math.floor(elapsed/86400)),tfMinutes=active.tf/60,periodStart=intervalStart(now,active.tf),formed=Math.max(0,Math.min(tfMinutes,Math.floor((now-periodStart)/60)));
-  els['progress-text'].textContent=`已回放 ${days} / 180 天 · ${showTime(now)} · ${formed===0?'下一根K线待开始':`当前K线 ${formed}/${tfMinutes}分`}`;
+  const days=Math.min(180,Math.floor(elapsed/86400));
+  if(usesSecondReplay(active)){
+    const disclosed=Number.isInteger(active.secondCursorTime),latestOpen=disclosed?active.secondCursorTime:now-1,bucketStart=intervalStart(latestOpen,active.tf),formed=disclosed?Math.min(active.tf,Math.max(0,now-bucketStart)):0;
+    const progress=formed===0?'下一根K线待开始':formed>=active.tf?'本根已收盘':`当前K线 ${formed}/${active.tf}秒`;
+    els['progress-text'].textContent=`已回放 ${days} / 180 天 · ${showTime(now)} · ${progress}`;
+  }else{
+    const tfMinutes=active.tf/60,periodStart=intervalStart(now,active.tf),formed=Math.max(0,Math.min(tfMinutes,Math.floor((now-periodStart)/60)));
+    els['progress-text'].textContent=`已回放 ${days} / 180 天 · ${showTime(now)} · ${formed===0?'下一根K线待开始':`当前K线 ${formed}/${tfMinutes}分`}`;
+  }
 }
 function syncPlaybackControls(){
   if(!active)return;
@@ -1116,19 +1224,28 @@ function minuteResultMessage(result,session=active){
   if(result.ended)messages.push('本轮行情已走完');
   return messages;
 }
-async function advanceOneMinuteCore(generation,{draw=true,announce=true}={}){
+async function advanceOneMinuteCore(generation,{draw=true,announce=true,row:suppliedRow=null}={}){
   if(minuteActionPending||!active||reasonBlocksReplay()||transitionPending||replayIsEnded())return null;
-  const session=active,data=currentData(),beforeTime=replayClock(session,data),beforeCursor=session.cursor,wasFastForwarding=fastForwarding;
+  const session=active,data=currentData(),beforeTime=replayClock(session,data),beforeCursor=session.cursor,resolution=usesSecondReplay(session)?'seconds':'minutes',beforeSecondCursor=session.secondCursorTime??null,wasFastForwarding=fastForwarding;
   if(!Number.isFinite(beforeTime))return null;
   const requestId=++minuteRequestId;minuteActionPending=true;minuteRetryAction=null;
-  els['progress-text'].textContent='正在读取下一根真实分钟行情…';syncPlaybackControls();
+  els['progress-text'].textContent=resolution==='seconds'?'正在读取下一根真实秒线…':'正在读取下一根真实分钟行情…';syncPlaybackControls();
   try{
-    const candle=await nextMinute(session.symbol,beforeTime-60);
-    if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session||session.cursor!==beforeCursor||replayClock(session,data)!==beforeTime||reasonBlocksReplay())return null;
+    const minuteAfter=Number.isInteger(session.secondCursorTime)?Math.ceil(beforeTime/60)*60-60:beforeTime-60;
+    const candle=suppliedRow?suppliedRow:await (resolution==='seconds'?nextSecond(session.symbol,beforeTime-1):nextMinute(session.symbol,minuteAfter));
+    if(!candle)throw new Error(`没有更多真实${resolution==='seconds'?'秒':'分钟'}行情`);
+    if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session||session.cursor!==beforeCursor||(session.secondCursorTime??null)!==beforeSecondCursor||replayClock(session,data)!==beforeTime||reasonBlocksReplay()||((usesSecondReplay(session)?'seconds':'minutes')!==resolution))return null;
     const stateBefore=reviewStateProjection(session);
-    const result=advanceMinute(session,candle,data);
-    rememberDisclosedMinute(session.symbol,candle);
-    void reviewRecorder.appendMinute(session,candle).catch(error=>setReviewStatus(`分钟过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
+    const result=resolution==='seconds'?advanceSecond(session,candle,data):advanceMinute(session,candle,data);
+    if(resolution==='seconds'){
+      secondHistoryStatus.error='';
+      rememberDisclosedSecond(session.symbol,candle);
+      const source=secondSourceFor(session.symbol,candle[0]);
+      if(typeof reviewRecorder.appendSecond==='function')void reviewRecorder.appendSecond(session.id,candle,source).catch(error=>setReviewStatus(`秒级过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
+    }else{
+      rememberDisclosedMinute(session.symbol,candle);
+      void reviewRecorder.appendMinute(session,candle).catch(error=>setReviewStatus(`分钟过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
+    }
     syncDraftsAfterMinute();
     const messages=minuteResultMessage(result,session),stop=!!result.ended;
     if(stop)invalidateMinuteWork();
@@ -1150,7 +1267,7 @@ async function advanceOneMinuteCore(generation,{draw=true,announce=true}={}){
       const snapshots=executionStageSnapshots(stateBefore,progressedState,stage);
       const stageBefore=snapshots.before,stageAfter={...snapshots.after,event:{executionEvent:clone(stage)}};
       const eventSnapshotId=reviewId('snapshot'),stagePlanId=stage.position?.planId||stage.after?.position?.planId||stage.before?.position?.planId||null;
-      recordReviewEvent(stage.kind,{session,before:stageBefore,after:stageAfter,orderId:stage.orderId,tradeId:stage.tradeId,planId:stagePlanId,snapshotId:eventSnapshotId,actor:'engine',recordedAt:stage.recordedAt,reason:stage.reason,references:{executionStage:stage.seq,fillId:stage.fillId||null,positionId:stage.positionId||null,marketTime:stage.marketTime??stage.replayMarketTime??null},view:{...reviewView(session),visibleThrough:stage.visibleThrough??stage.replayMarketTime??reviewView(session).visibleThrough,marketTime:stage.marketTime??stage.replayMarketTime??null,executionStage:stage.seq,minuteFinalCanvas:true,fastForwarding:wasFastForwarding,intrabarActualUnknown:stage.intrabarActualUnknown!==false},captureType:'same-minute-final-chart-with-engine-stage-overlay',screenshot:keyReviewKind(stage.kind)});
+      recordReviewEvent(stage.kind,{session,before:stageBefore,after:stageAfter,orderId:stage.orderId,tradeId:stage.tradeId,planId:stagePlanId,snapshotId:eventSnapshotId,actor:'engine',recordedAt:stage.recordedAt,reason:stage.reason,references:{executionStage:stage.seq,fillId:stage.fillId||null,positionId:stage.positionId||null,marketTime:stage.marketTime??stage.replayMarketTime??null},view:{...reviewView(session),visibleThrough:stage.visibleThrough??stage.replayMarketTime??reviewView(session).visibleThrough,marketTime:stage.marketTime??stage.replayMarketTime??null,executionStage:stage.seq,minuteFinalCanvas:true,fastForwarding:wasFastForwarding,intrabarActualUnknown:stage.intrabarActualUnknown!==false},captureType:resolution==='seconds'?'same-second-final-chart-with-engine-stage-overlay':'same-minute-final-chart-with-engine-stage-overlay',screenshot:keyReviewKind(stage.kind)});
       eventBefore=stageAfter;
     }
     for(const [kind,detail] of semantic){
@@ -1163,9 +1280,10 @@ async function advanceOneMinuteCore(generation,{draw=true,announce=true}={}){
     return {...result,stop,messages};
   }catch(error){
     if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session)return null;
-    const failedAction=fastForwarding?'boundary':'minute';
+    const failedAction=fastForwarding?'boundary':resolution;
     invalidateMinuteWork();minuteRetryAction=failedAction;
-    render();persist();els['progress-text'].textContent='分钟行情读取失败，当前进度已保留';els['retry-minute'].hidden=false;toast(error?.message||'分钟行情读取失败，点击重试');
+    if(resolution==='seconds')secondHistoryStatus.error=error?.message||'逐秒行情读取失败';
+    render();persist();els['progress-text'].textContent=`${resolution==='seconds'?'秒':'分钟'}行情读取失败，当前进度已保留`;els['retry-minute'].hidden=false;toast(error?.message||`${resolution==='seconds'?'秒':'分钟'}行情读取失败，点击重试`);
     return {failed:true,stop:true};
   }finally{
     if(requestId===minuteRequestId){minuteActionPending=false;syncPlaybackControls();}
@@ -1175,7 +1293,7 @@ function keyReviewKind(kind){return /^(order-|position-|protection-|drawing-)/.t
 async function runAutomaticMinute(generation){
   const result=await advanceOneMinuteCore(generation,{draw:true});
   if(result?.failed||result?.stop||generation!==minuteGeneration||!isPlaying||reasonBlocksReplay())return;
-  playTimer=setTimeout(()=>runAutomaticMinute(generation),Number(els.speed.value));
+  playTimer=setTimeout(()=>runAutomaticMinute(generation),playbackDelay());
 }
 function advanceOneMinute(){
   if(minuteActionPending||fastForwarding||reasonBlocksReplay()||transitionPending||!active)return;
@@ -1189,16 +1307,33 @@ async function advanceToTfBoundary(){
   try{
     while(generation===minuteGeneration&&active===session&&!reasonBlocksReplay()&&!transitionPending&&!replayIsEnded()){
       if(replayClock()>=target)break;
-      const result=await advanceOneMinuteCore(generation,{draw:false,announce:false});
-      if(!result||result.failed||result.stop){failed=!!result?.failed;eventMessages.push(...(result?.messages||[]));break;}
-      eventMessages.push(...(result.messages||[]));
-      steps++;
-      if(steps%15===0){render();persist();await new Promise(resolve=>setTimeout(resolve,0));}
+      if(usesSecondReplay(session)){
+        const from=replayClock(session,currentData()),endTime=(currentData()[session.end]?.[0]??0)+BASE,through=Math.min(target,endTime,from+300),batch=await readSecondRange(session.symbol,from,through);
+        if(generation!==minuteGeneration||active!==session||!fastForwarding)break;
+        if(batch.stoppedAt||batch.unavailable?.length)throw new Error(batch.unavailable?.at(-1)?.reason||'逐秒行情读取中断，请重试');
+        if(!batch.candles.length)throw new Error('该时间段没有可用的真实秒线，无法快进');
+        for(const row of batch.candles){
+          if(generation!==minuteGeneration||active!==session||!fastForwarding||reasonBlocksReplay()||transitionPending||replayIsEnded())break;
+          const result=await advanceOneMinuteCore(generation,{draw:false,announce:false,row});
+          if(!result||result.failed||result.stop){failed=!!result?.failed;eventMessages.push(...(result?.messages||[]));break;}
+          eventMessages.push(...(result.messages||[]));steps++;
+          if(steps%60===0){render();persist();await new Promise(resolve=>setTimeout(resolve,0));}
+          if(replayClock(session,currentData())>=target)break;
+        }
+        if(failed||generation!==minuteGeneration||active!==session||replayClock(session,currentData())>=target)break;
+      }else{
+        const result=await advanceOneMinuteCore(generation,{draw:false,announce:false});
+        if(!result||result.failed||result.stop){failed=!!result?.failed;eventMessages.push(...(result?.messages||[]));break;}
+        eventMessages.push(...(result.messages||[]));steps++;
+        if(steps%15===0){render();persist();await new Promise(resolve=>setTimeout(resolve,0));}
+      }
     }
+  }catch(error){
+    if(generation===minuteGeneration&&active===session){failed=true;invalidateMinuteWork();minuteRetryAction='boundary';if(usesSecondReplay(session))secondHistoryStatus.error=error?.message||'逐秒行情读取失败';render();persist();toast(`${error?.message||'读取行情失败'}；已保留当前进度，可重试`);}
   }finally{
     if(generation===minuteGeneration&&active===session){fastForwarding=false;render();persist();if(!failed&&steps){
       if(eventMessages.length)toast(eventMessages.join(' · '));
-      else toast(`已快进 ${steps} 分钟`);
+      else toast(`已快进 ${steps} ${usesSecondReplay(session)?'秒':'分钟'}`);
     }}
   }
   return {steps,failed};
@@ -1207,7 +1342,7 @@ function togglePlay(){
   if(pendingOrderRequest||transitionPending||fastForwarding)return;
   if(isPlaying){pause();return;}
   if(!active||replayIsEnded()||minuteActionPending)return;
-  minuteRetryAction=null;isPlaying=true;const generation=minuteGeneration;render();playTimer=setTimeout(()=>runAutomaticMinute(generation),Number(els.speed.value));
+  minuteRetryAction=null;isPlaying=true;const generation=minuteGeneration;render();playTimer=setTimeout(()=>runAutomaticMinute(generation),playbackDelay());
 }
 function archiveActive(){
   if(!active)return;
@@ -1228,14 +1363,14 @@ async function startRound(symbol=active?.symbol||els.symbol.value){
     pause();
     const data=await loadSymbol(symbol);
     const candidate=createSession(symbol,data);
-    clearModificationDraft();archiveActive();candidate.startTime=data[candidate.start][0]+BASE;candidate.sizePercent=10;candidate.leverage=1;candidate.speed=Number(els.speed.value)||1500;candidate.ma10=false;candidate.volume=true;candidate.reviewPlans??=[];active=candidate;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType='market';pendingSymbol=null;journalMode='positions';selectedHistoryId=null;els.symbol.value=symbol;hideLoading();render(true);persist({kind:'session-created'});return true;
+    clearModificationDraft();archiveActive();candidate.startTime=data[candidate.start][0]+BASE;candidate.sizePercent=10;candidate.leverage=1;candidate.speed=1500;candidate.secondSpeedMs=100;candidate.replayGranularity='seconds';candidate.ma10=false;candidate.volume=true;candidate.reviewPlans??=[];active=candidate;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType='market';pendingSymbol=null;journalMode='positions';selectedHistoryId=null;els.symbol.value=symbol;hideLoading();render(true);persist({kind:'session-created'});return true;
   }catch(error){
     toast(`新一轮暂未开始：${error.message}。现有练习和往期记录已保留。`);els.symbol.value=active?.symbol||'BTCUSDT';if(invalidSavedActive)showSavedRecordRecovery(error.message);else{hideLoading();if(active)render();}return false;
   }finally{transitionPending=false;els.symbol.disabled=false;if(active&&!invalidSavedActive)els['new-session'].disabled=false;else if(!active)els['new-session'].disabled=false;drawingTools?.refresh();syncDrawingControls();if(resumeAfterTransition&&active&&!replayIsEnded()&&!invalidSavedActive&&!isPlaying)togglePlayWithAudit();syncPlaybackControls();}
 }
 function maybeStart(symbol){if(pendingOrderRequest)return;pendingSymbol=symbol;if(active?.position){requestExitReason({archiveSymbol:symbol,returnFocus:els['new-session']});return;}if(active?.pending){$('new-dialog').showModal();return;}startRound(symbol);}
 function downloadExport(){
-  const payload={version:1,source:{marketData:'Binance 现货公开档案',symbols:['BTCUSDT','ETHUSDT'],interval:BASE,replayInterval:60,replayMode:'真实1分钟OHLC逐步回放；所选周期K线由已披露行情聚合',simulation:'本地练习记录，不代表真实成交',leverageModel:'1x–100x逐仓模拟；新订单记录含leverage、margin、marginMode、liquidationPrice；旧记录缺失时按1x显示且不追溯估算强平价',maintenanceMarginRate:0.005},exportedAt:new Date().toISOString(),current:active?clone(active):null,history:clone(history)};
+  const payload={version:1,source:{marketData:'Binance 现货公开档案',symbols:['BTCUSDT','ETHUSDT'],interval:BASE,replayInterval:usesSecondReplay(active)?1:60,replayMode:usesSecondReplay(active)?'真实1秒OHLC逐步回放；不推测秒内逐笔路径；所选周期K线只聚合已披露行情':'显式分钟回放；旧会话兼容；不推测分钟内逐笔路径',simulation:'本地练习记录，不代表真实成交',leverageModel:'1x–100x逐仓模拟；新订单记录含leverage、margin、marginMode、liquidationPrice；旧记录缺失时按1x显示且不追溯估算强平价',maintenanceMarginRate:0.005},exportedAt:new Date().toISOString(),current:active?clone(active):null,history:clone(history)};
   const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`K线回放_记录_${new Date().toISOString().slice(0,10)}.json`;document.body.append(a);a.click();a.remove();URL.revokeObjectURL(url);toast('练习记录 JSON 已导出');
 }
 function importedSessionMetrics(session){
@@ -1327,8 +1462,8 @@ function wireEvents(){
   els['step-minute'].addEventListener('click',()=>manualStep('step-minute'));
   els.step.addEventListener('click',()=>manualStep('step-boundary'));
   els['cancel-advance'].addEventListener('click',()=>{if(fastForwarding)pauseWithAudit();});
-  els['retry-minute'].addEventListener('click',()=>{if(!minuteRetryAction||pendingOrderRequest)return;const action=minuteRetryAction;minuteRetryAction=null;void manualStep(action==='boundary'?'step-boundary':'step-minute');});
-  els.speed.addEventListener('change',()=>{if(!active)return;const oldSpeed=Number(active.speed)||1500,before=reviewPlaybackSnapshot(active,isPlaying,oldSpeed),wasPlaying=isPlaying;active.speed=Number(els.speed.value)||1500;if(wasPlaying){pause();togglePlay();}persist({kind:'playback-speed',before,after:reviewPlaybackSnapshot(active,isPlaying,active.speed)});});
+  els['retry-minute'].addEventListener('click',()=>{if(!minuteRetryAction||pendingOrderRequest)return;const action=minuteRetryAction;minuteRetryAction=null;if(action==='boundary')void manualStep('step-boundary');else void manualStep('step-minute');});
+  els.speed.addEventListener('change',()=>{if(!active)return;const oldSpeed=playbackDelay(active),before=reviewPlaybackSnapshot(active,isPlaying,oldSpeed),wasPlaying=isPlaying,next=Number(els.speed.value);if(usesSecondReplay(active))active.secondSpeedMs=next;else active.speed=next;if(wasPlaying){pause();togglePlay();}persist({kind:'playback-speed',before,after:reviewPlaybackSnapshot(active,isPlaying,next)});});
   els.recenter.addEventListener('click',()=>chart?.timeScale().scrollToRealTime());
   els.long.addEventListener('click',()=>beginPlan(1));els.short.addEventListener('click',()=>beginPlan(-1));
   els['order-form'].addEventListener('submit',e=>e.preventDefault());
@@ -1379,7 +1514,7 @@ function wireEvents(){
 async function boot(){
   readSaved();initChart();wireEvents();
   if(active){
-    try{const data=await loadSymbol(active.symbol);if(!validateSession(active,active.symbol,data))throw new Error('保存的练习状态校验失败，记录已保留');invalidSavedActive=false;if((!Array.isArray(active.modelConfigs)||!active.modelConfigs.length)&&ensureEvidenceBaseline(active,data))persist({audit:false});active.reviewPlans??=[];await ensureLegacyEvidenceBaselines();if(!active.startTime)active.startTime=data[active.start][0]+BASE;active.ma10=active.ma10===true;active.volume=active.volume!==false;active.speed=Number.isFinite(active.speed)?active.speed:1500;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType=active.selectedOrderType||'market';if(active.draftPlan){uiPlan=clone(active.draftPlan);selectedOrderType=uiPlan.orderType||selectedOrderType;els['plan-actions'].hidden=false;}if(SMALL_TIMEFRAMES.has(active.tf)){smallTfStatus.loading=true;syncMinuteNote();try{await ensureSmallTfHistory(active,active.tf);smallTfStatus={loading:false,error:'',missingDays:smallTfStatus.missingDays};}catch(error){smallTfStatus={loading:false,error:error?.message||'分钟历史读取失败',missingDays:0};}}hideLoading();render(true);persist({audit:false});return;}
+    try{const data=await loadSymbol(active.symbol);if(!validateSession(active,active.symbol,data))throw new Error('保存的练习状态校验失败，记录已保留');invalidSavedActive=false;if((!Array.isArray(active.modelConfigs)||!active.modelConfigs.length)&&ensureEvidenceBaseline(active,data))persist({audit:false});active.reviewPlans??=[];await ensureLegacyEvidenceBaselines();if(!active.startTime)active.startTime=data[active.start][0]+BASE;active.ma10=active.ma10===true;active.volume=active.volume!==false;active.speed=Number.isFinite(active.speed)?active.speed:1500;active.secondSpeedMs=Number.isFinite(active.secondSpeedMs)?active.secondSpeedMs:100;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType=active.selectedOrderType||'market';if(active.draftPlan){uiPlan=clone(active.draftPlan);selectedOrderType=uiPlan.orderType||selectedOrderType;els['plan-actions'].hidden=false;}if(SMALL_TIMEFRAMES.has(active.tf)){if(usesSecondReplay(active)){secondHistoryStatus.loading=true;syncMinuteNote();try{await ensureSecondHistory(active,active.tf);secondHistoryStatus={loading:false,error:'',unavailable:[]};}catch(error){secondHistoryStatus={loading:false,error:error?.message||'逐秒历史读取失败',unavailable:[]};}}else{smallTfStatus.loading=true;syncMinuteNote();try{await ensureSmallTfHistory(active,active.tf);smallTfStatus={loading:false,error:'',missingDays:smallTfStatus.missingDays};}catch(error){smallTfStatus={loading:false,error:error?.message||'分钟历史读取失败',missingDays:0};}}}hideLoading();render(true);persist({audit:false});return;}
     catch(error){invalidSavedActive=true;showSavedRecordRecovery(error.message);return;}
   }
   const symbol=active?.symbol||'BTCUSDT';
@@ -1388,7 +1523,7 @@ async function boot(){
 }
 async function retryRecovery(){
   const symbol=active?.symbol||els.symbol.value;
-  try{await loadSymbol(symbol,true);if(active&&!validateSession(active,symbol,datasets.get(symbol)))throw new Error('保存的练习状态校验失败');invalidSavedActive=false;if(active&&!active.startTime)active.startTime=datasets.get(symbol)[active.start][0]+BASE;if(active&&SMALL_TIMEFRAMES.has(active.tf)){smallTfStatus={loading:true,error:'',missingDays:0};syncMinuteNote();await ensureSmallTfHistory(active,active.tf);smallTfStatus={loading:false,error:'',missingDays:smallTfStatus.missingDays};}hideLoading();if(active){render(true);persist();}else await startRound(symbol);}
+  try{await loadSymbol(symbol,true);if(active&&!validateSession(active,symbol,datasets.get(symbol)))throw new Error('保存的练习状态校验失败');invalidSavedActive=false;if(active&&!active.startTime)active.startTime=datasets.get(symbol)[active.start][0]+BASE;if(active){active.secondSpeedMs=Number.isFinite(active.secondSpeedMs)?active.secondSpeedMs:100;if(SMALL_TIMEFRAMES.has(active.tf)){if(usesSecondReplay(active)){secondHistoryStatus={loading:true,error:'',unavailable:[]};syncMinuteNote();await ensureSecondHistory(active,active.tf);secondHistoryStatus={loading:false,error:'',unavailable:[]};}else{smallTfStatus={loading:true,error:'',missingDays:0};syncMinuteNote();await ensureSmallTfHistory(active,active.tf);smallTfStatus={loading:false,error:'',missingDays:smallTfStatus.missingDays};}}}hideLoading();if(active){render(true);persist();}else await startRound(symbol);}
   catch(error){setLoading(`${error.message}。本地记录仍保留，可再次重试，或导出备份。`,true);}
 }
 boot();

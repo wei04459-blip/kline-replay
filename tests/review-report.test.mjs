@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {aggregateMinutePrefix, buildReviewReport} from '../dist/review-report.mjs';
+import {aggregateMinutePrefix, aggregateSecondPrefix, buildReviewReport} from '../dist/review-report.mjs';
 
 function makePayload(overrides = {}) {
   const session = {
@@ -504,6 +504,35 @@ test('weekly volume context follows Monday UTC boundaries', () => {
     view: {tf: 604800, volume: true}}];
   const report = buildReviewReport(payload).reportText;
   assert.match(report, /当前周期量：3 BTC/);
+});
+
+test('seconds report evidence is cutoff-bounded and never falls back to minute or 15m rows', () => {
+  const payload = makePayload();
+  const record = payload.sessions[0];
+  record.session.replayGranularity = 'seconds';
+  record.session.secondCursorTime = 121;
+  record.session.startTime = 120;
+  record.coverage.visibleThrough = 122;
+  record.market.secondMode = true;
+  record.market.secondCandles = [
+    [120, 100, 101, 99, 100.5, 1],
+    [121, 100.5, 103, 100, 102, 2],
+    [122, 102, 999, 1, 900, 100],
+  ];
+  record.events = [{kind: 'view-setting', seq: 1, visibleThrough: 122, view: {tf: 60, replayResolution: '1s',
+    secondCursorTime: 121, currentBar: {time: 120, interval: 60, open: 100, high: 103, low: 99, close: 102, volume: 3}}}];
+  const result = buildReviewReport(payload);
+  const metrics = result.metricsBySession[0];
+  assert.equal(metrics.coverage.secondRows, 2);
+  assert.equal(metrics.coverage.secondMode, true);
+  assert.equal(metrics.coverage.disclosedSecondVolume, 3);
+  assert.match(result.reportText, /真实1秒K线/);
+  assert.match(result.reportText, /逐笔成交/);
+  assert.deepEqual(aggregateSecondPrefix({secondCandles: record.market.secondCandles, interval: 60, barTime: 120, visibleThrough: 122}).candle,
+    [120, 100, 103, 99, 102, 3]);
+  record.market.secondCandles = [];
+  const missing = buildReviewReport(payload).metricsBySession[0];
+  assert.equal(missing.coverage.secondEvidence.status, 'unknown-no-recorded-seconds');
 });
 
 test('invalid top-level payload is rejected', () => {

@@ -124,6 +124,7 @@ export function replayPrice(session, data) {
 }
 
 export function replayTime(session, data) {
+  if (Number.isInteger(session?.secondCursorTime)) return session.secondCursorTime + 1;
   if (Number.isFinite(session?.minuteCursorTime)) return session.minuteCursorTime + 60;
   const c = candleAt(data, session?.cursor);
   return c ? c[0] + BASE : null;
@@ -430,8 +431,35 @@ export function validateSession(session, symbol, data) {
   if (!Object.hasOwn(session, 'position')) return false;
   if (!Number.isFinite(session.balance) || !Array.isArray(session.trades) || !VALID_TFS.has(session.tf)) return false;
   if (![session.start, session.cursor, session.end].every(i => candleAt(data, i))) return false;
-  if (Object.hasOwn(session, 'minuteCursorTime')) {
-    if (!Number.isInteger(session.minuteCursorTime) || session.minuteCursorTime < 0 || session.minuteCursorTime % 60 !== 0 ||
+  if (Object.hasOwn(session, 'secondCursorTime')) {
+    const secondTime = session.secondCursorTime, forming = session.forming1m, meta = session.forming1mMeta;
+    if (session.replayGranularity !== undefined && session.replayGranularity !== 'seconds' ||
+        !Number.isInteger(secondTime) || secondTime < 0 || !Number.isFinite(session.currentPrice) || session.currentPrice <= 0 ||
+        !Number.isInteger(session.minuteCursorTime) || session.minuteCursorTime !== intervalStart(secondTime, 60) ||
+        !Array.isArray(forming) || !candleAt([forming], 0) || forming[0] !== session.minuteCursorTime ||
+        !meta || !Number.isInteger(meta.firstSecondTime) || !Number.isInteger(meta.lastSecondTime) ||
+        !Number.isInteger(meta.disclosedSeconds) || meta.disclosedSeconds < 1 || meta.disclosedSeconds > 60 ||
+        typeof meta.contiguous !== 'boolean' || meta.lastSecondTime !== secondTime ||
+        meta.firstSecondTime < forming[0] || meta.firstSecondTime > secondTime ||
+        meta.disclosedSeconds > secondTime - meta.firstSecondTime + 1 ||
+        session.currentPrice !== forming[4] || secondTime + 1 > data[session.end][0] + BASE) return false;
+    const secondParentTime = intervalStart(secondTime, BASE), secondParentIndex = indexAtOpen(data, secondParentTime);
+    if (secondParentIndex < session.start || secondParentIndex > session.end) return false;
+    const finalSecond = secondTime + 1 === secondParentTime + BASE;
+    if (finalSecond) {
+      if (session.forming15m !== null || session.cursor < secondParentIndex) return false;
+    } else {
+      const parentForming = session.forming15m, partialIndex = formingIndex(session, data);
+      if (!Array.isArray(parentForming) || !candleAt([parentForming], 0) || parentForming[0] !== secondParentTime ||
+          partialIndex !== session.cursor + 1 || partialIndex !== secondParentIndex || partialIndex > session.end) return false;
+    }
+    if (meta.disclosedSeconds === 60 && meta.contiguous &&
+        (meta.firstSecondTime !== forming[0] || secondTime !== forming[0] + 59)) return false;
+    if (meta.disclosedSeconds === 60 && !meta.contiguous) return false;
+    if (meta.contiguous && meta.disclosedSeconds !== secondTime - meta.firstSecondTime + 1) return false;
+  } else if (Object.hasOwn(session, 'minuteCursorTime')) {
+    if (session.replayGranularity !== undefined && session.replayGranularity !== 'minute' ||
+        !Number.isInteger(session.minuteCursorTime) || session.minuteCursorTime < 0 || session.minuteCursorTime % 60 !== 0 ||
         !Number.isFinite(session.currentPrice) || session.currentPrice <= 0 || !Object.hasOwn(session, 'forming15m')) return false;
     if (session.forming15m !== null) {
       const forming = session.forming15m, partialIndex = formingIndex(session, data);
@@ -482,9 +510,10 @@ export function validateSession(session, symbol, data) {
     optionalAttemptNumber(t.attemptNumber) && initialRiskValid(t) && [t.pnl, t.fees, t.entry, t.exit, t.qty].every(Number.isFinite) &&
     (t.triggerEvidence === undefined || (t.triggerEvidence && ['stop', 'take', 'liquidation'].includes(t.triggerEvidence.type) &&
       Number.isFinite(t.triggerEvidence.triggerPrice) && t.triggerEvidence.triggerPrice > 0 &&
-      Number.isInteger(t.triggerEvidence.referenceMinute) && t.triggerEvidence.referenceMinute % 60 === 0 &&
-      Number.isInteger(t.triggerEvidence.referenceIntervalSeconds) && t.triggerEvidence.referenceIntervalSeconds >= 60 &&
-      t.triggerEvidence.triggerMarketTime === t.triggerEvidence.referenceMinute + t.triggerEvidence.referenceIntervalSeconds &&
+      Number.isInteger(t.triggerEvidence.referenceIntervalSeconds) && t.triggerEvidence.referenceIntervalSeconds >= 1 &&
+      Number.isInteger(t.triggerEvidence.referenceBarTime ?? t.triggerEvidence.referenceMinute) &&
+      (t.triggerEvidence.referenceIntervalSeconds < 60 || t.triggerEvidence.referenceBarTime !== undefined || t.triggerEvidence.referenceMinute % 60 === 0) &&
+      t.triggerEvidence.triggerMarketTime === (t.triggerEvidence.referenceBarTime ?? t.triggerEvidence.referenceMinute) + t.triggerEvidence.referenceIntervalSeconds &&
       t.triggerEvidence.triggerMarketTime <= replayTime(session, data) && typeof t.triggerEvidence.ruleId === 'string' &&
       t.triggerEvidence.ruleId.length > 0 && t.triggerEvidence.actualIntrabarOrderUnknown === true &&
       (t.triggerEvidence.affectedOrderIds === undefined || Array.isArray(t.triggerEvidence.affectedOrderIds) &&
@@ -612,7 +641,7 @@ export function createSession(symbol, data, random = Math.random) {
     balance: INITIAL, initialBalance: INITIAL, position: null, pending: null, orderHistory: [], orders: [], fills: [], trades: [],
     ledger: [], accountSnapshots: [], riskChanges: [], modelConfigId, engineVersion: ENGINE_VERSION, activeEngineVersion: ENGINE_VERSION,
     modelConfigs: [simulationModel(modelConfigId, {recordedAt: created, replayMarketTime: data[start][0] + BASE}, false)],
-    tf: 14400, blind: true, ma: false, notes: '', created};
+    tf: 14400, replayGranularity: 'minute', blind: true, ma: false, notes: '', created};
   appendLedger(session, data, 'initial-balance', {cashDelta: 0, balanceAfter: INITIAL, baselineBalance: INITIAL});
   appendAccountSnapshot(session, data, 'session-baseline');
   if (!validateSession(session, symbol, data)) throw new Error('行情数据范围无效');
@@ -753,6 +782,190 @@ export function aggregateDisclosedMinutes(minuteRows, seconds, visibleThrough, f
   return out;
 }
 
+/** Aggregate only real, fully disclosed UTC 1-second candles into 1s/1m/2m/3m/5m bars.
+ * `visibleThrough` is an exclusive close-time cutoff. Missing seconds remain
+ * gaps; incomplete bars carry `complete:false` and are never padded.
+ */
+export function aggregateDisclosedSeconds(secondRows, seconds, visibleThrough, from = 0) {
+  const intervals = new Set([1, 60, 120, 180, 300]);
+  if (!Array.isArray(secondRows) || !intervals.has(seconds) || !Number.isInteger(visibleThrough) || visibleThrough < 0) return [];
+  const unique = new Map();
+  for (const row of secondRows) {
+    if (!Array.isArray(row) || row.length < 6 || !row.slice(0, 6).every(Number.isFinite)) continue;
+    const [time] = row;
+    if (!Number.isInteger(time) || time < 0 || time + 1 > visibleThrough || unique.has(time)) continue;
+    const valid = candleAt([row], 0);
+    if (valid) unique.set(time, valid.slice(0, 6));
+  }
+  let rows = [...unique.values()].sort((a, b) => a[0] - b[0]);
+  if (Number.isInteger(from) && from > 0 && rows.length) {
+    const first = Math.min(from, rows.length - 1), bucket = intervalStart(rows[first][0], seconds);
+    rows = rows.filter(row => row[0] >= bucket);
+  }
+  const out = [];
+  for (const row of rows) {
+    const time = intervalStart(row[0], seconds), previous = out.at(-1);
+    if (previous?.time === time) {
+      previous.high = Math.max(previous.high, row[2]);
+      previous.low = Math.min(previous.low, row[3]);
+      previous.close = row[4];
+      previous.volume += row[5];
+      previous.disclosedSeconds += 1;
+      if (row[0] !== previous.lastSecondTime + 1) previous.contiguous = false;
+      previous.lastSecondTime = row[0];
+    } else {
+      out.push({time, open: row[1], high: row[2], low: row[3], close: row[4], volume: row[5],
+        disclosedSeconds: 1, expectedSeconds: seconds, firstSecondTime: row[0], lastSecondTime: row[0], contiguous: true});
+    }
+  }
+  for (const bar of out) {
+    bar.complete = bar.disclosedSeconds === bar.expectedSeconds && bar.contiguous &&
+      bar.firstSecondTime === bar.time && bar.lastSecondTime === bar.time + seconds - 1;
+    delete bar.firstSecondTime;
+    delete bar.lastSecondTime;
+    delete bar.contiguous;
+  }
+  return out;
+}
+
+function aggregateInto(existing, candle) {
+  if (!existing) return [...candle];
+  return [existing[0], existing[1], Math.max(existing[2], candle[2]), Math.min(existing[3], candle[3]), candle[4], existing[5] + candle[5]];
+}
+
+/** Advance one real UTC second candle, triggering orders/protections at second resolution.
+ * The base replay rows remain 15m for saved-index compatibility; second OHLCV is
+ * an explicitly disclosed observation and never inferred from a parent candle.
+ */
+export function advanceSecond(session, secondBar, data) {
+  if (!validateSession(session, session?.symbol, data)) throw new Error('本轮行情范围无效');
+  if (replayEnded(session, data)) return {ended: true, trade: null, orderFilled: null, orderCancelled: null};
+  if (!Array.isArray(secondBar) || secondBar.length < 6 || !secondBar.slice(0, 6).every(Number.isFinite) ||
+      !Number.isInteger(secondBar[0]) || secondBar[0] < 0 || !candleAt([secondBar], 0)) throw new Error('秒级行情无效');
+  const time = secondBar[0], previousCloseTime = replayTime(session, data);
+  if (!Number.isFinite(previousCloseTime) || time < previousCloseTime ||
+      (Number.isInteger(session.secondCursorTime) && time <= session.secondCursorTime))
+    throw new Error('秒级行情重复、逆序或早于已披露时刻');
+  const endTime = data[session.end][0] + BASE;
+  if (time + 1 > endTime) throw new Error('秒级行情超出本轮范围');
+
+  const parentTime = intervalStart(time, BASE), parentIndex = indexAtOpen(data, parentTime);
+  if (parentIndex < session.start || parentIndex > session.end) throw new Error('秒级行情缺少对应15分钟K线');
+
+  const next = structuredClone(session), beforeIndex = next.cursor;
+  next.replayGranularity = 'seconds';
+  const completedBefore = latestCompletedIndex(data, next.start, next.end, time);
+  if (completedBefore > next.cursor) next.cursor = completedBefore;
+  if (next.forming15m && next.forming15m[0] !== parentTime) next.forming15m = null;
+  if (next.cursor >= parentIndex) throw new Error('秒级行情已落在完整K线范围内');
+
+  const minuteTime = intervalStart(time, 60), previousMinuteTime = Number.isInteger(next.secondCursorTime)
+    ? next.minuteCursorTime : null;
+  const sameMinute = previousMinuteTime === minuteTime && Array.isArray(next.forming1m);
+  const forming1m = sameMinute
+    ? aggregateInto(next.forming1m, secondBar)
+    : [minuteTime, secondBar[1], secondBar[2], secondBar[3], secondBar[4], secondBar[5]];
+  const oldMeta = sameMinute ? next.forming1mMeta : null;
+  const firstSecondTime = oldMeta?.firstSecondTime ?? time;
+  const disclosedSeconds = (oldMeta?.disclosedSeconds ?? 0) + 1;
+  const contiguous = sameMinute ? !!oldMeta?.contiguous && time === oldMeta.lastSecondTime + 1 : true;
+  const forming15m = aggregateInto(next.forming15m && next.forming15m[0] === parentTime ? next.forming15m : null, secondBar);
+  next.secondCursorTime = time;
+  next.minuteCursorTime = minuteTime;
+  next.currentPrice = secondBar[4];
+  const finalSecond = time + 1 === parentTime + BASE;
+  next.forming15m = finalSecond ? null : forming15m;
+  next.forming1m = forming1m;
+  next.forming1mMeta = {firstSecondTime, lastSecondTime: time, disclosedSeconds, contiguous};
+  const eventTime = time + 1, eventIndex = parentIndex, secondCandle = secondBar.slice(0, 6);
+  if (finalSecond) next.cursor = parentIndex;
+
+  let trade = null, orderFilled = null, orderCancelled = null, entryBar = false;
+  const executionEvents = [];
+  const stageClock = {cursor: next.cursor, minuteCursorTime: next.minuteCursorTime, secondCursorTime: time,
+    forming1m: [...forming1m], forming1mMeta: {...next.forming1mMeta}, forming15m: next.forming15m ? [...next.forming15m] : null,
+    currentPrice: next.currentPrice, replayMarketTime: eventTime, visibleThrough: eventTime};
+  if (next.pending) {
+    const pending = next.pending, fillPrice = pendingFillPrice(pending, secondCandle);
+    if (fillPrice !== null) {
+      const before = {position: null, pending: structuredClone(pending), balance: next.balance};
+      const released = pending.marginMode === ISOLATED_MARGIN_MODE ? pending.margin + pending.notional * FEE : pending.notional * (1 + FEE);
+      next.pending = null;
+      if (next.modelConfigId) appendLedger(next, data, 'order-reservation-released', {reservedMarginDelta: -released, orderId: pending.id});
+      positionAtPrice(next, data, pending.side, pending.notional, fillPrice, pending.stop, pending.take, eventIndex,
+        pending.id, pending.entryReason, eventTime, pending.leverage ?? DEFAULT_LEVERAGE, pending.marginMode, pending, 'limit-touch-1s');
+      orderFilled = recordFilledOrder(next, pending, eventIndex, fillPrice, eventTime, next.position);
+      entryBar = true;
+      executionEvents.push({seq: executionEvents.length + 1, kind: 'order-filled', recordedAt: new Date().toISOString(),
+        marketTime: eventTime, replayMarketTime: eventTime, visibleThrough: eventTime, replayState: {...stageClock},
+        orderId: pending.id, fillId: orderFilled.fillId ?? next.position.entryFillId, positionId: next.position.positionId,
+        before: {...before, ...stageClock}, after: {position: structuredClone(next.position), pending: null, balance: next.balance, ...stageClock},
+        account: {before: {balance: before.balance, ...currentAccountValues({...next, pending: before.pending, position: before.position}, data)},
+          after: {balance: next.balance, ...currentAccountValues(next, data)}}, intrabarActualUnknown: true,
+        rule: {id: 'limit-touch-on-observed-1s', version: next.activeEngineVersion ?? next.engineVersion ?? 'legacy-engine-unversioned'}});
+    }
+  }
+  const positionBeforeExit = next.position ? structuredClone(next.position) : null, balanceBeforeExit = next.balance;
+  if (next.position) trade = exitPositionOnBar(next, data, secondCandle, eventIndex, entryBar, 1);
+  if (trade?.triggerEvidence) executionEvents.push({seq: executionEvents.length + 1, kind: 'position-triggered', recordedAt: new Date().toISOString(),
+    marketTime: eventTime, replayMarketTime: eventTime, visibleThrough: eventTime, replayState: {...stageClock},
+    orderId: trade.orderId ?? null, tradeId: trade.tradeId ?? trade.id, positionId: trade.positionId ?? null,
+    before: {position: positionBeforeExit, pending: structuredClone(next.pending), balance: balanceBeforeExit, ...stageClock},
+    after: {position: structuredClone(positionBeforeExit), pending: structuredClone(next.pending), balance: balanceBeforeExit,
+      triggerEvidence: structuredClone(trade.triggerEvidence), ...stageClock},
+    account: {before: {balance: balanceBeforeExit, ...currentAccountValues({...next, position: positionBeforeExit}, data)},
+      after: {balance: balanceBeforeExit, ...currentAccountValues({...next, position: positionBeforeExit}, data)}},
+    reason: trade.reason, affectedOrderIds: trade.triggerEvidence.affectedOrderIds ?? [],
+    intrabarAmbiguous: trade.executionEvidence?.intrabarAmbiguous ?? false, triggerEvidence: structuredClone(trade.triggerEvidence),
+    rule: trade.executionEvidence ?? trade.triggerEvidence, intrabarActualUnknown: trade.triggerEvidence.actualIntrabarOrderUnknown});
+  if (trade) executionEvents.push({seq: executionEvents.length + 1, kind: 'position-auto-closed', recordedAt: new Date().toISOString(),
+    marketTime: eventTime, replayMarketTime: eventTime, visibleThrough: eventTime, replayState: {...stageClock},
+    orderId: trade.orderId ?? null, tradeId: trade.tradeId ?? trade.id, positionId: trade.positionId ?? null, fillId: trade.exitFillId ?? null,
+    before: {position: positionBeforeExit, pending: structuredClone(next.pending), balance: balanceBeforeExit, ...stageClock},
+    after: {position: null, trade: structuredClone(trade), pending: structuredClone(next.pending), balance: next.balance, ...stageClock},
+    account: {before: {balance: balanceBeforeExit, ...currentAccountValues({...next, position: positionBeforeExit}, data)},
+      after: {balance: next.balance, ...currentAccountValues(next, data)}},
+    reason: trade.reason,
+    triggerEvidence: trade.triggerEvidence ? structuredClone(trade.triggerEvidence) : null,
+    affectedOrderIds: trade.executionEvidence?.affectedOrderIds ?? trade.triggerEvidence?.affectedOrderIds ?? [],
+    intrabarAmbiguous: trade.executionEvidence?.intrabarAmbiguous ?? false, rule: trade.executionEvidence ?? null,
+    intrabarActualUnknown: true});
+
+  if (finalSecond && next.cursor >= next.end) {
+    if (next.position) {
+      const before = structuredClone(next.position), balanceBefore = next.balance;
+      trade = closePosition(next, data, next.currentPrice, '本轮结束', next.cursor);
+      executionEvents.push({seq: executionEvents.length + 1, kind: 'position-auto-closed', recordedAt: new Date().toISOString(),
+        marketTime: eventTime, replayMarketTime: eventTime, visibleThrough: eventTime, replayState: {...stageClock},
+        orderId: trade.orderId ?? null, tradeId: trade.tradeId ?? trade.id, positionId: trade.positionId ?? null, fillId: trade.exitFillId ?? null,
+        before: {position: before, pending: structuredClone(next.pending), balance: balanceBefore, ...stageClock},
+        after: {position: null, trade: structuredClone(trade), pending: structuredClone(next.pending), balance: next.balance, ...stageClock},
+        account: {before: {balance: balanceBefore, ...currentAccountValues({...next, position: before}, data)},
+          after: {balance: next.balance, ...currentAccountValues(next, data)}}, reason: trade.reason,
+        affectedOrderIds: [], intrabarAmbiguous: false,
+        rule: {id: 'session-end-close', version: next.activeEngineVersion ?? next.engineVersion ?? 'legacy-engine-unversioned'},
+        intrabarActualUnknown: true});
+    }
+    if (next.pending) orderCancelled = cancelOrder(next, '本轮结束未成交', data);
+  }
+  if (time + 1 === minuteTime + 60 && next.modelConfigId) appendAccountSnapshot(next, data, 'minute-mark');
+  if (!validateSession(next, next.symbol, data)) throw new Error('秒级推进后状态校验失败');
+  Object.assign(session, next);
+  const currentTimeframeBoundary = intervalStart(previousCloseTime, session.tf) !== intervalStart(eventTime, session.tf);
+  const values = currentAccountValues(session, data);
+  const minuteAccountSnapshot = time + 1 === minuteTime + 60 ? {type: 'minute-mark', recordedAt: new Date().toISOString(),
+    replayMarketTime: eventTime, visibleThrough: eventTime, cursor: visibleUpperIndex(session, data), minuteCursorTime: minuteTime,
+    currentPrice: secondBar[4], balance: session.balance, equity: values.equity, availableBalance: values.availableBalance,
+    usedMargin: values.usedMargin, reservedMargin: values.reservedMargin, valuation: 'net-close-estimate'} : null;
+  return {ended: replayEnded(session, data), secondTime: time, replayTime: eventTime, currentPrice: secondBar[4],
+    forming1m: session.forming1m, forming1mMeta: structuredClone(session.forming1mMeta), forming15m: session.forming15m,
+    completed1m: time + 1 === minuteTime + 60, completed15m: finalSecond, currentTimeframeBoundary,
+    advanced15m: session.cursor - beforeIndex, trade, orderFilled, orderCancelled, executionEvents, minuteAccountSnapshot,
+    intrabarAmbiguous: Boolean(trade?.executionEvidence?.intrabarAmbiguous),
+    affectedOrderIds: trade?.executionEvidence?.affectedOrderIds ?? [], rule: trade?.executionEvidence ?? null,
+    missingSeconds: Math.max(0, time - previousCloseTime)};
+}
+
 export function advanceMinute(session, minuteBar, data) {
   if (!validateSession(session, session?.symbol, data)) throw new Error('本轮行情范围无效');
   if (replayEnded(session, data)) return {ended: true, trade: null, orderFilled: null, orderCancelled: null};
@@ -770,6 +983,14 @@ export function advanceMinute(session, minuteBar, data) {
 
   // Work on a clone so a bad minute or failed match can never leave half-updated cash/order/cursor state.
   const next = structuredClone(session);
+  next.replayGranularity = 'minute';
+  // Explicit minute-mode fallback may follow a seconds session, but only after
+  // a whole minute row strictly beyond the disclosed second cutoff is supplied.
+  if (Number.isInteger(next.secondCursorTime)) {
+    delete next.secondCursorTime;
+    delete next.forming1m;
+    delete next.forming1mMeta;
+  }
   const beforeIndex = next.cursor;
   const completedBefore = latestCompletedIndex(data, next.start, next.end, time);
   if (completedBefore > next.cursor) next.cursor = completedBefore;
@@ -860,6 +1081,11 @@ export function advanceMinute(session, minuteBar, data) {
     if (next.pending) orderCancelled = cancelOrder(next, '本轮结束未成交', data);
   }
   if (!validateSession(next, next.symbol, data)) throw new Error('分钟推进后状态校验失败');
+  if (!Object.hasOwn(next, 'secondCursorTime')) {
+    delete session.secondCursorTime;
+    delete session.forming1m;
+    delete session.forming1mMeta;
+  }
   Object.assign(session, next);
   const currentTimeframeBoundary = intervalStart(previousCloseTime, session.tf) !== intervalStart(eventTime, session.tf);
   const values = currentAccountValues(session, data);
@@ -1126,36 +1352,40 @@ function pendingFillPrice(order, candle) {
 function exitPositionOnBar(s, data, c, index, entryBar = false, referenceIntervalSeconds = 60) {
   const p = s.position;
   if (!p) return null;
+  const granularity = referenceIntervalSeconds === 1 ? 'second' : 'minute';
   const liquidation = p.marginMode === ISOLATED_MARGIN_MODE ? p.liquidationPrice : null;
   const gapLiquidation = Number.isFinite(liquidation) && (p.side === 1 ? c[1] <= liquidation : c[1] >= liquidation);
-  if (gapLiquidation) return closeOnTrigger(s, data, c, index, c[1], '强平', 'liquidation', c[1], 'minute-gap-liquidation-v1', null, referenceIntervalSeconds);
+  if (gapLiquidation) return closeOnTrigger(s, data, c, index, c[1], '强平', 'liquidation', c[1], `${granularity}-gap-liquidation-v1`, null, referenceIntervalSeconds);
   const gapStop = p.stop !== null && (p.side === 1 ? c[1] <= p.stop : c[1] >= p.stop);
   const hitStop = p.stop !== null && (p.side === 1 ? c[3] <= p.stop : c[2] >= p.stop);
-  if (gapStop) return closeOnTrigger(s, data, c, index, c[1], '跳空止损', 'stop', c[1], 'minute-gap-stop-at-open-v1', null, referenceIntervalSeconds);
+  if (gapStop) return closeOnTrigger(s, data, c, index, c[1], '跳空止损', 'stop', c[1], `${granularity}-gap-stop-at-open-v1`, null, referenceIntervalSeconds);
   const gapTake = p.take !== null && (p.side === 1 ? c[1] >= p.take : c[1] <= p.take);
-  if (!entryBar && gapTake) return closeOnTrigger(s, data, c, index, c[1], '跳空止盈', 'take', c[1], 'minute-gap-take-at-open-v1', null, referenceIntervalSeconds);
+  if (!entryBar && gapTake) return closeOnTrigger(s, data, c, index, c[1], '跳空止盈', 'take', c[1], `${granularity}-gap-take-at-open-v1`, null, referenceIntervalSeconds);
   const hitLiquidation = Number.isFinite(liquidation) && (p.side === 1 ? c[3] <= liquidation : c[2] >= liquidation);
   const hitTake = p.take !== null && (p.side === 1 ? c[2] >= p.take : c[3] <= p.take);
   const ambiguous = (hitStop && hitTake) || (hitStop && hitLiquidation) || (hitTake && hitLiquidation);
   const stopIsCloser = hitLiquidation && p.stop !== null && (p.side === 1 ? p.stop >= liquidation : p.stop <= liquidation);
   const chosen = hitLiquidation && (!hitStop || !stopIsCloser) ? 'liquidation' : hitStop ? 'stop' : hitTake ? 'take' : null;
   const evidence = ambiguous ? {intrabarAmbiguous: true, affectedOrderIds: p.orderId ? [p.orderId] : [],
-    ruleId: hitLiquidation ? '1m-ohlc-nearest-protective-threshold-v1' : '1m-ohlc-stop-first-v1',
+    ruleId: hitLiquidation ? `${referenceIntervalSeconds === 1 ? '1s' : '1m'}-ohlc-nearest-protective-threshold-v1`
+      : `${referenceIntervalSeconds === 1 ? '1s' : '1m'}-ohlc-stop-first-v1`,
     ruleVersion: s.activeEngineVersion ?? s.engineVersion ?? 'legacy-engine-unversioned', chosen} : null;
   if (hitLiquidation) {
     if (!hitStop || !stopIsCloser) return closeOnTrigger(s, data, c, index, liquidation, '强平', 'liquidation', liquidation,
-      evidence?.ruleId ?? 'minute-intrabar-liquidation-v1', evidence, referenceIntervalSeconds);
+      evidence?.ruleId ?? `${granularity}-intrabar-liquidation-v1`, evidence, referenceIntervalSeconds);
   }
   if (hitStop) return closeOnTrigger(s, data, c, index, p.stop, hitTake ? '双触发，按止损' : entryBar ? '入场同根止损' : '止损',
-    'stop', p.stop, evidence?.ruleId ?? 'minute-intrabar-stop-v1', evidence, referenceIntervalSeconds);
+    'stop', p.stop, evidence?.ruleId ?? `${granularity}-intrabar-stop-v1`, evidence, referenceIntervalSeconds);
   if (entryBar) return null; // Intrabar order is unknown; defer take-profit to the next candle.
   if (hitTake) return closeOnTrigger(s, data, c, index, p.take, '止盈', 'take', p.take,
-    evidence?.ruleId ?? 'minute-intrabar-take-v1', evidence, referenceIntervalSeconds);
+    evidence?.ruleId ?? `${granularity}-intrabar-take-v1`, evidence, referenceIntervalSeconds);
   return null;
 }
 
 function closeOnTrigger(s, data, candle, index, exitPrice, reason, type, triggerPrice, ruleId, executionEvidence = null, referenceIntervalSeconds = 60) {
-  const triggerEvidence = {type, triggerPrice, referenceMinute: candle[0], triggerMarketTime: candle[0] + referenceIntervalSeconds,
+  const triggerEvidence = {type, triggerPrice, referenceBarTime: candle[0],
+    ...(referenceIntervalSeconds >= 60 ? {referenceMinute: candle[0]} : {}),
+    triggerMarketTime: candle[0] + referenceIntervalSeconds,
     referenceIntervalSeconds,
     ruleId, actualIntrabarOrderUnknown: true,
     ...(executionEvidence?.affectedOrderIds ? {affectedOrderIds: [...executionEvidence.affectedOrderIds]} : [])};

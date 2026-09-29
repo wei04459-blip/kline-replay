@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, advanceMinute, aggregate, aggregateDisclosedMinutes, aggregateReplay, cancelOrder, closePosition, createSession, ENGINE_VERSION, ensureEvidenceBaseline, estimateOrderRisk, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, advanceMinute, advanceSecond, aggregate, aggregateDisclosedMinutes, aggregateDisclosedSeconds, aggregateReplay, cancelOrder, closePosition, createSession, ENGINE_VERSION, ensureEvidenceBaseline, estimateOrderRisk, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
 
 const TEST_ENTRY_REASON = '测试入场理由';
 function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
@@ -80,6 +80,116 @@ test('1m aggregation exposes only full minutes and tolerates malformed or repeat
   ]);
   assert.deepEqual(aggregateDisclosedMinutes(minutes, 60, NaN), []);
   assert.deepEqual(aggregateDisclosedMinutes(minutes, 240, 180), []);
+});
+
+test('real second aggregation is UTC-aligned, cutoff-safe, and exposes missing seconds without synthesis', () => {
+  const seconds = [
+    [0, 100, 102, 99, 101, 1], [1, 101, 104, 100, 103, 2],
+    [3, 103, 105, 98, 99, 4], [4, 99, 9999, 1, 9000, 1000],
+  ];
+  assert.deepEqual(aggregateDisclosedSeconds(seconds, 1, 4).map(row => row.time), [0, 1, 3]);
+  assert.deepEqual(aggregateDisclosedSeconds(seconds, 60, 4), [{time:0,open:100,high:105,low:98,close:99,
+    volume:7,disclosedSeconds:3,expectedSeconds:60,complete:false}]);
+  assert.deepEqual(aggregateDisclosedSeconds(seconds, 120, 4).map(row => [row.time,row.open,row.close,row.volume,row.complete]),
+    [[0,100,99,7,false]]);
+  const fullTwoMinutes=aggregateDisclosedSeconds(Array.from({length:120},(_,time)=>[time,100,101,99,100,1]),120,120);
+  assert.equal(fullTwoMinutes[0].complete,true);
+  assert.deepEqual(aggregateDisclosedSeconds(seconds, 300, 4)[0].high, 105);
+  assert.deepEqual(aggregateDisclosedSeconds(seconds, 60, 5)[0].volume, 1007,
+    'the final second enters only when its close is disclosed');
+  assert.deepEqual(aggregateDisclosedSeconds([seconds[0],seconds[2]],60,4)[0].disclosedSeconds,2,
+    'missing seconds are not filled');
+  for (const interval of [60,120,180,300]) {
+    const full=aggregateDisclosedSeconds(Array.from({length:interval},(_,time)=>[time,100,101,99,100,1]),interval,interval);
+    assert.equal(full.length,1);assert.equal(full[0].complete,true,`${interval}s period requires and receives every real second`);
+  }
+});
+
+test('second replay keeps 15m indexes, forms disclosed 1m/15m state, and restores exactly', () => {
+  const data=bars(4), s=session(data,{tf:60}), first=[900,100,101,99,100.5,2];
+  const result=advanceSecond(s,first,data);
+  assert.equal(result.secondTime,900);assert.equal(result.replayTime,901);assert.equal(result.completed1m,false);
+  assert.equal(s.cursor,0);assert.equal(s.secondCursorTime,900);assert.equal(s.currentPrice,100.5);
+  assert.deepEqual(s.forming1m,[900,100,101,99,100.5,2]);
+  assert.deepEqual(s.forming15m,[900,100,101,99,100.5,2]);
+  assert.equal(replayPrice(s,data),100.5);assert.equal(replayTime(s,data),901);
+  assert.equal(validateSession(JSON.parse(JSON.stringify(s)),s.symbol,data),true);
+  const finalMinuteSecond=advanceSecond(s,[959,100.5,102,100,101,3],data);
+  assert.equal(finalMinuteSecond.completed1m,true);
+  assert.deepEqual(s.forming1m,[900,100,102,99,101,5]);
+  assert.deepEqual(s.forming1mMeta,{firstSecondTime:900,lastSecondTime:959,disclosedSeconds:2,contiguous:false});
+  const saved=JSON.parse(JSON.stringify(s));
+  assert.equal(validateSession(saved,s.symbol,data),true,'partial second state survives JSON save/restore');
+  const gap=advanceSecond(s,[962,101,103,100,102,1],data);
+  assert.equal(gap.missingSeconds,2);assert.equal(s.forming1m[0],960);assert.equal(s.forming1mMeta.disclosedSeconds,1);
+  assert.equal(validateSession(s,s.symbol,data),true);
+});
+
+test('second OHLC triggers protections and limit fills at second resolution with explicit ambiguity evidence', () => {
+  const data=bars(4), market=session(data);
+  placeOrder(market,data,1,1000,100,99,null,'market');
+  const stopped=advanceSecond(market,[900,100,101,98,99,3],data);
+  assert.equal(stopped.trade.reason,'止损');assert.equal(stopped.trade.exitTime,901);
+  assert.equal(stopped.trade.triggerEvidence.referenceBarTime,900);
+  assert.equal(stopped.trade.triggerEvidence.referenceIntervalSeconds,1);
+  assert.equal(stopped.trade.triggerEvidence.ruleId,'second-intrabar-stop-v1');
+  assert.equal(stopped.trade.triggerEvidence.triggerMarketTime,901);
+  assert.equal(validateSession(market,market.symbol,data),true);
+
+  const takeSession=session(data);
+  enginePlaceOrder(takeSession,data,-1,1000,100,null,99,'market',TEST_ENTRY_REASON);
+  const taken=advanceSecond(takeSession,[900,100,101,98,100,1],data);
+  assert.equal(taken.trade.reason,'止盈');assert.equal(taken.trade.triggerEvidence.type,'take');
+  assert.equal(taken.trade.triggerEvidence.referenceIntervalSeconds,1);
+
+  const limit=session(data);
+  placeOrder(limit,data,1,1000,99,98,102,'limit');
+  const sameSecond=advanceSecond(limit,[900,100,101,97,100,4],data);
+  assert.ok(sameSecond.orderFilled);assert.equal(sameSecond.trade.reason,'入场同根止损');
+  assert.deepEqual(sameSecond.executionEvents.map(event=>event.kind),['order-filled','position-triggered','position-auto-closed']);
+  assert.equal(sameSecond.trade.entryTime,901);assert.equal(sameSecond.trade.exitTime,901);
+  assert.equal(sameSecond.trade.triggerEvidence.referenceIntervalSeconds,1);
+  assert.equal(validateSession(limit,limit.symbol,data),true,'same-second entry and stop are valid and recoverable');
+
+  const shortData=bars(4);shortData[1]=[900,100,120,90,100,10];
+  const short=session(shortData);
+  enginePlaceOrder(short,shortData,-1,1000,100,null,null,'market',TEST_ENTRY_REASON,10);
+  const liq=short.position.liquidationPrice;
+  const liquidated=advanceSecond(short,[900,100,liq+2,99,liq+1,1],shortData);
+  assert.equal(liquidated.trade.reason,'强平');assert.equal(liquidated.trade.triggerEvidence.type,'liquidation');
+  assert.equal(liquidated.trade.triggerEvidence.referenceIntervalSeconds,1);
+  assert.equal(validateSession(short,short.symbol,shortData),true);
+});
+
+test('second replay rejects duplicate rows atomically and gap-open protection uses the next observed second', () => {
+  const data=bars(4),s=session(data);
+  placeOrder(s,data,1,1000,100,99,null,'market');
+  advanceSecond(s,[900,100,100.5,99.5,100,1],data);
+  const before=JSON.parse(JSON.stringify(s));
+  assert.throws(()=>advanceSecond(s,[900,100,100.5,99.5,100,1],data),/重复、逆序/);
+  assert.deepEqual(s,before,'a duplicate second cannot partially mutate balance or clock');
+  const gap=advanceSecond(s,[905,98,99,97,98,2],data);
+  assert.equal(gap.missingSeconds,4);assert.equal(gap.trade.reason,'跳空止损');
+  assert.equal(gap.trade.triggerEvidence.ruleId,'second-gap-stop-at-open-v1');
+  assert.ok(gap.trade.exit < 99,'gap loss settles from the first observed second open plus adverse slippage');
+});
+
+test('second replay finalizes each parent once, settles at the last real second, and minute fallback starts after the cutoff', () => {
+  const data=bars(3),s=session(data,{end:1});
+  placeOrder(s,data,1,1000,100,null,null,'market');
+  advanceSecond(s,[900,100,101,99,100,1],data);
+  const final=advanceSecond(s,[1799,101,102,100,101,1],data);
+  assert.equal(final.completed15m,true);assert.equal(final.ended,true);assert.equal(replayEnded(s,data),true);
+  assert.equal(s.cursor,1);assert.equal(s.forming15m,null);assert.equal(s.position,null);
+  assert.equal(s.trades.length,1);assert.equal(s.trades[0].reason,'本轮结束');
+  assert.equal(s.trades[0].exitTime,1800);assert.equal(validateSession(s,s.symbol,data),true);
+  assert.equal(advanceSecond(s,[1800,101,101,101,101,0],data).ended,true,'end settlement occurs only once');
+
+  const fallback=session(data);advanceSecond(fallback,[900,100,101,99,100,1],data);
+  const result=advanceMinute(fallback,[960,100,102,99,101,12],data);
+  assert.equal(result.minuteTime,960);assert.equal(Object.hasOwn(fallback,'secondCursorTime'),false);
+  assert.equal(fallback.replayGranularity,'minute');
+  assert.equal(replayTime(fallback,data),1020);assert.equal(validateSession(fallback,fallback.symbol,data),true);
 });
 
 test('minute replay reports UTC boundary crossings for each new short chart timeframe', () => {
@@ -242,6 +352,7 @@ test('random session range includes the final valid slot and rejects invalid ran
   const first = createSession('BTCUSDT', data, () => 0);
   const last = createSession('BTCUSDT', data, () => 0.999999999);
   assert.equal(first.tf, 14400, 'default chart interval remains four hours');
+  assert.equal(first.replayGranularity, 'minute', 'new sessions start in explicit minute mode');
   assert.equal(data[first.start][0], WARMUP);
   assert.ok(last.end < data.length);
   assert.ok(last.start > first.start);

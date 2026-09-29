@@ -465,3 +465,36 @@ test('range export shares validated network work without poisoning nextMinute ca
     assert.ok(Array.isArray(rangeDayCache.get(`ETHUSDT/2025-11-03`).candles));
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('seconds export keeps only completed disclosed seconds and verifies forming bars without minute fallback', async () => {
+  const session = activeSession('second-round', start, null);
+  session.replayGranularity = 'seconds';
+  session.secondCursorTime = start + 1;
+  session.minuteCursorTime = start;
+  session.tf = 60;
+  session.currentPrice = 102;
+  session.forming1m = [start, 100, 103, 99, 102, 3];
+  session.forming1mMeta = {firstSecondTime: start, lastSecondTime: start + 1, disclosedSeconds: 2, contiguous: true};
+  session.currentBar = {time: start, interval: 60, open: 100, high: 103, low: 99, close: 102, volume: 3};
+  const seconds = [
+    [start, 100, 101, 99, 100.5, 1],
+    [start + 1, 100.5, 103, 100, 102, 2],
+    [start + 2, 102, 999, 1, 900, 100], // not closed by frozen cutoff
+  ];
+  const output = await buildReviewExport({current: session, history: [], loadDataset: async () => dataset(),
+    readAudit: async () => ({minutes: [], secondRows: seconds, secondDays: [{date: '2025-01-01',
+      url: 'https://data.binance.vision/future-day.zip', checksumUrl: 'https://data.binance.vision/future-day.zip.CHECKSUM', sha256: 'f'.repeat(64)}],
+      events: [], screenshots: [], issues: []})});
+  const record = output.payload.sessions[0];
+  assert.equal(record.coverage.visibleThrough, start + 2);
+  assert.deepEqual(record.market.secondCandles, seconds.slice(0, 2));
+  assert.equal(record.market.secondMode, true);
+  assert.equal(record.coverage.secondEvidence.status, 'complete');
+  assert.equal(record.coverage.secondEvidence.expectedRows, 2);
+  assert.equal(record.coverage.futureFiltered.secondRows, 1);
+  assert.deepEqual(record.session.forming1m, [start, 100, 103, 99, 102, 3]);
+  assert.equal(record.session.currentBar.complete, false);
+  assert.equal(record.market.secondSources[0].url, undefined, 'partial day source URL cannot expose unrevealed seconds');
+  assert.equal(record.market.secondSources[0].sourceHashStatus, 'slice-only-no-archive-hash');
+  assert.equal(output.metricsBySession[0].coverage.secondRows, 2);
+});

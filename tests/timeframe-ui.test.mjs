@@ -14,18 +14,22 @@ test('timeframe buttons and UI labels expose every supported interval, with comp
   assert.deepEqual(appIntervals.slice(0,7),[60,120,180,300,900,1800,2700]);
   assert.match(css,/\.timeframes\{[^}]*overflow-x:auto/);
   assert.match(css,/@media\(max-width:760px\)\{\.timeframes\{[^}]*justify-content:flex-start/);
-  assert.match(app,/1分钟周期显示真实完整OHLC · 分钟内不模拟逐笔波动/);
+  assert.match(app,/真实秒级回放 · 当前K线随每秒已披露行情逐步形成/);
+  assert.match(html,/1秒K线是该秒汇总，不含逐笔先后/);
 });
 
 function timeframeSwitcher({loadError=null}={}){
   const start=app.indexOf('async function switchTimeframe('),end=app.indexOf('\nfunction disclosedBars',start);
   assert.ok(start>=0&&end>start,'switchTimeframe should remain independently testable');
   const state={active:{id:'round-a',tf:900},transitionPending:false,smallTfRequest:0,
-    smallTfStatus:{loading:false,error:'',missingDays:0},loads:0,renders:[],persists:[],toasts:[],notes:0};
+    smallTfStatus:{loading:false,error:'',missingDays:0},secondHistoryStatus:{loading:false,error:'',unavailable:[]},loads:0,renders:[],persists:[],toasts:[],notes:0};
   const sandbox={
     TF_LABELS:new Map([[60,'1分'],[120,'2分'],[180,'3分'],[300,'5分'],[900,'15分']]),
     SMALL_TIMEFRAMES:new Set([60,120,180,300]),
+    usesSecondReplay:()=>false,
     ensureSmallTfHistory:async()=>{state.loads++;if(loadError)throw loadError;},
+    ensureSecondHistory:async()=>{throw new Error('seconds path should not run in this legacy-minute fixture');},
+    invalidateSecondBars:()=>{},
     syncMinuteNote:()=>{state.notes++;},render:(...args)=>state.renders.push(args),
     persist:options=>state.persists.push(options),toast:message=>state.toasts.push(message)
   };

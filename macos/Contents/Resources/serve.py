@@ -12,11 +12,12 @@ import re
 from urllib.parse import urlsplit
 
 from minute_data import MinuteDataError, MinuteDataService, MinuteDataUnavailable
+from second_data import SecondDataError, SecondDataService, SecondDataUnavailable
 
 APP_ID = "com.yuwan.local.kline-replay"
-VERSIONED_MODULES = ("app.mjs", "engine.mjs", "minute-data.mjs", "drawings.mjs",
-                     "review-export.mjs", "review-report.mjs", "review-import.mjs", "review-recorder.mjs", "review-plans.mjs", "review-summary.mjs")
-IMPORT_PATTERN = re.compile(rb"(['\"])[.]\/(engine|minute-data|drawings|review-export|review-report|review-import|review-recorder|review-plans|review-summary)[.]mjs\1")
+VERSIONED_MODULES = ("app.mjs", "engine.mjs", "minute-data.mjs", "second-data.mjs", "drawings.mjs",
+                     "second-data.mjs", "review-export.mjs", "review-report.mjs", "review-import.mjs", "review-recorder.mjs", "review-plans.mjs", "review-summary.mjs")
+IMPORT_PATTERN = re.compile(rb"(['\"])[.]\/(engine|minute-data|second-data|drawings|review-export|review-report|review-import|review-recorder|review-plans|review-summary)[.]mjs\1")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -56,6 +57,29 @@ class Handler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def _handle_api(self, path: str, query: str) -> None:
+        match = re.fullmatch(r"/api/v1/seconds/([^/]+)/([^/]+)", path)
+        if match:
+            if query:
+                self._send_json(404, {"error": "1秒行情接口不接受查询参数。"})
+                return
+            try:
+                SecondDataService.validate_request(*match.groups())
+            except SecondDataError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            try:
+                payload = self.server.second_service.get_day(*match.groups())
+            except SecondDataUnavailable as exc:
+                self._send_json(404, {"error": str(exc)})
+                return
+            except SecondDataError as exc:
+                self._send_json(502, {"error": str(exc)})
+                return
+            except Exception:
+                self._send_json(502, {"error": "读取1秒行情失败，请检查本地缓存或网络后重试。"})
+                return
+            self._send_json(200, {key: value for key, value in payload.items() if key != "cache_sha256"})
+            return
         match = re.fullmatch(r"/api/v1/minutes/([^/]+)/([^/]+)", path)
         if not match or query:
             self._send_json(404, {"error": "分钟行情接口路径无效。"})
@@ -102,7 +126,8 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def create_server(bind: str, port: int, directory: str | Path, cache_directory: str | Path | None = None,
-                  minute_service: MinuteDataService | None = None) -> ThreadingHTTPServer:
+                  minute_service: MinuteDataService | None = None,
+                  second_service: SecondDataService | None = None) -> ThreadingHTTPServer:
     try:
         bind_address = ipaddress.ip_address(bind)
     except ValueError as exc:
@@ -110,7 +135,7 @@ def create_server(bind: str, port: int, directory: str | Path, cache_directory: 
     if bind_address != ipaddress.IPv4Address("127.0.0.1"):
         raise ValueError("服务只允许绑定 127.0.0.1。")
     version_digest = hashlib.sha256()
-    for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs", "drawings.mjs",
+    for name in ("index.html", "app.mjs", "style.css", "engine.mjs", "minute-data.mjs", "second-data.mjs", "drawings.mjs",
                  "review-export.mjs", "review-report.mjs", "review-import.mjs", "review-recorder.mjs", "review-plans.mjs", "review-summary.mjs"):
         path = Path(directory) / name
         if path.is_file():
@@ -120,6 +145,7 @@ def create_server(bind: str, port: int, directory: str | Path, cache_directory: 
     handler = partial(Handler, directory=str(directory), asset_version=asset_version)
     server = ThreadingHTTPServer((bind, port), handler)
     server.minute_service = minute_service or MinuteDataService(cache_directory)
+    server.second_service = second_service or SecondDataService(cache_directory)
     return server
 
 

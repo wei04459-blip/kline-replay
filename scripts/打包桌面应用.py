@@ -19,6 +19,7 @@ DIST_FILES = (
     "style.css",
     "engine.mjs",
     "minute-data.mjs",
+    "second-data.mjs",
     "drawings.mjs",
     "review-export.mjs",
     "review-report.mjs",

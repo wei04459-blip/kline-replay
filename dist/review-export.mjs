@@ -1,5 +1,5 @@
 import {readMinuteRange} from './minute-data.mjs';
-import {aggregateMinutePrefix, buildReviewReport, SHORT_DISPLAY_INTERVALS, SUPPORTED_VIEW_INTERVALS} from './review-report.mjs';
+import {aggregateMinutePrefix, aggregateSecondPrefix, buildReviewReport, SHORT_DISPLAY_INTERVALS, SUPPORTED_VIEW_INTERVALS} from './review-report.mjs';
 
 const BASE = 900;
 const MINUTE = 60;
@@ -77,6 +77,7 @@ function nextDay(day) {
 function weekOpen(seconds) { return Math.floor((seconds - MONDAY_OFFSET) / WEEK) * WEEK + MONDAY_OFFSET; }
 
 function sessionCutoff(session, rows) {
+  if (Number.isInteger(session?.secondCursorTime) && session.secondCursorTime >= 0) return session.secondCursorTime + 1;
   if (Number.isInteger(session?.minuteCursorTime) && session.minuteCursorTime >= 0) return session.minuteCursorTime + MINUTE;
   const row = Number.isInteger(session?.cursor) ? rows[session.cursor] : null;
   return validCandle(row, BASE) ? row[0] + BASE : null;
@@ -461,6 +462,25 @@ function coalesceTimes(missing, interval, typeByTime) {
   return gaps;
 }
 
+function expectedGapRanges(rows, fromInclusive, throughExclusive, interval, type = 'recorded_second_gap') {
+  if (!Number.isFinite(fromInclusive) || !Number.isFinite(throughExclusive) || throughExclusive <= fromInclusive) return [];
+  const gaps = [];
+  let expected = Math.ceil(fromInclusive);
+  const flush = (start, end) => {
+    if (end <= start) return;
+    gaps.push({type, from: start, to: end - interval, fromUtc: iso(start), toUtc: iso(end - interval),
+      missingBars: Math.ceil((end - start) / interval)});
+  };
+  for (const row of rows) {
+    const time = row?.[0];
+    if (!Number.isFinite(time) || time < expected || time >= throughExclusive) continue;
+    flush(expected, time);
+    expected = time + interval;
+  }
+  flush(expected, Math.floor(throughExclusive));
+  return gaps;
+}
+
 function buildPartialIndex(minutes) {
   const buckets = new Map();
   for (const row of minutes) {
@@ -667,7 +687,7 @@ function restrictEvidenceToCutoff(target, cutoff, rows, issues, label) {
     target.modelConfigId = (target.modelConfigs.filter(item => !item.baselineOnly).at(-1) ?? target.modelConfigs.at(-1))?.modelConfigId ?? null;
 }
 
-function safeCurrentBar(target, cutoff, contextCandles, minuteCandles, issues, label) {
+function safeCurrentBar(target, cutoff, contextCandles, minuteCandles, secondCandles, issues, label) {
   if (!target || typeof target !== 'object' || !target.currentBar) return;
   const bar = target.currentBar;
   const interval = Number.isInteger(bar.interval) ? bar.interval
@@ -681,6 +701,21 @@ function safeCurrentBar(target, cutoff, contextCandles, minuteCandles, issues, l
     return;
   }
   if (SHORT_DISPLAY_INTERVALS.has(interval)) {
+    const secondMode = target.replayResolution === '1s' || Number.isInteger(target.secondCursorTime);
+    if (secondMode) {
+      const aggregate = aggregateSecondPrefix({secondCandles, interval, barTime: bar.time, visibleThrough: cutoff});
+      const actual = [bar.open, bar.high, bar.low, bar.close, bar.volume];
+      const expected = aggregate.candle?.slice(1, 6) ?? null;
+      const agrees = expected && actual.every((value, index) => Number.isFinite(value) &&
+        Math.abs(value - expected[index]) <= 1e-9 * Math.max(1, Math.abs(expected[index])));
+      if (!agrees) {
+        delete target.currentBar;
+        issues.push(`${label}的${interval / 60}分钟当前K线缺少连续、截止前的真实1秒证据或与其不一致，已排除；不使用分钟或15分钟背景补齐。`);
+        return;
+      }
+      target.currentBar = {...bar, interval, complete: aggregate.complete};
+      return;
+    }
     const aggregate = aggregateMinutePrefix({minuteCandles, interval, barTime: bar.time, visibleThrough: cutoff});
     const actual = [bar.open, bar.high, bar.low, bar.close, bar.volume];
     const expected = aggregate.candle?.slice(1, 6) ?? null;
@@ -712,6 +747,36 @@ function safeCurrentBar(target, cutoff, contextCandles, minuteCandles, issues, l
     return;
   }
   target.currentBar = {...bar, complete: bar.time + interval <= cutoff};
+}
+
+function safeFormingMinute(target, cutoff, secondCandles, issues, label) {
+  if (!target || typeof target !== 'object' || !Array.isArray(target.forming1m)) return;
+  const bar = target.forming1m;
+  const bucket = Number.isInteger(target.minuteCursorTime) ? target.minuteCursorTime : bar[0];
+  const first = target.forming1mMeta?.firstSecondTime;
+  const last = target.forming1mMeta?.lastSecondTime ?? target.secondCursorTime;
+  if (target.replayResolution !== '1s' && !Number.isInteger(target.secondCursorTime)) {
+    delete target.forming1m; delete target.forming1mMeta;
+    issues.push(`${label}的未完成1分钟K线没有逐秒回放标记，已排除。`); return;
+  }
+  if (!Number.isInteger(bucket) || bucket % MINUTE !== 0 || !Number.isInteger(first) || first < bucket ||
+      first >= bucket + MINUTE || !Number.isInteger(last) || last + 1 > cutoff || first > last ||
+      Math.floor(last / MINUTE) * MINUTE !== bucket) {
+    delete target.forming1m; delete target.forming1mMeta;
+    issues.push(`${label}的未完成1分钟K线缺少可验证的逐秒时间边界，已排除。`); return;
+  }
+  const rows = rowsBetween(secondCandles, first, last + 1);
+  const expectedCount = last - first + 1;
+  const contiguous = rows.length === expectedCount && rows.every((row, index) => row[0] === first + index && row[0] + 1 <= cutoff);
+  const calculated = contiguous ? [bucket, rows[0][1], Math.max(...rows.map(row => row[2])),
+    Math.min(...rows.map(row => row[3])), rows.at(-1)[4], rows.reduce((sum, row) => sum + row[5], 0)] : null;
+  const matches = calculated && bar.length >= 6 && bar.slice(0, 6).every((value, index) => Number.isFinite(value) &&
+    Math.abs(value - calculated[index]) <= 1e-9 * Math.max(1, Math.abs(calculated[index])));
+  if (!matches || target.forming1mMeta?.disclosedSeconds !== expectedCount || target.forming1mMeta?.contiguous !== true) {
+    delete target.forming1m; delete target.forming1mMeta;
+    issues.push(`${label}的未完成1分钟K线未能由连续且截止前的真实1秒行核实，已排除。`); return;
+  }
+  target.forming1m = calculated;
 }
 
 function rowsBetween(rows, from, to) {
@@ -1112,6 +1177,56 @@ export async function buildReviewExport({current = null, history = [], loadDatas
       else minuteSources.push({date: day, sliceSha256: await digestRows(minuteCandles.filter(row => utcDay(row[0]) === day)),
         note: '仅列出已揭示分钟切片的哈希；未公开含未来行的整日归档哈希或URL。'});
     }
+    const rawSecondRows = [
+      ...(Array.isArray(audit.secondRows) ? audit.secondRows : []),
+      ...(Array.isArray(audit.sourceMetadata?.market?.secondCandles) ? audit.sourceMetadata.market.secondCandles : []),
+    ];
+    const secondByTime = new Map();
+    let invalidSecondRows = 0, futureSecondRowsFiltered = 0;
+    for (const row of rawSecondRows) {
+      if (!validCandle(row, 1)) { invalidSecondRows += 1; continue; }
+      if (row[0] < bounds.replayFrom) { invalidSecondRows += 1; continue; }
+      if (row[0] + 1 > roundCutoff) { futureSecondRowsFiltered += 1; continue; }
+      if (!secondByTime.has(row[0])) secondByTime.set(row[0], row.slice(0, 6));
+    }
+    const secondCandles = [...secondByTime.values()].sort((a, b) => a[0] - b[0]);
+    if (invalidSecondRows) roundIssues.push(`已隔离 ${invalidSecondRows} 条超出本轮范围、重复格式或 OHLCV 无效的逐秒记录。`);
+    const secondModeUsed = rawSecondRows.length > 0 || Number.isInteger(record.secondCursorTime) ||
+      record.replayGranularity === 'seconds' || Number.isInteger(record.session?.secondCursorTime) ||
+      record.session?.replayGranularity === 'seconds';
+    const secondExpectedFrom = Number.isFinite(bounds.replayFrom) ? Math.ceil(bounds.replayFrom) : null;
+    const secondExpectedThrough = Number.isFinite(roundCutoff) ? Math.floor(roundCutoff) : null;
+    const secondExpectedCount = secondModeUsed && secondExpectedFrom !== null && secondExpectedThrough !== null
+      ? Math.max(0, secondExpectedThrough - secondExpectedFrom) : null;
+    const secondMissingCount = secondExpectedCount === null ? null : Math.max(0, secondExpectedCount - secondCandles.length);
+    const secondGaps = secondModeUsed && secondExpectedFrom !== null && secondExpectedThrough !== null
+      ? expectedGapRanges(secondCandles, secondExpectedFrom, secondExpectedThrough, 1) : [];
+    const secondComplete = secondModeUsed && secondCandles.length > 0 && secondMissingCount === 0 && secondGaps.length === 0;
+    const secondEvidenceStatus = !secondModeUsed ? 'not-used'
+      : !secondCandles.length ? 'unknown-no-recorded-seconds'
+        : secondExpectedCount === null ? 'unknown-range-boundary'
+          : secondComplete ? 'complete' : 'partial';
+    const secondDaysByDate = new Map();
+    for (const item of [...(Array.isArray(audit.secondDays) ? audit.secondDays : []),
+      ...(Array.isArray(audit.sourceMetadata?.market?.secondDays) ? audit.sourceMetadata.market.secondDays : [])]) {
+      if (item && typeof item.date === 'string' && !secondDaysByDate.has(item.date)) secondDaysByDate.set(item.date, item);
+    }
+    const secondSources = [];
+    for (const day of [...new Set(secondCandles.map(row => utcDay(row[0])))]) {
+      const sourceInfo = secondDaysByDate.get(day);
+      const sliceRows = secondCandles.filter(row => utcDay(row[0]) === day);
+      const dayEndExclusive = Math.floor(Date.parse(`${day}T00:00:00Z`) / 1000) + 86400;
+      const fullDay = roundCutoff >= dayEndExclusive && sliceRows.length === 86400 &&
+        sliceRows[0]?.[0] === dayEndExclusive - 86400 && sliceRows.at(-1)?.[0] === dayEndExclusive - 1;
+      secondSources.push({date: day, ...(sourceInfo && fullDay ? {url: sourceInfo.url ?? null,
+        checksumUrl: sourceInfo.checksumUrl ?? sourceInfo.checksum_url ?? null,
+        archiveSha256: sourceInfo.sha256 ?? sourceInfo.archiveSha256 ?? null} : {}),
+      rowCount: sliceRows.length, sliceSha256: await digestRows(sliceRows),
+      firstOpen: sliceRows[0]?.[0] ?? null, lastOpen: sliceRows.at(-1)?.[0] ?? null,
+      sourceHashStatus: sourceInfo && fullDay && (sourceInfo.sha256 || sourceInfo.archiveSha256)
+        ? 'archive-checksum-recorded' : 'slice-only-no-archive-hash',
+      ...(fullDay ? {} : {note: '仅列出已披露秒级切片的哈希；未公开含未来秒数据的整日归档URL或SHA256。'})});
+    }
     const roundId = String(input.id ?? record.id ?? '');
     const maxSeq = Number.isInteger(auditWatermarks?.[roundId]) ? auditWatermarks[roundId] : Number.MAX_SAFE_INTEGER;
     const audited = await auditEvents(audit, snapshotAt, record, roundIssues, roundCutoff, maxSeq);
@@ -1148,7 +1263,8 @@ export async function buildReviewExport({current = null, history = [], loadDatas
     const futureOutcomeRedactions = redactFutureOutcomes(sessionForPackage, roundCutoff, rows, roundIssues, '本轮快照');
     restrictEvidenceToCutoff(sessionForPackage, roundCutoff, rows, roundIssues, '本轮快照');
     redactUnverifiedPartial(sessionForPackage, roundCutoff, partialIndex, roundIssues, '本轮快照');
-    safeCurrentBar(sessionForPackage, roundCutoff, contextCandles, minuteCandles, roundIssues, '本轮快照');
+    safeFormingMinute(sessionForPackage, roundCutoff, secondCandles, roundIssues, '本轮快照');
+    safeCurrentBar(sessionForPackage, roundCutoff, contextCandles, minuteCandles, secondCandles, roundIssues, '本轮快照');
     if (Array.isArray(sessionForPackage.trades)) {
       for (const trade of sessionForPackage.trades) {
         const exit = Number.isFinite(trade?.exitTime) ? trade.exitTime :
@@ -1178,24 +1294,31 @@ export async function buildReviewExport({current = null, history = [], loadDatas
       const contextCount = eventCutoff == null ? 0 : upperBoundClose(contextCandles, eventCutoff, BASE);
       const safeEvent = clone(event);
       if (eventCutoff !== null) {
-        const beforeCutoff = Number.isFinite(safeEvent.before?.minuteCursorTime) ? safeEvent.before.minuteCursorTime + MINUTE
+        const beforeCutoff = Number.isInteger(safeEvent.before?.secondCursorTime) ? safeEvent.before.secondCursorTime + 1
+          : Number.isFinite(safeEvent.before?.minuteCursorTime) ? safeEvent.before.minuteCursorTime + MINUTE
           : sessionCutoff(safeEvent.before, rows);
-        const afterCutoff = Number.isFinite(safeEvent.after?.minuteCursorTime) ? safeEvent.after.minuteCursorTime + MINUTE
+        const afterCutoff = Number.isInteger(safeEvent.after?.secondCursorTime) ? safeEvent.after.secondCursorTime + 1
+          : Number.isFinite(safeEvent.after?.minuteCursorTime) ? safeEvent.after.minuteCursorTime + MINUTE
           : sessionCutoff(safeEvent.after, rows);
         redactUnverifiedPartial(safeEvent.before, Math.min(beforeCutoff ?? eventCutoff, eventCutoff), partialIndex, roundIssues,
           `事件${event.seq ?? event.id ?? ''}操作前`);
         redactUnverifiedPartial(safeEvent.after, Math.min(afterCutoff ?? eventCutoff, eventCutoff), partialIndex, roundIssues,
           `事件${event.seq ?? event.id ?? ''}操作后`);
+        safeFormingMinute(safeEvent.before, Math.min(beforeCutoff ?? eventCutoff, eventCutoff), secondCandles, roundIssues,
+          `事件${event.seq ?? event.id ?? ''}操作前`);
+        safeFormingMinute(safeEvent.after, Math.min(afterCutoff ?? eventCutoff, eventCutoff), secondCandles, roundIssues,
+          `事件${event.seq ?? event.id ?? ''}操作后`);
         eventOutcomeRedactions += redactFutureOutcomes(safeEvent.before, Math.min(beforeCutoff ?? eventCutoff, eventCutoff), rows, roundIssues,
           `事件${event.seq ?? event.id ?? ''}操作前`);
         eventOutcomeRedactions += redactFutureOutcomes(safeEvent.after, Math.min(afterCutoff ?? eventCutoff, eventCutoff), rows, roundIssues,
           `事件${event.seq ?? event.id ?? ''}操作后`);
-        safeCurrentBar(safeEvent.before, Math.min(beforeCutoff ?? eventCutoff, eventCutoff), contextCandles, minuteCandles,
+        safeCurrentBar(safeEvent.before, Math.min(beforeCutoff ?? eventCutoff, eventCutoff), contextCandles, minuteCandles, secondCandles,
           roundIssues, `事件${event.seq ?? event.id ?? ''}操作前图表K线`);
-        safeCurrentBar(safeEvent.after, Math.min(afterCutoff ?? eventCutoff, eventCutoff), contextCandles, minuteCandles,
+        safeCurrentBar(safeEvent.after, Math.min(afterCutoff ?? eventCutoff, eventCutoff), contextCandles, minuteCandles, secondCandles,
           roundIssues, `事件${event.seq ?? event.id ?? ''}操作后图表K线`);
         redactUnverifiedPartial(safeEvent.view, eventCutoff, partialIndex, roundIssues, `事件${event.seq ?? event.id ?? ''}图表状态`);
-        safeCurrentBar(safeEvent.view, eventCutoff, contextCandles, minuteCandles, roundIssues,
+        safeFormingMinute(safeEvent.view, eventCutoff, secondCandles, roundIssues, `事件${event.seq ?? event.id ?? ''}图表状态`);
+        safeCurrentBar(safeEvent.view, eventCutoff, contextCandles, minuteCandles, secondCandles, roundIssues,
           `事件${event.seq ?? event.id ?? ''}图表当前K线`);
       } else {
         redactForming(safeEvent.before, '事件没有可验证的市场截止；完整未完成K线未导出。');
@@ -1232,6 +1355,9 @@ export async function buildReviewExport({current = null, history = [], loadDatas
         visibleThrough: roundCutoff, visibleThroughUtc: iso(roundCutoff), replayFrom: bounds.replayFrom,
         replayFromUtc: iso(bounds.replayFrom), cutoffIsExclusiveClose: true, expectedMinuteRows: expected,
         availableMinuteRows: covered, missingMinuteRows: expected - covered,
+        secondEvidence: {mode: secondModeUsed, status: secondEvidenceStatus, expectedRows: secondExpectedCount,
+          availableRows: secondCandles.length, missingRows: secondMissingCount, internalGapRanges: secondGaps,
+          futureRowsFiltered: futureSecondRowsFiltered, invalidRows: invalidSecondRows},
         shortTimeframeEvidence: SHORT_DISPLAY_INTERVALS.has(sessionForPackage.tf)
           ? {interval: sessionForPackage.tf, sourceInterval: MINUTE,
             status: expected === 0 || covered === 0 ? 'unknown-no-minute-evidence' : expected === covered ? 'minute-backed' : 'partial-minute-coverage',
@@ -1252,6 +1378,7 @@ export async function buildReviewExport({current = null, history = [], loadDatas
           historicalStatus: preCaptureTrades === null ? 'unknown-legacy' : preCaptureTrades ? 'unknown-legacy' : 'not-applicable',
           preCaptureTradesWithoutVerifiableCapture: preCaptureTrades},
         futureFiltered: {minuteRows: futureAuditMinutesFiltered, auditEvents: audited.futureExcluded,
+          secondRows: futureSecondRowsFiltered,
           laterRecordedEvents: audited.recordedAfterSnapshot, beyondEventWatermark: audited.afterWatermark,
           tradeOutcomes: futureOutcomeRedactions + eventOutcomeRedactions,
           forming15mFinalBar: record.forming15m ? 1 : 0, legacyStateFields: legacyRedactions.filter(entry =>
@@ -1259,13 +1386,18 @@ export async function buildReviewExport({current = null, history = [], loadDatas
         gaps: [...contextGaps, ...minuteGaps], unavailableDays: unavailable,
         recordingStartedAt: audit.recordingStartedAt ?? null, auditBaseline: audit.baseline ?? null},
       market: {contextInterval: BASE, contextCandles, replayInterval: MINUTE, minuteCandles,
+        secondMode: secondModeUsed, secondInterval: 1, secondCandles,
+        secondCoverage: {status: secondEvidenceStatus, expectedRows: secondExpectedCount,
+          availableRows: secondCandles.length, missingRows: secondMissingCount, gaps: secondGaps},
+        secondSources,
         marketDataUnits: {timestamps: 'Unix秒，UTC', row: ['openTime', 'open', 'high', 'low', 'close', 'volume'],
           prices: 'USDT per BTC/ETH', volume: symbol === 'BTCUSDT' ? 'BTC基础资产数量，不是USDT成交额' : 'ETH基础资产数量，不是USDT成交额'},
         forming: sessionForPackage.forming15m ? {time: sessionForPackage.forming15m[0], disclosedPartial: true,
           candle: sessionForPackage.forming15m.slice(0, 6), note: '仅由截止时已揭示分钟形成；禁止替换成原始15分钟最终OHLCV。'} : null,
         sources: [{name: 'Binance Vision 官方现货归档', source: '按已揭示时间裁剪；禁止使用未回放行情'}],
         sourceManifest: {provider: 'Binance Vision 现货公开归档', sourceIndex: safe15mSources,
-          contextSliceSha256: contextSha, minuteDays: minuteSources, minuteSliceSha256: minuteSha}},
+          contextSliceSha256: contextSha, minuteDays: minuteSources, minuteSliceSha256: minuteSha,
+          secondDays: secondSources, secondSliceSha256: await digestRows(secondCandles)}},
       events: sessionEvents, auditScreenshots: screenshotMeta, issues: localIssues,
     };
     sessions.push(roundPayload);

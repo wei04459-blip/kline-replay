@@ -17,26 +17,29 @@ const reasonResumeEnd = source.indexOf('\nasync function submitOrderReason(){', 
 assert.ok(reasonResumeStart >= 0 && reasonResumeEnd > reasonResumeStart, 'reason resume helper should remain identifiable');
 const reasonResumeSource = `${source.slice(source.indexOf('function reviewPlaybackSnapshot('), source.indexOf('\nasync function manualStep(', source.indexOf('function reviewPlaybackSnapshot(')))}\n${source.slice(reasonResumeStart, reasonResumeEnd)}`;
 
-function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
+function harness({results = [], nextMinute, nextSecond, readSecondRange, replayResolution = 'minute', tf = 180, time = 0} = {}) {
   const timers = [], toasts = [];
-  const active = {id: 'session-1', symbol: 'BTCUSDT', cursor: 0, time, tf, end: 100, ended: false};
+  const active = {id: 'session-1', symbol: 'BTCUSDT', cursor: 0, time, tf, end: 100, ended: false, replayGranularity: replayResolution};
   const data = [];
   const state = {
     active, data, pendingOrderRequest: null, transitionPending: false, invalidSavedActive: false, uiPlan: null, modificationDraft: null,
     isPlaying: false, reasonResumePlayback: false, fastForwarding: false, minuteActionPending: false, minuteRetryAction: null,
     minuteGeneration: 0, minuteRequestId: 0, playTimer: 0,
     advanceCount: 0, renderCount: 0, persistCount: 0, draftSyncCount: 0,
-    events: [...results], timers, toasts, reviewEvents: [], minuteRows: []
+    events: [...results], timers, toasts, reviewEvents: [], minuteRows: [], secondRows: []
   };
   const controls = {
     play: {disabled: false, textContent: '', setAttribute() {}},
     'step-minute': {disabled: false}, step: {disabled: false}, 'cancel-advance': {hidden: true},
     'retry-minute': {hidden: true}, 'progress-text': {textContent: ''}, 'progress-bar': {style: {width: ''}},
-    speed: {value: '1500'}
+    speed: {value: replayResolution==='seconds'?'100':'1500'}
   };
   const sandbox = {
     els: controls,
     replayIsEnded: (s = active) => !!s.ended,
+    usesSecondReplay: session => session?.replayGranularity==='seconds',
+    replayResolution: session => session?.replayGranularity==='seconds'?'1s':'1m',
+    playbackDelay: (session=active) => session?.replayGranularity==='seconds'?(session.secondSpeedMs||100):(session?.speed||1500),
     replayClock: (s = active) => s.time,
     currentData: () => data,
     clone: value => value == null ? value : JSON.parse(JSON.stringify(value)),
@@ -44,12 +47,16 @@ function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
     reviewId: prefix => `${prefix}-test-id`,
     reasonBlocksReplay: mode => ['entry','exit'].includes(mode??sandbox.pendingOrderRequest?.mode),
     reviewView: session => ({visibleThrough: session.time + 60, tf: session.tf}),
-    reviewRecorder: {appendMinute: async (_session, row) => { state.minuteRows.push(row); }, observe: async (_session, options = {}) => { if (options.kind) state.reviewEvents.push(options.kind); }},
+    reviewRecorder: {appendMinute: async (_session, row) => { state.minuteRows.push(row); }, appendSecond: async (_session, row) => { state.secondRows.push(row); }, observe: async (_session, options = {}) => { if (options.kind) state.reviewEvents.push(options.kind); }},
     recordReviewEvent: (kind, details) => { state.reviewEvents.push({kind, details}); },
     executionStageSnapshots: (before, progressed, stage) => ({before, after: {...progressed, ...(stage?.after||{})}}),
     keyReviewKind: kind => /^(order-|position-|protection-|drawing-)/.test(kind),
     intervalStart: (value, seconds) => Math.floor(value / seconds) * seconds,
     nextMinute: nextMinute || (async (_symbol, afterTime) => [afterTime + 60, 100, 101, 99, 100, 1]),
+    nextSecond: nextSecond || (async (_symbol, afterTime) => [afterTime + 1, 100, 101, 99, 100, 1]),
+    secondSourceFor: () => null,
+    advanceSecond: (session, candle) => {state.advanceCount++;session.secondCursorTime=candle[0];session.time=candle[0]+1;const result=state.events.shift()||{ended:false};if(result.ended)session.ended=true;return result;},
+    readSecondRange: readSecondRange || (async (_symbol, from, through) => ({candles:Array.from({length:Math.max(0,through-from)},(_,index)=>[from+index,100,101,99,100,1]),unavailable:[],stoppedAt:null})),
     advanceMinute: (session, candle) => {
       state.advanceCount++;
       session.cursor++;
@@ -59,6 +66,7 @@ function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
       return result;
     },
     rememberDisclosedMinute: () => {},
+    rememberDisclosedSecond: () => {},
     syncDraftsAfterMinute: () => { state.draftSyncCount++; return false; },
     minuteResultMessage: (result, session) => {
       const coin = session.symbol.replace(/USDT$/, '');
@@ -72,10 +80,12 @@ function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
     render: () => { state.renderCount++; },
     persist: () => { state.persistCount++; },
     syncReplayProgress: () => {},
+    secondHistoryStatus: {error:''},
     toast: message => toasts.push(message),
     pretty: value => String(value),
     FEE: 0.0004,
-    setTimeout: callback => { const id = timers.length + 1; timers.push({id, callback}); return id; },
+    BASE: 900,
+  setTimeout: (callback, delay = 0) => { const id = timers.length + 1; timers.push({id, callback, delay}); return id; },
     clearTimeout: id => { const timer = timers.find(item => item.id === id); if (timer) timer.cancelled = true; }
   };
   for (const key of Object.keys(state)) Object.defineProperty(sandbox, key, {
@@ -226,10 +236,56 @@ test('minute read failure stops playback and preserves the retry affordance', as
   h.state.isPlaying = true;
   await h.api.runAutomaticMinute(h.state.minuteGeneration);
   assert.equal(h.state.isPlaying, false);
-  assert.equal(h.state.minuteRetryAction, 'minute');
+  assert.equal(h.state.minuteRetryAction, 'minutes');
   assert.equal(h.controls['retry-minute'].hidden, false);
   assert.match(h.toasts.at(-1), /网络中断/);
   assert.equal(h.timers.filter(timer => !timer.cancelled).length, 0);
+});
+
+test('second playback advances one real second, records it, and uses the compressed second speed', async () => {
+  const h=harness({replayResolution:'seconds',time:120,nextSecond:async(_symbol,afterTime)=>[afterTime+1,100,101,99,100.5,0.25]});
+  h.state.active.secondSpeedMs=100;h.state.isPlaying=true;
+  await h.api.runAutomaticMinute(h.state.minuteGeneration);
+  assert.equal(h.state.active.secondCursorTime,120);
+  assert.equal(h.state.active.time,121);
+  assert.equal(h.state.secondRows.length,1);
+  assert.deepEqual(h.state.secondRows[0],[120,100,101,99,100.5,0.25]);
+  assert.equal(h.timers.filter(timer=>!timer.cancelled).at(-1).delay,100);
+});
+
+test('second-mode boundary fast-forward batches real rows but advances and records every second', async () => {
+  const h=harness({replayResolution:'seconds',tf:3,time:0});
+  const result=await h.api.advanceToTfBoundary();
+  assert.equal(result.steps,3,JSON.stringify({result,toasts:h.toasts,events:h.state.reviewEvents}));
+  assert.equal(h.state.active.time,3);
+  assert.equal(h.state.active.secondCursorTime,2);
+  assert.equal(h.state.advanceCount,3);
+  assert.equal(h.state.secondRows.length,3);
+  assert.equal(h.state.renderCount>=1,true);
+});
+
+test('second request failure pauses without changing the cutoff and exposes retry', async () => {
+  const h=harness({replayResolution:'seconds',time:300,nextSecond:async()=>{throw new Error('秒档不可用');}});
+  h.state.isPlaying=true;
+  await h.api.runAutomaticMinute(h.state.minuteGeneration);
+  assert.equal(h.state.active.time,300);
+  assert.equal(h.state.active.secondCursorTime,undefined);
+  assert.equal(h.state.isPlaying,false);
+  assert.equal(h.state.minuteRetryAction,'seconds');
+  assert.equal(h.controls['retry-minute'].hidden,false);
+  assert.match(h.toasts.at(-1),/秒档不可用/);
+});
+
+test('pause invalidates a pending second fetch before the row can be disclosed', async () => {
+  const wait=deferred(),h=harness({replayResolution:'seconds',time:600,nextSecond:()=>wait.promise});
+  const pending=h.api.advanceOneMinuteCore(h.state.minuteGeneration);
+  await Promise.resolve();
+  assert.equal(h.state.minuteActionPending,true);
+  h.api.pause(false);
+  wait.resolve([600,100,101,99,100,1]);
+  assert.equal(await pending,null);
+  assert.equal(h.state.advanceCount,0);
+  assert.equal(h.state.secondRows.length,0);
 });
 
 function appSection(startMarker, endMarker) {
@@ -287,6 +343,8 @@ function exitHarness({playing = true, startResult = false} = {}) {
     active,
     transitionPending: false,
     isPlaying: playing,
+    playbackDelay: () => 1500,
+    replayResolution: () => '1m',
     reasonResumePlayback: false,
     reasonFocusReturn: null,
     reasonWindowDrag: null,

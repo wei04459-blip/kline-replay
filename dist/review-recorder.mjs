@@ -1,5 +1,5 @@
 const DB_NAME = 'kline-replay-review-v1';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 function requestResult(request) {
   return new Promise((resolve, reject) => {
@@ -25,8 +25,9 @@ function openDatabase() {
       if (!db.objectStoreNames.contains('sessions')) db.createObjectStore('sessions', {keyPath: 'sessionId'});
       const events = db.objectStoreNames.contains('events') ? request.transaction.objectStore('events') : db.createObjectStore('events', {keyPath: ['sessionId', 'seq']});
       const minutes = db.objectStoreNames.contains('minutes') ? request.transaction.objectStore('minutes') : db.createObjectStore('minutes', {keyPath: ['sessionId', 'time']});
+      const seconds = db.objectStoreNames.contains('seconds') ? request.transaction.objectStore('seconds') : db.createObjectStore('seconds', {keyPath: ['sessionId', 'time']});
       const screenshots = db.objectStoreNames.contains('screenshots') ? request.transaction.objectStore('screenshots') : db.createObjectStore('screenshots', {keyPath: 'id'});
-      for (const store of [events, minutes, screenshots]) if (!store.indexNames.contains('sessionId')) store.createIndex('sessionId', 'sessionId', {unique: false});
+      for (const store of [events, minutes, seconds, screenshots]) if (!store.indexNames.contains('sessionId')) store.createIndex('sessionId', 'sessionId', {unique: false});
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error('无法打开本地复盘资料库'));
@@ -37,6 +38,21 @@ function openDatabase() {
 function jsonClone(value) {
   if (value === undefined) return null;
   try { return JSON.parse(JSON.stringify(value)); } catch { return null; }
+}
+
+export function normalizeSecondRow(row) {
+  const value = Array.isArray(row) ? row.slice(0, 6) : null;
+  if (!value || value.length < 6 || !value.every(Number.isFinite) || !Number.isInteger(value[0]) || value[0] < 0 ||
+      value[1] <= 0 || value[2] <= 0 || value[3] <= 0 || value[4] <= 0 || value[5] < 0 ||
+      value[3] > Math.min(value[1], value[4]) || value[2] < Math.max(value[1], value[4])) return null;
+  return value;
+}
+
+export function normalizeSecondSource(source) {
+  if (!source || typeof source !== 'object' || typeof source.date !== 'string' ||
+      typeof source.url !== 'string' || typeof (source.checksum_url ?? source.checksumUrl) !== 'string' ||
+      typeof source.sha256 !== 'string' || !/^[a-f\d]{64}$/i.test(source.sha256)) return null;
+  return {date: source.date, url: source.url, checksum_url: source.checksum_url ?? source.checksumUrl, sha256: source.sha256};
 }
 
 export function cloneScreenshotRecord(item) {
@@ -53,8 +69,12 @@ function projection(session) {
     symbol: session.symbol,
     cursor: session.cursor,
     minuteCursorTime: session.minuteCursorTime ?? null,
+    secondCursorTime: session.secondCursorTime ?? null,
     forming15m: session.forming15m ?? null,
+    forming1m: session.forming1m ?? null,
+    forming1mMeta: session.forming1mMeta ?? null,
     currentPrice: session.currentPrice ?? null,
+    replayGranularity: session.replayGranularity ?? 'minute',
     tf: session.tf,
     ma: !!session.ma,
     ma10: !!session.ma10,
@@ -287,6 +307,34 @@ export function createReviewRecorder() {
     },sessionId);
   }
 
+  async function appendSecond(sessionId, row, source = null) {
+    const id = String(sessionId || '');
+    const secondRow = normalizeSecondRow(row);
+    if (!id || !secondRow) return;
+    const recordedAt = new Date().toISOString();
+    const sourceCopy = normalizeSecondSource(source);
+    return enqueue(async () => {
+      const database = await db();
+      const tx = database.transaction(['sessions', 'seconds'], 'readwrite');
+      const done = transactionDone(tx);
+      const seconds = tx.objectStore('seconds'), sessions = tx.objectStore('sessions');
+      let meta = await requestResult(sessions.get(id));
+      if (!meta) meta = {sessionId: id, recordingStartedAt: recordedAt, baseline: true, issues: [], nextSeq: 1};
+      seconds.put({sessionId: id, time: secondRow[0], row: secondRow, recordedAt});
+      if (sourceCopy) {
+        const days = Array.isArray(meta.secondDays) ? meta.secondDays : [];
+        const existing = days.findIndex(item => item?.date === sourceCopy.date);
+        if (existing < 0) days.push(sourceCopy);
+        else if (days[existing].sha256 !== sourceCopy.sha256) {
+          meta.issues = [...(meta.issues || []), `秒级行情来源校验信息在 ${sourceCopy.date} 出现冲突。`];
+        }
+        meta.secondDays = days;
+      }
+      sessions.put(meta);
+      await done;
+    }, id);
+  }
+
   async function captureWatermarks(sessionIds) {
     const ids = [...new Set((sessionIds || []).filter(Boolean).map(String))];
     return enqueue(async () => {
@@ -319,7 +367,7 @@ export function createReviewRecorder() {
     const importedAt = new Date().toISOString();
     return enqueue(async () => {
       const database = await db();
-      const tx = database.transaction(['sessions', 'events', 'screenshots', 'minutes'], 'readwrite');
+      const tx = database.transaction(['sessions', 'events', 'screenshots', 'minutes', 'seconds'], 'readwrite');
       const done = transactionDone(tx), sessions = tx.objectStore('sessions');
       const existing = await requestResult(sessions.get(sessionId));
       if (existing) {
@@ -344,7 +392,7 @@ export function createReviewRecorder() {
         archivedSession: jsonClone(session),
         issues: Array.isArray(archive.issues) ? archive.issues.slice() : ['此轮来自导入归档；导入前本地过程缺失情况以原包标记为准。'],
         nextSeq: maxSeq + 1, lastState: jsonClone(projection(session))});
-      const eventStore = tx.objectStore('events'), minuteStore = tx.objectStore('minutes');
+      const eventStore = tx.objectStore('events'), minuteStore = tx.objectStore('minutes'), secondStore = tx.objectStore('seconds');
       for (const event of events) {
         event.sessionId = sessionId;
         if (!event.id) event.id = `${sessionId}:${event.seq}`;
@@ -355,10 +403,30 @@ export function createReviewRecorder() {
         screenshot.sessionId = sessionId;
         screenshotStore.put(screenshot);
       }
-      let visibleThrough = Number.isFinite(session.minuteCursorTime) ? session.minuteCursorTime + 60 : Number.MAX_SAFE_INTEGER;
+      let visibleThrough = Number.isFinite(session.secondCursorTime) ? session.secondCursorTime + 1 :
+        (Number.isFinite(session.minuteCursorTime) ? session.minuteCursorTime + 60 : Number.MAX_SAFE_INTEGER);
       for (const row of minutes) {
         if (row[0] + 60 > visibleThrough) continue;
         minuteStore.put({sessionId, time: row[0], row, recordedAt: importedAt});
+      }
+      const importedMarket = archive.market ?? archive.sourceMetadata?.market ?? null;
+      const importedSeconds = Array.isArray(archive.secondRows) ? archive.secondRows :
+        (Array.isArray(importedMarket?.secondCandles) ? importedMarket.secondCandles : []);
+      for (const candidate of importedSeconds) {
+        const row = normalizeSecondRow(candidate);
+        if (!row || row[0] + 1 > visibleThrough) continue;
+        secondStore.put({sessionId, time: row[0], row, recordedAt: importedAt});
+      }
+      const importedSecondDays = Array.isArray(archive.secondDays) ? archive.secondDays :
+        (Array.isArray(importedMarket?.secondDays) ? importedMarket.secondDays :
+          (Array.isArray(importedMarket?.sourceManifest?.secondDays) ? importedMarket.sourceManifest.secondDays : []));
+      const meta = await requestResult(sessions.get(sessionId));
+      if (meta && importedSecondDays.length) {
+        meta.secondDays = importedSecondDays.filter(item => item && typeof item.date === 'string' && typeof (item.sha256 ?? item.archiveSha256) === 'string').map(item => ({
+          date: item.date, url: item.url ?? null, checksum_url: item.checksum_url ?? item.checksumUrl ?? null,
+          sha256: item.sha256 ?? item.archiveSha256
+        }));
+        sessions.put(meta);
       }
       await done;
       return {status: 'imported', sessionId};
@@ -373,22 +441,25 @@ export function createReviewRecorder() {
 
   async function readSession(sessionId, {maxSeq = Number.MAX_SAFE_INTEGER, visibleThrough = Number.MAX_SAFE_INTEGER, snapshotAt = Number.MAX_SAFE_INTEGER} = {}) {
     const database = await db();
-    const tx = database.transaction(['sessions', 'events', 'screenshots', 'minutes'], 'readonly');
+    const tx = database.transaction(['sessions', 'events', 'screenshots', 'minutes', 'seconds'], 'readonly');
     const done = transactionDone(tx);
     const key = IDBKeyRange.only(String(sessionId));
-    const [meta, allEvents, allScreenshots, allMinutes] = await Promise.all([
+    const [meta, allEvents, allScreenshots, allMinutes, allSeconds] = await Promise.all([
       requestResult(tx.objectStore('sessions').get(String(sessionId))),
       requestResult(tx.objectStore('events').index('sessionId').getAll(key)),
       requestResult(tx.objectStore('screenshots').index('sessionId').getAll(key)),
-      requestResult(tx.objectStore('minutes').index('sessionId').getAll(key))
+      requestResult(tx.objectStore('minutes').index('sessionId').getAll(key)),
+      requestResult(tx.objectStore('seconds').index('sessionId').getAll(key))
     ]);
     await done;
     const events = allEvents.filter(x => x.sessionId === String(sessionId) && x.seq <= maxSeq && (x.visibleThrough === null || x.visibleThrough <= visibleThrough) && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.seq - b.seq);
     const includedIds = new Set(events.map(x => x.screenshotId).filter(Boolean));
     const screenshots = allScreenshots.filter(x => x.sessionId === String(sessionId) && includedIds.has(x.id)).map(({id, blob, eventId, mimeType, captureType}) => ({id, blob, eventId, mimeType, captureType}));
     const minutes = allMinutes.filter(x => x.sessionId === String(sessionId) && x.time + 60 <= visibleThrough && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.time - b.time).map(x => x.row);
+    const secondRows = allSeconds.filter(x => x.sessionId === String(sessionId) && x.time + 1 <= visibleThrough && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.time - b.time).map(x => x.row);
     return {
-      sessionId: String(sessionId), events, screenshots, minutes,
+      sessionId: String(sessionId), events, screenshots, minutes, secondRows,
+      secondDays: jsonClone(meta?.secondDays ?? []),
       recordingStartedAt: meta?.recordingStartedAt ?? null,
       baseline: meta?.baseline ?? true,
       imported: meta?.imported ?? false,
@@ -399,7 +470,7 @@ export function createReviewRecorder() {
     };
   }
 
-  return {observe, appendMinute, flush, readSession, captureWatermarks, importSessionArchive};
+  return {observe, appendMinute, appendSecond, flush, readSession, captureWatermarks, importSessionArchive};
 }
 
 export {projection as reviewStateProjection, inferredKind as inferReviewEventKind};

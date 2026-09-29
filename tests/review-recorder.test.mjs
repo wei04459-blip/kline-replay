@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {cloneScreenshotRecord, inferReviewEventKind, reviewStateProjection} from '../dist/review-recorder.mjs';
+import {cloneScreenshotRecord, inferReviewEventKind, normalizeSecondRow, normalizeSecondSource, reviewStateProjection} from '../dist/review-recorder.mjs';
 import {estimateOrderRisk} from '../dist/engine.mjs';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
@@ -25,6 +25,27 @@ test('review projection preserves only the current disclosed replay state and it
   assert.equal(projected.volume, true);
   assert.deepEqual(projected.simulationModel, {id: 'isolated-v1'});
   assert.equal(Object.hasOwn(projected, 'futureRows'), false);
+});
+
+test('review projection preserves second-resolution cutoff and currently forming disclosed minute', () => {
+  const session={symbol:'BTCUSDT',cursor:42,minuteCursorTime:1234567800,secondCursorTime:1234567890,
+    replayGranularity:'seconds',forming1m:[1234567860,10,12,9,11,4],
+    forming1mMeta:{firstSecondTime:1234567860,lastSecondTime:1234567890,disclosedSeconds:31,contiguous:true}};
+  const projected=reviewStateProjection(session);
+  assert.equal(projected.replayGranularity,'seconds');
+  assert.equal(projected.secondCursorTime,1234567890);
+  assert.deepEqual(projected.forming1m,session.forming1m);
+  assert.deepEqual(projected.forming1mMeta,session.forming1mMeta);
+});
+
+test('recorder accepts only valid real second OHLCV rows and checksum source descriptors', () => {
+  const row=[1700000000,10,12,9,11,4];
+  assert.deepEqual(normalizeSecondRow(row),row);
+  assert.equal(normalizeSecondRow([1700000000,10,9,9,11,4]),null,'high cannot be below close');
+  assert.equal(normalizeSecondRow([1700000000.5,10,12,9,11,4]),null,'second open time must be integer UTC seconds');
+  const source={date:'2023-11-14',url:'https://example.test/day.zip',checksum_url:'https://example.test/day.zip.CHECKSUM',sha256:'a'.repeat(64)};
+  assert.deepEqual(normalizeSecondSource(source),source);
+  assert.equal(normalizeSecondSource({...source,sha256:'bad'}),null,'source hashes must be SHA-256');
 });
 
 test('review projection is a detached before-snapshot for in-place trade mutations', () => {
