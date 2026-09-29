@@ -124,7 +124,7 @@ export async function readSecondRange(symbol, fromInclusive, throughExclusive, {
     const start = Math.max(firstOpen, dayStart);
     const end = Math.min(throughExclusive, nextMidnight(day));
     const selected = rows.slice(start - dayStart, end - dayStart);
-    candles.push(...selected);
+    for (const candle of selected) candles.push(candle);
     const source = archiveMetaCache.get(`${symbol}/${day}`) || null;
     days.push({symbol, date: day, ...(source ? {url: source.url, checksumUrl: source.checksum_url, archiveSha256: source.sha256} : {}),
       rowCount: selected.length, firstOpen: selected[0]?.[0] ?? null, lastOpen: selected.at(-1)?.[0] ?? null,

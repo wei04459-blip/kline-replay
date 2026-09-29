@@ -743,10 +743,14 @@ function rememberDisclosedMinute(symbol,row){
 }
 function rememberDisclosedSecond(symbol,row){
   if(!Array.isArray(row)||!Number.isInteger(row[0]))return;
-  const rows=secondRowsBySymbol.get(symbol)||[],last=rows.at(-1),copy=row.slice(0,6);
+  let rows=secondRowsBySymbol.get(symbol)||[];const last=rows.at(-1),copy=row.slice(0,6);
   if(last&&last[0]===row[0])rows[rows.length-1]=copy;
   else if(!last||row[0]>last[0])rows.push(copy);
-  else {rows.splice(0,rows.length,...mergeSecondRows(rows,[copy]));}
+  else {
+    let low=0,high=rows.length;
+    while(low<high){const mid=(low+high)>>>1;if(rows[mid][0]<row[0])low=mid+1;else high=mid;}
+    if(rows[low]?.[0]===row[0])rows[low]=copy;else rows.splice(low,0,copy);
+  }
   if(rows.length>SECOND_CACHE_MAX_ROWS)rows.splice(0,rows.length-SECOND_CACHE_MAX_ROWS);
   secondRowsBySymbol.set(symbol,rows);
   const nextThrough=row[0]+1,cacheByTf=secondBarsBySymbol.get(symbol);
