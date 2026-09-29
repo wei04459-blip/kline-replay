@@ -24,7 +24,8 @@ test('drawing sanitizer keeps valid records and drops bad items independently', 
 
 test('trendlines need two valid points at distinct times', () => {
   assert.deepEqual(sanitizeDrawings([{id: 't1', type: 'trend', start: {time: 1, price: 5}, end: {time: 2, price: 7}}]),
-    [{id: 't1', type: 'trend', start: {time: 1, price: 5}, end: {time: 2, price: 7}}]);
+    [{id: 't1', type: 'trend', start: {time: 1, price: 5}, end: {time: 2, price: 7}, colorPreset: 'teal'}]);
+  assert.equal(sanitizeDrawings([{id: 't3', type: 'trend', start: {time: 1, price: 5}, end: {time: 2, price: 7}, colorPreset: 'red'}])[0].colorPreset, 'red');
   assert.deepEqual(sanitizeDrawings([{id: 't2', type: 'trend', start: {time: 1, price: 5}, end: {time: 1, price: 7}}]), []);
 });
 
@@ -95,6 +96,7 @@ test('drawing projections map timestamps to logical coordinates without needing 
     end: {time: bars15[3].time + 900, price: 43000}};
   assert.deepEqual(projectDrawing(drawing, bars30, 1800), {
     id: 'trend-1', type: 'trend', start: {logical: 0.75, price: 42000}, end: {logical: 2, price: 43000},
+    colorPreset: 'teal',
   });
 });
 
@@ -102,9 +104,11 @@ test('whole-line translation preserves trend shape; endpoint move changes only t
   const trend = {id: 'trend-2', type: 'trend', start: {time: 10, price: 100}, end: {time: 30, price: 120}};
   assert.deepEqual(translateDrawing(trend, 60, -5), {
     id: 'trend-2', type: 'trend', start: {time: 70, price: 95}, end: {time: 90, price: 115},
+    colorPreset: 'teal',
   });
   assert.deepEqual(moveDrawingPoint(trend, 'end', {time: 50, price: 130}), {
     id: 'trend-2', type: 'trend', start: trend.start, end: {time: 50, price: 130},
+    colorPreset: 'teal',
   });
   assert.equal(translateDrawing(trend, -60, -150), null, 'invalid pointer movement must not produce a drawable');
 });
@@ -166,8 +170,10 @@ test('SVG renderer creates visible selected horizontal and trend lines with mult
     assert.equal(session.drawings[0].colorPreset,'purple','refresh keeps the selected drawing preset');
     const trendHit=overlay.children.find(node=>node.dataset.drawingId==='t1'&&node.attributes.class==='drawing-hit-area');
     trendHit.listeners.pointerdown[0]({button:0,pointerId:3,target:trendHit,clientX:100,clientY:50,preventDefault(){},stopPropagation(){}});
-    assert.equal(tools.setSelectedColor('red'),false,'trendline colors remain unchanged');
-    assert.equal(Object.hasOwn(session.drawings[1],'colorPreset'),false);
+    assert.equal(tools.setSelectedColor('red'),true,'trendline uses the shared color control');
+    assert.equal(session.drawings[1].colorPreset,'red');
+    assert.equal(overlay.children.find(node=>node.attributes.class==='drawing-line trend selected').attributes.stroke,DRAWING_PALETTE.red.line);
+    assert.equal(changes.length,2,'trendline color changes use the persisted drawing modification path');
     tools.destroy();
   } finally {
     for (const [key, value] of Object.entries(previous)) {

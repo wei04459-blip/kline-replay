@@ -248,7 +248,7 @@ function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
     for(const drawing of active.drawings||[]){
       const projected=projectDrawing(drawing,bars,active.tf);if(!projected)continue;
       const palette=resolveDrawingPalette(drawing.type,drawing.colorPreset);
-      ctx.beginPath();ctx.strokeStyle=drawing.type==='horizontal'?palette.line:'#e6ba69';ctx.lineWidth=1.2;ctx.setLineDash(['horizontal','trend'].includes(drawing.type)?[]:[5,4]);
+      ctx.beginPath();ctx.strokeStyle=['horizontal','trend'].includes(drawing.type)?palette.line:'#e6ba69';ctx.lineWidth=1.2;ctx.setLineDash(['horizontal','trend'].includes(drawing.type)?[]:[5,4]);
       if(drawing.type==='horizontal'){
         const y=candleSeries.priceToCoordinate(projected.anchor.price);if(Number.isFinite(y)){ctx.moveTo(0,y);ctx.lineTo(plotWidth,y);ctx.stroke();}
       }else if(drawing.type==='zone'){
@@ -516,7 +516,7 @@ function syncDrawingControls(){
     const button=$(id);if(!button)continue;const selected=activeDrawingTool===tool;button.classList.toggle('active',selected);button.setAttribute('aria-pressed',String(selected));button.disabled=locked;
   }
   const del=$('drawing-delete');if(del){del.disabled=locked||!selectedDrawingId;del.setAttribute('aria-disabled',String(del.disabled));}
-  const selected=drawingTools?.getSelectedDrawing?.(),colorable=!!selected&&['horizontal','zone','fibonacci'].includes(selected.type),fibSelected=selected?.type==='fibonacci';
+  const selected=drawingTools?.getSelectedDrawing?.(),colorable=!!selected&&['horizontal','trend','zone','fibonacci'].includes(selected.type),fibSelected=selected?.type==='fibonacci';
   const colorButton=$('drawing-color'),popover=$('drawing-color-popover'),sample=$('drawing-color-sample');
   if(!colorable||locked)closeDrawingColorPopover();
   if(colorButton){colorButton.disabled=locked||!colorable;colorButton.setAttribute('aria-disabled',String(colorButton.disabled));colorButton.setAttribute('aria-expanded',String(drawingColorPopoverOpen));}

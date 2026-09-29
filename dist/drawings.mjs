@@ -39,7 +39,8 @@ function cloneDrawing(item) {
       item.start.time !== item.end.time) {
     return {id: item.id, type: item.type,
       start: {time: item.start.time, price: item.start.price},
-      end: {time: item.end.time, price: item.end.price}};
+      end: {time: item.end.time, price: item.end.price},
+      colorPreset: validColorPreset(item.colorPreset) ? item.colorPreset : NEW_DRAWING_COLOR_PRESET};
   }
   if (item.type === 'fibonacci' && validPoint(item.start) && validPoint(item.end) &&
       (item.start.time !== item.end.time || item.start.price !== item.end.price)) {
@@ -126,7 +127,7 @@ export function projectDrawing(drawing, bars, intervalSeconds = 60) {
   });
   if (valid.type === 'horizontal') return {id: valid.id, type: valid.type, anchor: project(valid.anchor), colorPreset: valid.colorPreset};
   return {id: valid.id, type: valid.type, start: project(valid.start), end: project(valid.end),
-    ...(['zone', 'fibonacci'].includes(valid.type) ? {colorPreset: valid.colorPreset} : {}),
+    ...(['trend', 'zone', 'fibonacci'].includes(valid.type) ? {colorPreset: valid.colorPreset} : {}),
     ...(valid.type === 'fibonacci' ? {lineStyle: valid.lineStyle, extendRight: valid.extendRight} : {})};
 }
 
@@ -535,14 +536,15 @@ export function createDrawingTools({chart, series, container, getSession, getBar
       stroke: 'transparent', 'stroke-width': 12, 'vector-effect': 'non-scaling-stroke'}, 'drawing-hit-area');
     bindHit(hit, drawing.id);
     overlay.append(hit);
+    const palette = resolveDrawingPalette('trend', drawing.colorPreset);
     const line = createSvg('line', {x1: a.x, y1: a.y, x2: b.x, y2: b.y,
-      stroke: chosen ? '#f3cd73' : '#90a6ab', 'stroke-width': chosen ? 2 : 1.5,
+      stroke: palette.line, 'stroke-width': chosen ? 2 : 1.5,
       'stroke-dasharray': 'none', 'vector-effect': 'non-scaling-stroke'}, `drawing-line trend${chosen ? ' selected' : ''}`);
     line.style.pointerEvents = 'none';
     overlay.append(line);
     if (chosen) {
       for (const [which, point] of [['start', a], ['end', b]]) {
-        const handle = createSvg('circle', {cx: point.x, cy: point.y, r: 5, fill: '#f3cd73', stroke: '#171b1e', 'stroke-width': 2}, 'drawing-handle');
+        const handle = createSvg('circle', {cx: point.x, cy: point.y, r: 5, fill: palette.line, stroke: '#f3cd73', 'stroke-width': 2}, 'drawing-handle');
         bindHit(handle, drawing.id, which);
         overlay.append(handle);
       }
@@ -659,7 +661,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
         if (point.time === first.time && (tool !== 'fibonacci' || point.price === first.price)) return false;
         return finishDrawing(tool === 'fibonacci' ? {id: uid(), type: 'fibonacci', start: first, end: point,
           colorPreset: NEW_DRAWING_COLOR_PRESET, lineStyle: 'solid', extendRight: true} :
-          {id: uid(), type: 'trend', start: first, end: point});
+          {id: uid(), type: 'trend', start: first, end: point, colorPreset: NEW_DRAWING_COLOR_PRESET});
       }
     }
     if (tool === 'zone') {
@@ -849,7 +851,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   function setSelectedColor(colorPreset) {
     if (!selectedId || !validColorPreset(colorPreset) || isLocked()) return false;
     const drawing = currentDrawings().find(item => item.id === selectedId);
-    if (!drawing || !['horizontal', 'zone', 'fibonacci'].includes(drawing.type) || drawing.colorPreset === colorPreset) return false;
+    if (!drawing || !['horizontal', 'trend', 'zone', 'fibonacci'].includes(drawing.type) || drawing.colorPreset === colorPreset) return false;
     if (!replaceDrawing(selectedId, {...drawing, colorPreset})) return false;
     render();
     return true;
