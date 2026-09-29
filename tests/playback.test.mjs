@@ -58,6 +58,7 @@ function harness({results = [], nextMinute, tf = 180, time = 0} = {}) {
       if (result.ended) session.ended = true;
       return result;
     },
+    rememberDisclosedMinute: () => {},
     syncDraftsAfterMinute: () => { state.draftSyncCount++; return false; },
     minuteResultMessage: (result, session) => {
       const coin = session.symbol.replace(/USDT$/, '');

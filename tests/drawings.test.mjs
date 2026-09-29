@@ -4,6 +4,7 @@ import {
   logicalToTimestamp, moveDrawingPoint, projectDrawing, sanitizeDrawings,
   timestampToLogical, translateDrawing, createDrawingTools, resizeZone,
   DRAWING_PALETTE, resolveDrawingPalette,
+  FIBONACCI_LEVELS, DRAWING_LINE_STYLES, fibonacciPriceLevels,
 } from '../dist/drawings.mjs';
 
 const bars15 = Array.from({length: 5}, (_, i) => ({time: 1_700_000_000 + i * 900}));
@@ -25,6 +26,28 @@ test('trendlines need two valid points at distinct times', () => {
   assert.deepEqual(sanitizeDrawings([{id: 't1', type: 'trend', start: {time: 1, price: 5}, end: {time: 2, price: 7}}]),
     [{id: 't1', type: 'trend', start: {time: 1, price: 5}, end: {time: 2, price: 7}}]);
   assert.deepEqual(sanitizeDrawings([{id: 't2', type: 'trend', start: {time: 1, price: 5}, end: {time: 1, price: 7}}]), []);
+});
+
+test('Fibonacci sanitizer preserves endpoint order and allowlists style, color, and right extension', () => {
+  const fib={id:'fib-1',type:'fibonacci',start:{time:bars15[3].time,price:100},end:{time:bars15[1].time,price:200},colorPreset:'purple',lineStyle:'dotted',extendRight:false};
+  assert.deepEqual(sanitizeDrawings([fib]),[fib]);
+  assert.deepEqual(sanitizeDrawings([{...fib,id:'legacy-fib',colorPreset:'evil',lineStyle:'url(evil)',extendRight:'yes'}]),[
+    {...fib,id:'legacy-fib',colorPreset:'teal',lineStyle:'solid',extendRight:true},
+  ]);
+  assert.equal(sanitizeDrawings([{...fib,id:'flat-fib',end:{...fib.start}}]).length,0);
+  assert.deepEqual(FIBONACCI_LEVELS,[0,.236,.382,.5,.618,.786,1]);
+  assert.deepEqual(DRAWING_LINE_STYLES,{solid:'',dashed:'7 5',dotted:'2 4'});
+  assert.deepEqual(fibonacciPriceLevels(fib),FIBONACCI_LEVELS.map(ratio=>({ratio,price:200-100*ratio})));
+  const rising={...fib,start:{time:10,price:100},end:{time:20,price:200}};
+  const falling={...fib,start:{time:10,price:200},end:{time:20,price:100}};
+  assert.equal(fibonacciPriceLevels(rising)[0].price,200,'retracement 0 is the second-click impulse endpoint');
+  assert.equal(fibonacciPriceLevels(rising).at(-1).price,100,'retracement 1 is the first-click swing origin');
+  assert.equal(fibonacciPriceLevels(falling)[0].price,100,'falling impulses use the same endpoint convention');
+  assert.equal(fibonacciPriceLevels(falling).at(-1).price,200);
+  const projected=projectDrawing(fib,bars30,1800);
+  assert.deepEqual(projected,{id:'fib-1',type:'fibonacci',start:{logical:1.5,price:100},end:{logical:.5,price:200},colorPreset:'purple',lineStyle:'dotted',extendRight:false});
+  assert.deepEqual(translateDrawing(fib,900,-10),{...fib,start:{time:fib.start.time+900,price:90},end:{time:fib.end.time+900,price:190}});
+  assert.deepEqual(moveDrawingPoint(fib,'start',{time:fib.start.time+1800,price:90}),{...fib,start:{time:fib.start.time+1800,price:90}});
 });
 
 test('SMC zones normalize corners, reject zero-area records, project across timeframes, and resize edges', () => {
@@ -312,6 +335,117 @@ test('SMC zone previews and completes on two clicks, then supports whole drag an
     tools.destroy();
     for(const [key,value] of Object.entries(previous)){if(value===undefined)delete globalThis[key];else globalThis[key]=value;}
   }
+});
+
+test('Fibonacci uses two-click preview, seven levels, editable options, endpoints, whole-drag, and stable persistence', () => {
+  const previous={document:globalThis.document,window:globalThis.window,getComputedStyle:globalThis.getComputedStyle,ResizeObserver:globalThis.ResizeObserver};
+  class FakeNode {
+    constructor(tag){this.tagName=tag;this.attributes={};this.style={};this.dataset={};this.children=[];this.listeners={};this.hidden=false;this.textContent='';}
+    setAttribute(key,value){this.attributes[key]=String(value);}
+    append(...nodes){for(const node of nodes){node.parentNode=this;this.children.push(node);}}
+    replaceChildren(...nodes){this.children=[];this.append(...nodes);}
+    addEventListener(type,fn){(this.listeners[type]??=[]).push(fn);}
+    removeEventListener(){}
+    remove(){}
+    getBoundingClientRect(){return {left:0,top:0};}
+    contains(node){for(let current=node;current;current=current.parentNode)if(current===this)return true;return false;}
+    setPointerCapture(){}
+    hasPointerCapture(){return true;}
+    releasePointerCapture(){}
+  }
+  globalThis.document={createElement:tag=>new FakeNode(tag),createElementNS:(_ns,tag)=>new FakeNode(tag),addEventListener(){},removeEventListener(){}};
+  globalThis.window={addEventListener(){},removeEventListener(){}};
+  globalThis.getComputedStyle=()=>({position:'relative'});
+  globalThis.ResizeObserver=class{observe(){} disconnect(){}};
+  const container=new FakeNode('div');container.clientWidth=1000;container.clientHeight=400;
+  const chart={timeScale:()=>({width:()=>900,height:()=>28,logicalToCoordinate:logical=>logical*100,coordinateToLogical:x=>x/100,
+    subscribeVisibleLogicalRangeChange(){},unsubscribeVisibleLogicalRangeChange(){},subscribeVisibleTimeRangeChange(){},unsubscribeVisibleTimeRangeChange(){}})};
+  const series={priceToCoordinate:price=>40000-price,coordinateToPrice:y=>40000-y};
+  const session={id:'fib-interaction',drawings:[]};let changes=0;const states=[];
+  const tools=createDrawingTools({chart,series,container,getSession:()=>session,getBars:()=>bars15,getInterval:()=>900,onChange:()=>changes++,onStateChange:state=>states.push(state),formatPrice:value=>value.toFixed(2)});
+  const overlay=container.children[0];
+  const dispatch=(type,event)=>{for(const fn of container.listeners[type]??[])fn(event);};
+  const click=(x,y)=>{const event={button:0,pointerId:1,target:container,clientX:x,clientY:y,preventDefault(){},stopPropagation(){}};dispatch('pointerdown',event);dispatch('pointerup',event);};
+  const dragNode=(node,which,from,to)=>{
+    const down={button:0,pointerId:4,target:node,clientX:from[0],clientY:from[1],preventDefault(){},stopPropagation(){}};
+    for(const fn of node.listeners.pointerdown??[])fn(down);
+    for(const fn of overlay.listeners.pointermove??[])fn({...down,target:overlay,clientX:to[0],clientY:to[1]});
+    for(const fn of overlay.listeners.pointerup??[])fn({...down,target:overlay,clientX:to[0],clientY:to[1]});
+  };
+  try{
+    tools.setTool('fibonacci');click(100,100);
+    assert.equal(states.at(-1).phase,'end');
+    assert.ok(overlay.children.some(node=>node.attributes.class==='drawing-start-marker drawing-fib-marker'));
+    dispatch('pointermove',{pointerId:1,target:container,clientX:300,clientY:200});
+    assert.equal(overlay.children.filter(node=>node.attributes.class==='drawing-preview drawing-fib-level-preview').length,7);
+    click(300,200);
+    const fib=session.drawings[0];
+    assert.equal(fib.type,'fibonacci');assert.equal(fib.start.price,39900);assert.equal(fib.end.price,39800);
+    assert.equal(fib.extendRight,true);assert.equal(fib.lineStyle,'solid');
+    assert.equal(tools.getSelectedId(),fib.id);assert.equal(states.at(-1).tool,null);
+    assert.equal(overlay.children.filter(node=>node.attributes.class==='drawing-fib-level selected').length,7);
+    assert.equal(overlay.children.filter(node=>node.attributes.class==='drawing-fib-label').length,7);
+    assert.equal(tools.setSelectedColor('purple'),true);
+    assert.equal(tools.setSelectedFibOptions({lineStyle:'dashed',extendRight:false}),true);
+    assert.equal(session.drawings[0].colorPreset,'purple');assert.equal(session.drawings[0].lineStyle,'dashed');assert.equal(session.drawings[0].extendRight,false);
+    tools.refresh(bars30);
+    assert.equal(session.drawings[0].colorPreset,'purple');assert.equal(session.drawings[0].lineStyle,'dashed');
+    const firstHandle=overlay.children.find(node=>node.attributes.class==='drawing-handle drawing-fib-handle');
+    const originalStart={...session.drawings[0].start};
+    dragNode(firstHandle,'start',[100,100],[120,110]);
+    assert.equal(session.drawings[0].start.price,originalStart.price-10,'endpoint drag changes the selected anchor only');
+    assert.equal(session.drawings[0].end.price,39800);
+    const hit=overlay.children.find(node=>node.attributes.class==='drawing-hit-area drawing-fib-hit');
+    const before=session.drawings[0];
+    dragNode(hit,'whole',[150,150],[160,160]);
+    assert.equal(session.drawings[0].start.price,before.start.price-10,'spine hit area moves the whole fib');
+    assert.equal(session.drawings[0].end.price,before.end.price-10);
+    assert.ok(changes>=4,'create, palette, option, and drag mutations persist through the drawing change callback');
+  }finally{tools.destroy();for(const [key,value]of Object.entries(previous)){if(value===undefined)delete globalThis[key];else globalThis[key]=value;}}
+});
+
+test('drawing projection waits for post-data visible-range coordinates and redraws after timeframe range changes',()=>{
+  const previous={document:globalThis.document,window:globalThis.window,getComputedStyle:globalThis.getComputedStyle,ResizeObserver:globalThis.ResizeObserver,requestAnimationFrame:globalThis.requestAnimationFrame};
+  class FakeNode{
+    constructor(tag){this.tagName=tag;this.attributes={};this.style={};this.dataset={};this.children=[];this.listeners={};this.hidden=false;this.textContent='';}
+    setAttribute(key,value){this.attributes[key]=String(value);}
+    append(...nodes){for(const node of nodes){node.parentNode=this;this.children.push(node);}}
+    replaceChildren(...nodes){this.children=[];this.append(...nodes);}
+    addEventListener(type,fn){(this.listeners[type]??=[]).push(fn);}
+    removeEventListener(){}
+    remove(){}
+    getBoundingClientRect(){return {left:0,top:0};}
+    contains(node){for(let current=node;current;current=current.parentNode)if(current===this)return true;return false;}
+  }
+  globalThis.document={createElement:tag=>new FakeNode(tag),createElementNS:(_ns,tag)=>new FakeNode(tag),addEventListener(){},removeEventListener(){}};
+  globalThis.window={addEventListener(){},removeEventListener(){}};globalThis.getComputedStyle=()=>({position:'relative'});globalThis.ResizeObserver=class{observe(){} disconnect(){}};
+  const frames=[];globalThis.requestAnimationFrame=callback=>frames.push(callback);
+  const container=new FakeNode('div');container.clientWidth=1000;container.clientHeight=400;
+  let rangeReady=false;const logicalListeners=[],timeListeners=[];
+  const timeScale={width:()=>900,height:()=>28,logicalToCoordinate:logical=>Number.isInteger(logical)&&rangeReady?logical*100:0,coordinateToLogical:x=>x/100,
+    subscribeVisibleLogicalRangeChange:fn=>logicalListeners.push(fn),unsubscribeVisibleLogicalRangeChange(){},
+    subscribeVisibleTimeRangeChange:fn=>timeListeners.push(fn),unsubscribeVisibleTimeRangeChange(){}};
+  const chart={timeScale:()=>timeScale};const series={priceToCoordinate:price=>40000-price,coordinateToPrice:y=>40000-y};
+  const twoMinuteStart=Math.floor(bars15[0].time/120)*120;
+  const bars1m=Array.from({length:8},(_,index)=>({time:twoMinuteStart+index*60}));
+  const bars2m=[0,1,2,3].map(index=>({time:twoMinuteStart+index*120}));
+  const fib={id:'fib-range',type:'fibonacci',start:{time:twoMinuteStart+60,price:39900},end:{time:twoMinuteStart+180,price:39800}};
+  const session={id:'range-session',drawings:[fib]};
+  let interval=60;
+  const tools=createDrawingTools({chart,series,container,getSession:()=>session,getBars:()=>bars1m,getInterval:()=>interval});
+  const overlay=container.children[0];
+  try{
+    frames.shift()();frames.shift()();
+    assert.equal(overlay.children.find(node=>node.attributes.class==='drawing-fib-level').attributes.x1,'0','initial data projection occurs before chart range settles');
+    interval=120;tools.refresh(bars2m); // mirrors renderChart setData/refresh before resetRange
+    rangeReady=true;
+    for(const listener of [...logicalListeners,...timeListeners])listener(); // mirrors visible-range notification
+    assert.equal(overlay.children.find(node=>node.attributes.class==='drawing-fib-level').attributes.x1,'0','projection is deferred until chart coordinates settle');
+    frames.shift()();frames.shift()();
+    const line=overlay.children.find(node=>node.attributes.class==='drawing-fib-level');
+    assert.equal(line.attributes.x1,'50','the 1m anchor halfway between 2m bars uses interpolated logical coordinates');
+    assert.equal(line.attributes.x2,'900','right-extended Fib reaches the updated plot boundary');
+  }finally{tools.destroy();for(const [key,value]of Object.entries(previous)){if(value===undefined)delete globalThis[key];else globalThis[key]=value;}}
 });
 
 test('price-axis plus freezes its price, draws one line, and isolates dismiss clicks', () => {

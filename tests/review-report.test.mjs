@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {buildReviewReport} from '../dist/review-report.mjs';
+import {aggregateMinutePrefix, buildReviewReport} from '../dist/review-report.mjs';
 
 function makePayload(overrides = {}) {
   const session = {
@@ -308,6 +308,43 @@ test('disclosed currentBar is preferred for event volume; reconstruction combine
   record.coverage.visibleThrough = 960;
   record.events = [{kind: 'view-setting', visibleThrough: 960, view: {tf: 86400, volume: true}}];
   assert.match(buildReviewReport(rebuilt).reportText, /当前周期量：105 BTC/);
+});
+
+test('short timeframe candles and volume are reconstructed only from contiguous disclosed minute rows', () => {
+  const payload = makePayload();
+  const record = payload.sessions[0];
+  record.session.tf = 120;
+  record.coverage.visibleThrough = 120;
+  record.coverage.expectedMinuteRows = 2;
+  record.coverage.availableMinuteRows = 2;
+  record.coverage.missingMinuteRows = 0;
+  record.market.contextCandles = [[0, 100, 999, 1, 800, 9999]];
+  record.market.minuteCandles = [[0, 100, 110, 95, 105, 3], [60, 105, 120, 90, 115, 7]];
+  record.events = [{kind: 'view-setting', visibleThrough: 120,
+    view: {tf: 120, visibleThrough: 120, currentBar: {time: 0, interval: 120, open: 100, high: 120,
+      low: 90, close: 115, volume: 10}}}];
+  const {reportText} = buildReviewReport(payload);
+  assert.match(reportText, /当前周期量：10 BTC/);
+  assert.match(reportText, /已由截止前真实1分钟行核实/);
+  assert.doesNotMatch(reportText, /9999|800/);
+
+  record.market.minuteCandles = [[60, 105, 120, 90, 115, 7]]; // first minute of this 2m bucket is absent
+  record.coverage.availableMinuteRows = 1;
+  record.coverage.missingMinuteRows = 1;
+  const missing = buildReviewReport(payload).reportText;
+  assert.match(missing, /行情覆盖未知或有缺口/);
+  assert.match(missing, /不使用15分钟背景推算/);
+  assert.doesNotMatch(missing, /当前周期量：7 BTC/);
+});
+
+test('aggregateMinutePrefix enforces minute boundaries and never fills a missing row', () => {
+  const rows = [[0, 10, 12, 9, 11, 1], [60, 11, 15, 8, 14, 2], [120, 14, 16, 13, 15, 3]];
+  assert.deepEqual(aggregateMinutePrefix({minuteCandles: rows, interval: 180, barTime: 0, visibleThrough: 180}),
+    {candle: [0, 10, 16, 8, 15, 6], complete: true, expectedMinutes: 3, availableMinutes: 3, reason: null});
+  assert.equal(aggregateMinutePrefix({minuteCandles: rows.slice(1), interval: 120, barTime: 0, visibleThrough: 120}).candle, null);
+  const partial = aggregateMinutePrefix({minuteCandles: rows, interval: 120, barTime: 0, visibleThrough: 60});
+  assert.deepEqual(partial.candle, [0, 10, 12, 9, 11, 1]);
+  assert.equal(partial.complete, false);
 });
 
 test('issues and baseline coverage are visible while large event snapshots link to untouched raw JSON without duplication', () => {

@@ -1,7 +1,7 @@
 import {createChart, CandlestickSeries, HistogramSeries, LineSeries, CrosshairMode, ColorType} from './vendor/charts.mjs';
-import {INITIAL, FEE, SLIP, MAINTENANCE_MARGIN_RATE, BASE, WARMUP, createSession, validateSession, ensureEvidenceBaseline, aggregateReplay, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, manualClosePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, maxNotional, positionLiquidationPrice, estimateOrderRisk, metrics} from './engine.mjs';
-import {nextMinute} from './minute-data.mjs';
-import {createDrawingTools, projectDrawing, resolveDrawingPalette} from './drawings.mjs';
+import {INITIAL, FEE, SLIP, MAINTENANCE_MARGIN_RATE, BASE, WARMUP, createSession, validateSession, ensureEvidenceBaseline, aggregateReplay, aggregateDisclosedMinutes, intervalStart, replayPrice as engineReplayPrice, replayTime as engineReplayTime, replayEnded, advanceMinute, manualClosePosition, placeOrder, cancelOrder, updatePendingOrder, updateProtection, reconcileOrderProtections, maxNotional, positionLiquidationPrice, estimateOrderRisk, metrics} from './engine.mjs';
+import {nextMinute, readMinuteRange} from './minute-data.mjs';
+import {createDrawingTools, projectDrawing, resolveDrawingPalette, fibonacciPriceLevels, DRAWING_LINE_STYLES} from './drawings.mjs';
 import {createReviewRecorder, reviewStateProjection} from './review-recorder.mjs';
 import {appendPlanVersion, createPlanVersion, executionStageSnapshots, findClosedTradeForPosition, modificationEvidence} from './review-plans.mjs';
 import {buildReviewExport} from './review-export.mjs';
@@ -10,7 +10,9 @@ import {parseReviewImport} from './review-import.mjs';
 const $ = id => document.getElementById(id);
 const els = Object.fromEntries(['save-status','new-session','equity','pnl','unreal','trade-count','win-rate','symbol','coin-mark','ma','ma10','volume','blind','recenter','last-price','last-change','volume-value','ohlc','loading','play','step','step-minute','cancel-advance','retry-minute','speed','replay-status','progress-text','progress-bar','balance','notional','risk-preview','long','short','observation-open','order-hint','position-badge','position','journal-count','history-count','journal-content','notes','current-tab','history-tab','order-form','toast','new-dialog','confirm-new','info-dialog','export','review-export','review-import','review-import-file','review-export-status','review-export-download','rules','source-details','source-label','size-range','size-readout','leverage-range','leverage-readout','leverage-badge','notional-value','margin-value','entry-fee-value','liquidation-value','plan-actions','plan-hint','confirm-plan','cancel-plan','locate-plan','session-badge','order-reason-window','order-reason-drag','order-reason-summary','thesis-fields','thesis-choice','thesis-label-wrap','thesis-label','parent-trade','attempt-number','strategy-version','observation-fields','observation-status','observed-conditions','entry-reason','entry-reason-error','reason-cancel','reason-close','reason-confirm','loss-budget','loss-budget-status'].map(id=>[id,$(id)]));
 const STORE_KEY = 'replay-lab-v1';
-const TF_LABELS = new Map([[900,'15分'],[1800,'30分'],[2700,'45分'],[3600,'1小时'],[14400,'4小时'],[86400,'1日'],[604800,'1周']]);
+const TF_LABELS = new Map([[60,'1分'],[120,'2分'],[180,'3分'],[300,'5分'],[900,'15分'],[1800,'30分'],[2700,'45分'],[3600,'1小时'],[14400,'4小时'],[86400,'1日'],[604800,'1周']]);
+const SMALL_TIMEFRAMES = new Set([60,120,180,300]);
+const SMALL_TF_CONTEXT_BARS = 2400;
 const datasets = new Map();
 let active = null;
 let history = [];
@@ -57,6 +59,11 @@ let chart, candleSeries, maSeries, ma10Series, volumeSeries, resizeObserver;
 const reviewRecorder=createReviewRecorder();
 let reviewExporting=false,reviewImporting=false;
 let reviewDownloadUrl=null;
+const smallTfRowsBySymbol = new Map();
+const smallTfCoverageBySymbol = new Map();
+const smallTfDayCache = new Map();
+let smallTfRequest = 0;
+let smallTfStatus = {loading:false,error:'',missingDays:0};
 
 function toast(message) {
   els.toast.textContent = message;
@@ -200,6 +207,14 @@ function captureReviewScreenshot(annotation=null,kind='action',identifiers={}){
       }else if(drawing.type==='zone'){
         const x1=chart.timeScale().logicalToCoordinate(projected.start.logical),y1=candleSeries.priceToCoordinate(projected.start.price),x2=chart.timeScale().logicalToCoordinate(projected.end.logical),y2=candleSeries.priceToCoordinate(projected.end.price);
         if([x1,y1,x2,y2].every(Number.isFinite)){const x=Math.min(x1,x2),y=Math.min(y1,y2),width=Math.abs(x2-x1),height=Math.abs(y2-y1);ctx.fillStyle=palette.selectedFill;ctx.fillRect(x,y,width,height);ctx.strokeStyle=palette.border;ctx.setLineDash([]);ctx.strokeRect(x,y,width,height);}
+      }else if(drawing.type==='fibonacci'){
+        const x1=chart.timeScale().logicalToCoordinate(projected.start.logical),y1=candleSeries.priceToCoordinate(projected.start.price),x2=chart.timeScale().logicalToCoordinate(projected.end.logical),y2=candleSeries.priceToCoordinate(projected.end.price);
+        if([x1,y1,x2,y2].every(Number.isFinite)){
+          const left=Math.min(x1,x2),right=projected.extendRight?plotWidth:Math.max(x1,x2),lineStyle=DRAWING_LINE_STYLES[projected.lineStyle]||'';
+          ctx.save();ctx.strokeStyle=palette.line;ctx.fillStyle=palette.line;ctx.lineWidth=1.25;ctx.setLineDash([3,4]);ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();ctx.setLineDash(lineStyle?lineStyle.split(' ').map(Number):[]);ctx.font='10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          for(const {ratio,price} of fibonacciPriceLevels(drawing)){const y=candleSeries.priceToCoordinate(price);if(!Number.isFinite(y))continue;ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(right,y);ctx.stroke();ctx.setLineDash([]);ctx.textAlign='right';ctx.fillText(`${ratio}  ${pretty(price)}`,Math.max(left+48,right-5),Math.max(10,y-4));ctx.setLineDash(lineStyle?lineStyle.split(' ').map(Number):[]);}
+          ctx.restore();
+        }
       }else{
         const x1=chart.timeScale().logicalToCoordinate(projected.start.logical),y1=candleSeries.priceToCoordinate(projected.start.price),x2=chart.timeScale().logicalToCoordinate(projected.end.logical),y2=candleSeries.priceToCoordinate(projected.end.price);
         if([x1,y1,x2,y2].every(Number.isFinite)){ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();}
@@ -450,11 +465,11 @@ function requestPlanSupplement({trade=null,returnFocus=null}={}){
 }
 function syncDrawingControls(){
   const locked=reasonBlocksReplay()||!!transitionPending;
-  for(const [id,tool] of [['drawing-select',null],['drawing-horizontal','horizontal'],['drawing-trendline','trendline'],['drawing-zone','zone']]){
+  for(const [id,tool] of [['drawing-select',null],['drawing-horizontal','horizontal'],['drawing-trendline','trendline'],['drawing-zone','zone'],['drawing-fibonacci','fibonacci']]){
     const button=$(id);if(!button)continue;const selected=activeDrawingTool===tool;button.classList.toggle('active',selected);button.setAttribute('aria-pressed',String(selected));button.disabled=locked;
   }
   const del=$('drawing-delete');if(del){del.disabled=locked||!selectedDrawingId;del.setAttribute('aria-disabled',String(del.disabled));}
-  const selected=drawingTools?.getSelectedDrawing?.(),colorable=!!selected&&['horizontal','zone'].includes(selected.type);
+  const selected=drawingTools?.getSelectedDrawing?.(),colorable=!!selected&&['horizontal','zone','fibonacci'].includes(selected.type),fibSelected=selected?.type==='fibonacci';
   const colorButton=$('drawing-color'),popover=$('drawing-color-popover'),sample=$('drawing-color-sample');
   if(!colorable||locked)closeDrawingColorPopover();
   if(colorButton){colorButton.disabled=locked||!colorable;colorButton.setAttribute('aria-disabled',String(colorButton.disabled));colorButton.setAttribute('aria-expanded',String(drawingColorPopoverOpen));}
@@ -462,6 +477,9 @@ function syncDrawingControls(){
     const chosen=colorable&&button.dataset.drawingColorPreset===selected.colorPreset;button.setAttribute('aria-pressed',String(chosen));button.classList.toggle('selected',chosen);
   }}
   if(sample)sample.style.backgroundColor=colorable?resolveDrawingPalette(selected.type,selected.colorPreset).line:'#69aebd';
+  const fibStyle=$('drawing-fib-style'),fibExtend=$('drawing-fib-extend');
+  if(fibStyle){fibStyle.disabled=locked||!fibSelected;fibStyle.value=fibSelected?selected.lineStyle:'solid';fibStyle.setAttribute('aria-disabled',String(fibStyle.disabled));}
+  if(fibExtend){fibExtend.disabled=locked||!fibSelected;fibExtend.checked=fibSelected?selected.extendRight:true;fibExtend.setAttribute('aria-disabled',String(fibExtend.disabled));}
 }
 function closeDrawingColorPopover(){
   drawingColorPopoverOpen=false;const popover=$('drawing-color-popover'),button=$('drawing-color');
@@ -469,14 +487,14 @@ function closeDrawingColorPopover(){
 }
 function toggleDrawingColorPopover(){
   const selected=drawingTools?.getSelectedDrawing?.();
-  if(!selected||!['horizontal','zone'].includes(selected.type)||pendingOrderRequest||transitionPending)return;
+  if(!selected||!['horizontal','zone','fibonacci'].includes(selected.type)||pendingOrderRequest||transitionPending)return;
   drawingColorPopoverOpen=!drawingColorPopoverOpen;syncDrawingControls();
 }
 function chooseDrawingTool(tool){
   if(pendingOrderRequest||transitionPending)return;
   activeDrawingTool=tool;drawingTools?.setTool(tool);syncDrawingControls();
   chartOverlay?.classList.toggle('drawing-disabled',!!tool);
-  $('drawing-hint').textContent=tool==='horizontal'?'点图放置水平线，或悬停价格轴旁＋':tool==='trendline'?'点击起点，然后点击终点':'悬停价格轴旁＋绘制水平线；趋势线点两次完成后可直接拖动';
+  $('drawing-hint').textContent=tool==='horizontal'?'点图放置水平线，或悬停价格轴旁＋':tool==='trendline'?'点击起点，然后点击终点':tool==='fibonacci'?'点击起点，再点击终点；完成后可拖动端点或整组线':'悬停价格轴旁＋绘制水平线；趋势线点两次完成后可直接拖动';
 }
 function deleteSelectedDrawing(){
   if(pendingOrderRequest||transitionPending)return;
@@ -685,12 +703,80 @@ function dragReasonWindowEnd(event){
 }
 function cancelDraft(){if(pendingOrderRequest)return;uiPlan=null;if(active)active.draftPlan=null;els['plan-actions'].hidden=true;chart.priceScale('right').applyOptions({autoScale:true});render();persist();}
 function locatePlanPrices(){chart.priceScale('right').applyOptions({autoScale:true});chart.timeScale().scrollToRealTime();renderPlanOverlay();}
+function mergeMinuteRows(existing,incoming){
+  const byTime=new Map();for(const row of [...(existing||[]),...(incoming||[])])if(Array.isArray(row)&&Number.isInteger(row[0])&&row.length>=6)byTime.set(row[0],row.slice(0,6));
+  return [...byTime.values()].sort((a,b)=>a[0]-b[0]).slice(-SMALL_TF_CONTEXT_BARS*5);
+}
+function rememberDisclosedMinute(symbol,row){
+  if(!Array.isArray(row)||!Number.isInteger(row[0]))return;
+  const rows=smallTfRowsBySymbol.get(symbol)||[],last=rows.at(-1);
+  if(last&&last[0]===row[0])rows[rows.length-1]=row.slice(0,6);
+  else if(!last||row[0]>last[0])rows.push(row.slice(0,6));
+  else {rows.splice(0,rows.length,...mergeMinuteRows(rows,[row]));}
+  if(rows.length>SMALL_TF_CONTEXT_BARS*5)rows.splice(0,rows.length-SMALL_TF_CONTEXT_BARS*5);
+  smallTfRowsBySymbol.set(symbol,rows);
+}
+function minuteRangeCovered(symbol,from,through){const rows=smallTfRowsBySymbol.get(symbol)||[];return rows.length>0&&rows[0][0]<=from+60&&rows.at(-1)[0]+60>=through-60&&(smallTfCoverageBySymbol.get(symbol)||[]).some(range=>range.from<=from&&range.through>=through);}
+function addMinuteCoverage(symbol,from,through){
+  const ranges=[...(smallTfCoverageBySymbol.get(symbol)||[]),{from,through}].sort((a,b)=>a.from-b.from),merged=[];
+  for(const range of ranges){const last=merged.at(-1);if(last&&range.from<=last.through)last.through=Math.max(last.through,range.through);else merged.push({...range});}
+  smallTfCoverageBySymbol.set(symbol,merged);
+}
+async function ensureSmallTfHistory(session,seconds){
+  const data=datasets.get(session?.symbol),through=replayClock(session,data);
+  if(!data?.length||!Number.isFinite(through))throw new Error('当前练习时刻无效，无法读取小周期分钟历史。');
+  const from=Math.max(data[0][0],Math.floor((through-seconds*SMALL_TF_CONTEXT_BARS)/60)*60);
+  if(through>from&&!minuteRangeCovered(session.symbol,from,through)){
+    const result=await readMinuteRange(session.symbol,from,through,{dayCache:smallTfDayCache});
+    if(result.stoppedAt)throw new Error(result.unavailable?.at(-1)?.reason||'分钟历史读取中断，请稍后重试。');
+    while(smallTfDayCache.size>12)smallTfDayCache.delete(smallTfDayCache.keys().next().value);
+    const previous=smallTfRowsBySymbol.get(session.symbol)||[];
+    smallTfRowsBySymbol.set(session.symbol,mergeMinuteRows(previous,result.candles));
+    addMinuteCoverage(session.symbol,from,through);
+    smallTfStatus.missingDays=result.unavailable?.length||0;
+  }
+  return {from,through};
+}
+function syncMinuteNote(){
+  const note=$('minute-note');if(!note)return;
+  if(smallTfStatus.loading){note.textContent='正在读取已披露的真实分钟历史…';note.classList.add('loading');return;}
+  note.classList.remove('loading');
+  if(smallTfStatus.error){note.textContent='小周期分钟历史暂不可用 · 点击周期可重试';return;}
+  if(active?.tf===60){note.textContent='1分钟周期显示真实完整OHLC · 分钟内不模拟逐笔波动';return;}
+  const latestSmallBar=SMALL_TIMEFRAMES.has(active?.tf)?disclosedBars().at(-1):null;
+  if(latestSmallBar?.complete===false){note.textContent='真实分钟K线逐步形成 · 灰色K线表示分钟数据不完整';return;}
+  note.textContent=smallTfStatus.missingDays&&SMALL_TIMEFRAMES.has(active?.tf)
+    ?'真实分钟K线逐步形成 · 归档缺失处保留空档，不补造数据'
+    :'真实分钟回放 · 当前K线随每分钟行情逐步形成';
+}
+async function switchTimeframe(seconds){
+  if(!active||transitionPending||!TF_LABELS.has(seconds))return;
+  const session=active,request=++smallTfRequest;
+  if(SMALL_TIMEFRAMES.has(seconds)){
+    smallTfStatus={loading:true,error:'',missingDays:0};syncMinuteNote();
+    try{
+      await ensureSmallTfHistory(session,seconds);
+      if(request!==smallTfRequest||active!==session)return;
+      // Playback may continue during archive reads; extend the disclosed cache
+      // to the latest clock before exposing the newly selected interval.
+      await ensureSmallTfHistory(session,seconds);
+      if(request!==smallTfRequest||active!==session)return;
+      session.tf=seconds;smallTfStatus.loading=false;render(true);persist({kind:'view-setting'});
+    }catch(error){
+      if(request!==smallTfRequest||active!==session)return;
+      smallTfStatus.loading=false;smallTfStatus.error=error?.message||'分钟历史读取失败';syncMinuteNote();toast(`${smallTfStatus.error}；练习进度未改变`);
+    }
+    return;
+  }
+  smallTfStatus={loading:false,error:'',missingDays:0};session.tf=seconds;render(true);persist({kind:'view-setting'});
+}
 function disclosedBars(){
   if(!active)return [];
+  if(SMALL_TIMEFRAMES.has(active.tf))return aggregateDisclosedMinutes(smallTfRowsBySymbol.get(active.symbol)||[],active.tf,replayClock(active,currentData()),0);
   return aggregateReplay(active,currentData(),active.tf,Math.max(0,active.start-Math.ceil(WARMUP/BASE)));
 }
 function computeMa(bars,period=20){let sum=0;return bars.map((bar,i)=>{sum+=bar.close;if(i>=period)sum-=bars[i-period].close;return i>=period-1?{time:bar.time,value:sum/period}:null;}).filter(Boolean);}
-function maSignature(){return active?`${active.id}|${active.symbol}|${active.tf}|${active.cursor}|${active.minuteCursorTime??''}`:'';}
+function maSignature(){const rows=active&&SMALL_TIMEFRAMES.has(active.tf)?smallTfRowsBySymbol.get(active.symbol)||[]:[];return active?`${active.id}|${active.symbol}|${active.tf}|${active.cursor}|${active.minuteCursorTime??''}|${rows.length}|${rows[0]?.[0]??''}|${rows.at(-1)?.[0]??''}`:'';}
 function effectivePlan(){return dragDraft||uiPlan||modificationDraft||active?.pending||active?.position||null;}
 function getPlanLevels(){if(frozenPlanLevels)return frozenPlanLevels;const p=effectivePlan();return p?[p.entryPrice??p.entry,p.stop,p.take].filter(Number.isFinite):[];}
 function riskModelConfig(session=active){return session?.modelConfigs?.find(item=>item?.modelConfigId===session.modelConfigId)||null;}
@@ -831,7 +917,7 @@ function initChart(){
   chart.subscribeCrosshairMove(param=>{if(!active||!param.time)return;const bar=param.seriesData.get(candleSeries);if(!bar)return;const vol=param.seriesData.get(volumeSeries);els['ohlc'].textContent=`${showTime(Number(param.time))}  O ${pretty(bar.open)}  H ${pretty(bar.high)}  L ${pretty(bar.low)}  C ${pretty(bar.close)}`;if(vol)els['volume-value'].textContent=`VOL ${pretty(vol.value,4)} ${active.symbol.replace(/USDT$/,'')}`;});
   chart.subscribeClick(param=>{if(drawingTools?.consumeChartClick())return;if(pendingOrderRequest||activeDrawingTool||!uiPlan||uiPlan.orderType!=='limit'||!param.point||!chartOverlay)return;const rect=host.getBoundingClientRect(),y=param.point.y;if(y<0||y>rect.height-28)return;const price=candleSeries.coordinateToPrice(y);if(Number.isFinite(price)&&price>0)setPlanEntry(price);});
   chartOverlay=document.createElement('div');chartOverlay.className='price-line-overlay';chartOverlay.setAttribute('aria-label','入场与风险价格线');host.append(chartOverlay);
-  drawingTools=createDrawingTools({chart,series:candleSeries,container:host,getSession:()=>active,getBars:()=>disclosedBars(),getInterval:()=>active?.tf??BASE,formatPrice:price=>pretty(price),onChange:()=>{const before=reviewStateProjection(active),oldDrawings=drawingAuditSnapshot??clone(active?.drawings||[]),nextDrawings=clone(active?.drawings||[]),oldIds=new Set(oldDrawings.map(x=>x?.id)),nextIds=new Set(nextDrawings.map(x=>x?.id));const kind=[...nextIds].some(id=>!oldIds.has(id))?'drawing-created':[...oldIds].some(id=>!nextIds.has(id))?'drawing-deleted':'drawing-modified';before.drawings=oldDrawings;drawingAuditSnapshot=nextDrawings;render();persist({kind,before,capture:true});syncDrawingControls();},onStateChange:state=>{activeDrawingTool=state.tool;selectedDrawingId=state.selectedId;chartOverlay?.classList.toggle('drawing-disabled',!!state.tool);syncDrawingControls();if($('drawing-hint'))$('drawing-hint').textContent=state.tool==='trendline'?(state.phase==='end'?'点击终点完成趋势线':'点击起点，然后移动鼠标预览并点击终点'):state.tool==='zone'?(state.phase==='end'?'移动预览区域，点击对角完成':'点击区域第一角，再移动并点击对角'):state.tool==='horizontal'?'点图放置水平线，或悬停价格轴旁＋':'悬停价格轴旁＋绘制水平线；趋势线完成后可拖动，区域可拖动边角';},isLocked:()=>!!pendingOrderRequest||!!transitionPending});
+  drawingTools=createDrawingTools({chart,series:candleSeries,container:host,getSession:()=>active,getBars:()=>disclosedBars(),getInterval:()=>active?.tf??BASE,formatPrice:price=>pretty(price),onChange:()=>{const before=reviewStateProjection(active),oldDrawings=drawingAuditSnapshot??clone(active?.drawings||[]),nextDrawings=clone(active?.drawings||[]),oldIds=new Set(oldDrawings.map(x=>x?.id)),nextIds=new Set(nextDrawings.map(x=>x?.id));const kind=[...nextIds].some(id=>!oldIds.has(id))?'drawing-created':[...oldIds].some(id=>!nextIds.has(id))?'drawing-deleted':'drawing-modified';before.drawings=oldDrawings;drawingAuditSnapshot=nextDrawings;render();persist({kind,before,capture:true});syncDrawingControls();},onStateChange:state=>{activeDrawingTool=state.tool;selectedDrawingId=state.selectedId;chartOverlay?.classList.toggle('drawing-disabled',!!state.tool);syncDrawingControls();if($('drawing-hint'))$('drawing-hint').textContent=state.tool==='trendline'?(state.phase==='end'?'点击终点完成趋势线':'点击起点，然后移动鼠标预览并点击终点'):state.tool==='fibonacci'?(state.phase==='end'?'预览Fib回撤位，点击终点完成':'点击Fib起点，再移动鼠标预览并点击终点'):state.tool==='zone'?(state.phase==='end'?'移动预览区域，点击对角完成':'点击区域第一角，再移动并点击对角'):state.tool==='horizontal'?'点图放置水平线，或悬停价格轴旁＋':'悬停价格轴旁＋绘制水平线；完成后可拖动趋势线、区域边角或Fib端点';},isLocked:()=>!!pendingOrderRequest||!!transitionPending});
   setupPlanOverlayEvents();
   resizeObserver=new ResizeObserver(entries=>{const box=entries[0]?.contentRect;if(box){chart.applyOptions({width:box.width,height:box.height});renderPlanOverlay();}});resizeObserver.observe(host);
   chart.timeScale().subscribeVisibleLogicalRangeChange(syncPlanOverlayCoordinates);
@@ -844,8 +930,8 @@ function renderChart(fit=false,resetRange=false){
   if(!active||!candleSeries)return;
   const bars=disclosedBars();
   // Only disclosed candles are sent to the chart; no future whitespace/data points are created.
-  candleSeries.setData(bars.map(b=>({time:b.time,open:b.open,high:b.high,low:b.low,close:b.close})));
-  volumeSeries.setData(bars.map(b=>({time:b.time,value:Number.isFinite(b.volume)?b.volume:0,color:b.close>=b.open?'#22c58b99':'#f06d7899'})));
+  candleSeries.setData(bars.map(b=>{const partial=SMALL_TIMEFRAMES.has(active.tf)&&b.complete===false,color=partial?'#788489':b.close>=b.open?'#22c58b':'#f06d78';return {time:b.time,open:b.open,high:b.high,low:b.low,close:b.close,...(partial?{color,borderColor:color,wickColor:color}:{})};}));
+  volumeSeries.setData(bars.map(b=>({time:b.time,value:Number.isFinite(b.volume)?b.volume:0,color:SMALL_TIMEFRAMES.has(active.tf)&&b.complete===false?'#78848999':b.close>=b.open?'#22c58b99':'#f06d7899'})));
   volumeSeries.applyOptions({visible:active.volume!==false});
   drawingTools?.refresh(bars);
   const key=maSignature();
@@ -988,10 +1074,10 @@ function render(resetRange=false,updateChart=true){
   const data=currentData(),m=metrics(active,data);if(Number.isFinite(active.speed))els.speed.value=String(active.speed);else active.speed=Number(els.speed.value)||1500;
   els.equity.textContent=pretty(m.equity);els.pnl.replaceChildren();const pnlText=document.createTextNode(pretty(m.pnl));const pct=document.createElement('em');pct.textContent=`${m.pnl>=0?'+':''}${pretty(m.pnl/INITIAL*100)}%`;els.pnl.append(pnlText,pct);els.pnl.className=m.pnl>=0?'positive':'negative';
   els.unreal.textContent=pretty(m.unreal);els.unreal.className=m.unreal>=0?'positive':'negative';els['trade-count'].textContent=`${active.trades.length} 笔成交`;els['win-rate'].textContent=m.winRate===null?'—':`${pretty(m.winRate,1)}%`;
-  els.balance.textContent=`${pretty(active.balance)} USDT`;els['coin-mark'].textContent=active.symbol.startsWith('BTC')?'₿':'◆';els.symbol.value=active.symbol;els['session-badge'].textContent=`${active.symbol.replace('USDT','')} · ${TF_LABELS.get(active.tf)} · ${active.position?'持仓中':active.pending?'限价待成交':'盲回放'}`;
-  document.querySelectorAll('[data-tf]').forEach(button=>button.classList.toggle('active',Number(button.dataset.tf)===active.tf));
+  els.balance.textContent=`${pretty(active.balance)} USDT`;els['coin-mark'].textContent=active.symbol.startsWith('BTC')?'₿':'◆';els.symbol.value=active.symbol;els['session-badge'].textContent=`${active.symbol.replace('USDT','')} · ${TF_LABELS.get(active.tf)||`${active.tf}s`} · ${active.position?'持仓中':active.pending?'限价待成交':'盲回放'}`;
+  document.querySelectorAll('[data-tf]').forEach(button=>{const selected=Number(button.dataset.tf)===active.tf;button.classList.toggle('active',selected);button.setAttribute('aria-pressed',String(selected));});
   active.volume=active.volume!==false;els.blind.checked=!!active.blind;els.ma.checked=!!active.ma;els.ma10.checked=!!active.ma10;els.volume.checked=active.volume;
-  syncReplayProgress(data);
+  syncReplayProgress(data);syncMinuteNote();
   const hasOrder=!!active.position||!!active.pending,ended=replayIsEnded(active,data),reasonOpen=!!pendingOrderRequest,reasonLocked=reasonBlocksReplay();els.play.disabled=ended||reasonLocked||fastForwarding||minuteActionPending&&!isPlaying;els['step-minute'].disabled=ended||reasonLocked||minuteActionPending||fastForwarding;els.step.disabled=ended||reasonLocked||minuteActionPending||fastForwarding;els['cancel-advance'].hidden=!fastForwarding;els['retry-minute'].hidden=!minuteRetryAction;els.long.disabled=ended||hasOrder||reasonOpen;els.short.disabled=ended||hasOrder||reasonOpen;els['size-range'].disabled=hasOrder||reasonOpen;els['leverage-range'].disabled=hasOrder||reasonOpen;syncDirectionSelection();
   els.play.textContent=isPlaying?'Ⅱ':'▶';els.play.setAttribute('aria-label',isPlaying?'暂停回放':'自动播放');els['replay-status'].textContent=ended?'本轮结束':fastForwarding?'快进中':active.position?'持仓中':active.pending?'限价待成交':'盲回放';
   els['new-session'].disabled=reasonOpen;els.symbol.disabled=reasonOpen;els['order-hint'].textContent=modificationDraft?'图上线位修改仅为预览；在右侧确认修改后生效，取消可恢复':active.position?'持仓期间不能重复下单':active.pending?'限价单等待后续行情满足价格条件':'市价立即成交；限价按指定价或更优成交，否则挂起等待';
@@ -1041,6 +1127,7 @@ async function advanceOneMinuteCore(generation,{draw=true,announce=true}={}){
     if(requestId!==minuteRequestId||generation!==minuteGeneration||active!==session||session.cursor!==beforeCursor||replayClock(session,data)!==beforeTime||reasonBlocksReplay())return null;
     const stateBefore=reviewStateProjection(session);
     const result=advanceMinute(session,candle,data);
+    rememberDisclosedMinute(session.symbol,candle);
     void reviewRecorder.appendMinute(session,candle).catch(error=>setReviewStatus(`分钟过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));
     syncDraftsAfterMinute();
     const messages=minuteResultMessage(result,session),stop=!!result.ended;
@@ -1222,8 +1309,10 @@ function wireEvents(){
   $('new-dialog').addEventListener('close',()=>{if(pendingSymbol&&pendingSymbol!==active?.symbol)els.symbol.value=active?.symbol||'BTCUSDT';pendingSymbol=null;});
   els.symbol.addEventListener('change',()=>{maybeStart(els.symbol.value);});
   document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>$(button.dataset.close).close()));
-  document.querySelectorAll('[data-tf]').forEach(button=>button.addEventListener('click',()=>{if(!active||transitionPending)return;active.tf=Number(button.dataset.tf);render(true);persist();}));
-  $('drawing-select').addEventListener('click',()=>chooseDrawingTool(null));$('drawing-horizontal').addEventListener('click',()=>chooseDrawingTool('horizontal'));$('drawing-trendline').addEventListener('click',()=>chooseDrawingTool('trendline'));$('drawing-zone').addEventListener('click',()=>chooseDrawingTool('zone'));$('drawing-delete').addEventListener('click',deleteSelectedDrawing);
+  document.querySelectorAll('[data-tf]').forEach(button=>button.addEventListener('click',()=>void switchTimeframe(Number(button.dataset.tf))));
+  $('drawing-select').addEventListener('click',()=>chooseDrawingTool(null));$('drawing-horizontal').addEventListener('click',()=>chooseDrawingTool('horizontal'));$('drawing-trendline').addEventListener('click',()=>chooseDrawingTool('trendline'));$('drawing-zone').addEventListener('click',()=>chooseDrawingTool('zone'));$('drawing-fibonacci').addEventListener('click',()=>chooseDrawingTool('fibonacci'));$('drawing-delete').addEventListener('click',deleteSelectedDrawing);
+  $('drawing-fib-style').addEventListener('change',()=>{if(drawingTools?.setSelectedFibOptions({lineStyle:$('drawing-fib-style').value}))syncDrawingControls();});
+  $('drawing-fib-extend').addEventListener('change',()=>{if(drawingTools?.setSelectedFibOptions({extendRight:$('drawing-fib-extend').checked}))syncDrawingControls();});
   $('drawing-color').addEventListener('click',toggleDrawingColorPopover);
   $('drawing-color-popover').querySelectorAll('[data-drawing-color-preset]').forEach(button=>button.addEventListener('click',()=>{
     if(drawingTools?.setSelectedColor(button.dataset.drawingColorPreset)){closeDrawingColorPopover();syncDrawingControls();$('drawing-color').focus();}
@@ -1290,7 +1379,7 @@ function wireEvents(){
 async function boot(){
   readSaved();initChart();wireEvents();
   if(active){
-    try{const data=await loadSymbol(active.symbol);if(!validateSession(active,active.symbol,data))throw new Error('保存的练习状态校验失败，记录已保留');invalidSavedActive=false;if((!Array.isArray(active.modelConfigs)||!active.modelConfigs.length)&&ensureEvidenceBaseline(active,data))persist({audit:false});active.reviewPlans??=[];await ensureLegacyEvidenceBaselines();if(!active.startTime)active.startTime=data[active.start][0]+BASE;active.ma10=active.ma10===true;active.volume=active.volume!==false;active.speed=Number.isFinite(active.speed)?active.speed:1500;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType=active.selectedOrderType||'market';if(active.draftPlan){uiPlan=clone(active.draftPlan);selectedOrderType=uiPlan.orderType||selectedOrderType;els['plan-actions'].hidden=false;}hideLoading();render(true);persist({audit:false});return;}
+    try{const data=await loadSymbol(active.symbol);if(!validateSession(active,active.symbol,data))throw new Error('保存的练习状态校验失败，记录已保留');invalidSavedActive=false;if((!Array.isArray(active.modelConfigs)||!active.modelConfigs.length)&&ensureEvidenceBaseline(active,data))persist({audit:false});active.reviewPlans??=[];await ensureLegacyEvidenceBaselines();if(!active.startTime)active.startTime=data[active.start][0]+BASE;active.ma10=active.ma10===true;active.volume=active.volume!==false;active.speed=Number.isFinite(active.speed)?active.speed:1500;drawingAuditSnapshot=clone(active.drawings||[]);selectedOrderType=active.selectedOrderType||'market';if(active.draftPlan){uiPlan=clone(active.draftPlan);selectedOrderType=uiPlan.orderType||selectedOrderType;els['plan-actions'].hidden=false;}if(SMALL_TIMEFRAMES.has(active.tf)){smallTfStatus.loading=true;syncMinuteNote();try{await ensureSmallTfHistory(active,active.tf);smallTfStatus={loading:false,error:'',missingDays:smallTfStatus.missingDays};}catch(error){smallTfStatus={loading:false,error:error?.message||'分钟历史读取失败',missingDays:0};}}hideLoading();render(true);persist({audit:false});return;}
     catch(error){invalidSavedActive=true;showSavedRecordRecovery(error.message);return;}
   }
   const symbol=active?.symbol||'BTCUSDT';
@@ -1299,7 +1388,7 @@ async function boot(){
 }
 async function retryRecovery(){
   const symbol=active?.symbol||els.symbol.value;
-  try{await loadSymbol(symbol,true);if(active&&!validateSession(active,symbol,datasets.get(symbol)))throw new Error('保存的练习状态校验失败');invalidSavedActive=false;if(active&&!active.startTime)active.startTime=datasets.get(symbol)[active.start][0]+BASE;hideLoading();if(active){render(true);persist();}else await startRound(symbol);}
+  try{await loadSymbol(symbol,true);if(active&&!validateSession(active,symbol,datasets.get(symbol)))throw new Error('保存的练习状态校验失败');invalidSavedActive=false;if(active&&!active.startTime)active.startTime=datasets.get(symbol)[active.start][0]+BASE;if(active&&SMALL_TIMEFRAMES.has(active.tf)){smallTfStatus={loading:true,error:'',missingDays:0};syncMinuteNote();await ensureSmallTfHistory(active,active.tf);smallTfStatus={loading:false,error:'',missingDays:smallTfStatus.missingDays};}hideLoading();if(active){render(true);persist();}else await startRound(symbol);}
   catch(error){setLoading(`${error.message}。本地记录仍保留，可再次重试，或导出备份。`,true);}
 }
 boot();

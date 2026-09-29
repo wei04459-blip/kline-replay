@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {advance, advanceMinute, aggregate, aggregateReplay, cancelOrder, closePosition, createSession, ENGINE_VERSION, ensureEvidenceBaseline, estimateOrderRisk, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
+import {advance, advanceMinute, aggregate, aggregateDisclosedMinutes, aggregateReplay, cancelOrder, closePosition, createSession, ENGINE_VERSION, ensureEvidenceBaseline, estimateOrderRisk, FEE, INITIAL, intervalStart, LENGTH, MAINTENANCE_MARGIN_RATE, MAX_LEVERAGE, maxNotional, metrics, manualClosePosition, openPosition as engineOpenPosition, placeOrder as enginePlaceOrder, positionLiquidationPrice, reconcileOrderProtections, replayEnded, replayPrice, replayTime, SLIP, updatePendingOrder, updateProtection, validateSession, WARMUP} from '../dist/engine.mjs';
 
 const TEST_ENTRY_REASON = '测试入场理由';
 function openPosition(...args) { return engineOpenPosition(...args, TEST_ENTRY_REASON); }
@@ -22,6 +22,79 @@ test('higher-timeframe candles contain only disclosed bars', () => {
   const next = aggregate(data, 4, 3600);
   assert.equal(next.length, 2);
   assert.equal(next[1].high, 999);
+});
+
+test('short timeframe rows require real disclosed minutes and never split 15m OHLCV', () => {
+  const data = bars(3);
+  for (const tf of [60, 120, 180, 300]) {
+    const s = session(data, {tf});
+    assert.equal(validateSession(s, s.symbol, data), true, `${tf}s is a valid saved chart timeframe`);
+    assert.deepEqual(aggregate(data, 2, tf), [], '15m source bars cannot be reinterpreted as sub-bars');
+    assert.deepEqual(aggregateReplay(s, data, tf), [], 'forming15m does not contain enough detail to split');
+    assert.throws(() => advance(s, data), /真实分钟行情/);
+  }
+});
+
+test('real minute aggregation uses UTC epoch bucket starts, cutoff OHLCV, and no gap fill', () => {
+  const minutes = [
+    [0, 100, 102, 99, 101, 2],
+    [60, 101, 104, 100, 103, 3],
+    [120, 103, 105, 98, 99, 5],
+    [180, 99, 9999, 1, 9000, 1000], // not disclosed at cutoff 180
+    [240, 100, 101, 99, 100, 7],
+  ];
+  const twoMinute = aggregateDisclosedMinutes(minutes, 120, 180);
+  assert.deepEqual(twoMinute, [
+    {time: 0, open: 100, high: 104, low: 99, close: 103, volume: 5, disclosedMinutes: 2, expectedMinutes: 2, complete: true},
+    {time: 120, open: 103, high: 105, low: 98, close: 99, volume: 5, disclosedMinutes: 1, expectedMinutes: 2, complete: false},
+  ]);
+  const fiveMinute = aggregateDisclosedMinutes(minutes, 300, 180);
+  assert.deepEqual(fiveMinute, [
+    {time: 0, open: 100, high: 105, low: 98, close: 99, volume: 10, disclosedMinutes: 3, expectedMinutes: 5, complete: false},
+  ]);
+  assert.ok(fiveMinute[0].high < 9999 && fiveMinute[0].volume < 1000, 'future high/low/close/volume are excluded');
+  const sliced = aggregateDisclosedMinutes(minutes, 180, 240, 2);
+  assert.equal(sliced[0].time, 0);
+  assert.equal(sliced[0].open, 100, 'from inside a bucket rewinds to preserve its real first open');
+  assert.equal(sliced[0].disclosedMinutes, 3);
+
+  const gap = aggregateDisclosedMinutes([minutes[0], minutes[1], minutes[3]], 300, 240);
+  assert.equal(gap.length, 1, 'missing minute does not create a synthetic bar');
+  assert.equal(gap[0].disclosedMinutes, 3);
+  assert.equal(gap[0].volume, 1005);
+  assert.equal(gap[0].complete, false);
+});
+
+test('1m aggregation exposes only full minutes and tolerates malformed or repeated input rows', () => {
+  const minutes = [
+    [60, 100, 101, 99, 100, 1],
+    [0, 99, 102, 98, 101, 2],
+    [60, 100, 999, 1, 900, 1000], // duplicate: first valid row wins
+    [120, 100, 101, 99, 100, 50], // close is after cutoff
+    [180, 100, 100, 100, 100, 0],
+    ['240', 100, 100, 100, 100, 1],
+  ];
+  assert.deepEqual(aggregateDisclosedMinutes(minutes, 60, 120), [
+    {time: 0, open: 99, high: 102, low: 98, close: 101, volume: 2, disclosedMinutes: 1, expectedMinutes: 1, complete: true},
+    {time: 60, open: 100, high: 101, low: 99, close: 100, volume: 1, disclosedMinutes: 1, expectedMinutes: 1, complete: true},
+  ]);
+  assert.deepEqual(aggregateDisclosedMinutes(minutes, 60, NaN), []);
+  assert.deepEqual(aggregateDisclosedMinutes(minutes, 240, 180), []);
+});
+
+test('minute replay reports UTC boundary crossings for each new short chart timeframe', () => {
+  for (const tf of [60, 120, 180, 300]) {
+    const data = bars(8), s = session(data, {tf});
+    let sawBoundary = false;
+    for (let i = 0; i < 8 && !sawBoundary; i++) {
+      const previous = replayTime(s, data), row = [900 + i * 60, 100, 101, 99, 100, 1];
+      const result = advanceMinute(s, row, data);
+      const expected = intervalStart(previous, tf) !== intervalStart(row[0] + 60, tf);
+      assert.equal(result.currentTimeframeBoundary, expected, `${tf}s boundary at minute ${row[0]}`);
+      sawBoundary ||= expected;
+    }
+    assert.equal(sawBoundary, true, `${tf}s eventually crosses its UTC epoch boundary`);
+  }
 });
 
 test('from inside an interval rewinds to its first base candle', () => {
@@ -168,6 +241,7 @@ test('random session range includes the final valid slot and rejects invalid ran
   const data = bars(count);
   const first = createSession('BTCUSDT', data, () => 0);
   const last = createSession('BTCUSDT', data, () => 0.999999999);
+  assert.equal(first.tf, 14400, 'default chart interval remains four hours');
   assert.equal(data[first.start][0], WARMUP);
   assert.ok(last.end < data.length);
   assert.ok(last.start > first.start);

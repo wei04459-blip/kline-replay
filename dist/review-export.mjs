@@ -1,5 +1,5 @@
 import {readMinuteRange} from './minute-data.mjs';
-import {buildReviewReport} from './review-report.mjs';
+import {aggregateMinutePrefix, buildReviewReport, SHORT_DISPLAY_INTERVALS, SUPPORTED_VIEW_INTERVALS} from './review-report.mjs';
 
 const BASE = 900;
 const MINUTE = 60;
@@ -670,10 +670,28 @@ function restrictEvidenceToCutoff(target, cutoff, rows, issues, label) {
 function safeCurrentBar(target, cutoff, contextCandles, minuteCandles, issues, label) {
   if (!target || typeof target !== 'object' || !target.currentBar) return;
   const bar = target.currentBar;
-  const interval = Number.isInteger(bar.interval) && bar.interval >= BASE ? bar.interval : null;
-  if (!interval || !Number.isInteger(bar.time) || bar.time < 0 || bar.time % interval !== 0 || !Number.isFinite(cutoff)) {
+  const interval = Number.isInteger(bar.interval) ? bar.interval
+    : Number.isInteger(target.tf) ? target.tf
+      : Number.isInteger(target.interval) ? target.interval : null;
+  const declaredInterval = Number.isInteger(target.tf) ? target.tf : Number.isInteger(target.interval) ? target.interval : null;
+  if (!SUPPORTED_VIEW_INTERVALS.has(interval) || (declaredInterval !== null && declaredInterval !== interval) ||
+      !Number.isInteger(bar.time) || bar.time < 0 || bar.time % interval !== 0 || !Number.isFinite(cutoff)) {
     delete target.currentBar;
     issues.push(`${label}的图表当前K线缺少可验证的周期、时间或截止，已排除。`);
+    return;
+  }
+  if (SHORT_DISPLAY_INTERVALS.has(interval)) {
+    const aggregate = aggregateMinutePrefix({minuteCandles, interval, barTime: bar.time, visibleThrough: cutoff});
+    const actual = [bar.open, bar.high, bar.low, bar.close, bar.volume];
+    const expected = aggregate.candle?.slice(1, 6) ?? null;
+    const agrees = expected && actual.every((value, index) => Number.isFinite(value) &&
+      Math.abs(value - expected[index]) <= 1e-9 * Math.max(1, Math.abs(expected[index])));
+    if (!agrees) {
+      delete target.currentBar;
+      issues.push(`${label}的${interval / 60}分钟当前K线缺少连续、截止前的真实1分钟证据或与其不一致，已排除；不使用15分钟背景拆分或校验。`);
+      return;
+    }
+    target.currentBar = {...bar, interval, complete: aggregate.complete};
     return;
   }
   const contextRows = rowsBetween(contextCandles, bar.time, bar.time + interval).filter(row => row[0] + BASE <= cutoff);
@@ -1214,6 +1232,12 @@ export async function buildReviewExport({current = null, history = [], loadDatas
         visibleThrough: roundCutoff, visibleThroughUtc: iso(roundCutoff), replayFrom: bounds.replayFrom,
         replayFromUtc: iso(bounds.replayFrom), cutoffIsExclusiveClose: true, expectedMinuteRows: expected,
         availableMinuteRows: covered, missingMinuteRows: expected - covered,
+        shortTimeframeEvidence: SHORT_DISPLAY_INTERVALS.has(sessionForPackage.tf)
+          ? {interval: sessionForPackage.tf, sourceInterval: MINUTE,
+            status: expected === 0 || covered === 0 ? 'unknown-no-minute-evidence' : expected === covered ? 'minute-backed' : 'partial-minute-coverage',
+            expectedMinuteRows: expected, availableMinuteRows: covered,
+            rule: '只由可见截止前真实1分钟行形成；15分钟背景不用于短周期拆分或校验。'}
+          : {status: 'not-applicable'},
         marketComplete, auditComplete, screenshotsComplete,
         captureCoverageComplete: marketComplete && auditComplete && captureScreenshotsComplete,
         historicalEvidenceComplete: evidenceCoverage.evidenceComplete && screenshotsComplete,
@@ -1274,6 +1298,8 @@ export async function buildReviewExport({current = null, history = [], loadDatas
       intervalBoundary: '区间左闭右开；完整K线仅当openTime+interval<=visibleThrough时导出。',
       backgroundObservationInterval: '15分钟原始OHLCV，覆盖当时回放场景的背景观察/热身；不代表该期间已逐分钟回放。',
       replayExecutionInterval: '1分钟真实OHLCV，只覆盖逐步揭示并落入该轮visibleThrough之前的区间。',
+      supportedViewIntervalsSeconds: [...SUPPORTED_VIEW_INTERVALS],
+      shortViewAggregation: '60/120/180/300秒周期只由visibleThrough前连续、完整的真实1分钟OHLCV行聚合；15分钟背景行不得拆分、补齐或验证短周期K线。缺少分钟行时currentBar不导出，报告标为未知或部分。',
       visibleThrough: '每轮及事件各自的排他收盘边界。',
       row: ['openTime', 'open', 'high', 'low', 'close', 'volume'], price: 'USDT per BTC/ETH',
       volume: '基础资产数量BTC或ETH，不是USDT成交额；源数据数值精度原样保留。'},
