@@ -174,6 +174,95 @@ test('second replay rejects duplicate rows atomically and gap-open protection us
   assert.ok(gap.trade.exit < 99,'gap loss settles from the first observed second open plus adverse slippage');
 });
 
+test('shallow second transaction matches independent replay results for market, limit, and stop/take paths', () => {
+  const cases = [
+    {side: 1, order: ['market', 100, 95, null], rows: [[900, 100, 101, 94, 96, 2]]},
+    {side: -1, order: ['limit', 105, 110, 100], rows: [[900, 100, 106, 99, 102, 2], [901, 102, 103, 99, 100, 1]]},
+    {side: 1, order: ['limit', 95, 92, null], rows: [[900, 94, 96, 89, 92, 3]]},
+  ];
+  const project = s => ({balance:s.balance,cursor:s.cursor,currentPrice:s.currentPrice,minuteCursorTime:s.minuteCursorTime,
+    secondCursorTime:s.secondCursorTime,forming1m:s.forming1m,forming15m:s.forming15m,
+    pending:s.pending&&{side:s.pending.side,entryPrice:s.pending.entryPrice,stop:s.pending.stop,take:s.pending.take},
+    position:s.position&&{side:s.position.side,entry:s.position.entry,stop:s.position.stop,take:s.position.take,qty:s.position.qty},
+    orderHistory:(s.orderHistory??[]).map(o=>({status:o.status,type:o.type,side:o.side,entryPrice:o.entryPrice,fillPrice:o.fillPrice})),
+    trades:s.trades.map(t=>({side:t.side,entry:t.entry,exit:t.exit,pnl:t.pnl,fees:t.fees,reason:t.reason,entryTime:t.entryTime,exitTime:t.exitTime})),
+    fills:(s.fills??[]).map(f=>({side:f.side,price:f.price,qty:f.qty,fee:f.fee,time:f.time})),
+    ledger:(s.ledger??[]).map(x=>({type:x.type,cashDelta:x.cashDelta,fee:x.fee,balanceAfter:x.balanceAfter}))});
+  for (const scenario of cases) {
+    const data=bars(4), actual=session(data,{end:3}), reference=session(data,{end:3});
+    const [type,entry,stop,take]=scenario.order;
+    placeOrder(actual,data,scenario.side,1000,entry,stop,take,type);
+    let referenceSaved=structuredClone(actual);
+    for (const row of scenario.rows) {
+      const actualResult=advanceSecond(actual,row,data);
+      // Recreate the former full-session draft boundary as a slow-path reference.
+      const referenceDraft=structuredClone(referenceSaved);
+      const referenceResult=advanceSecond(referenceDraft,row,data);
+      assert.deepEqual({ended:actualResult.ended,completed15m:actualResult.completed15m,
+        eventKinds:actualResult.executionEvents.map(e=>e.kind),reason:actualResult.trade?.reason},
+      {ended:referenceResult.ended,completed15m:referenceResult.completed15m,
+        eventKinds:referenceResult.executionEvents.map(e=>e.kind),reason:referenceResult.trade?.reason});
+      assert.deepEqual(project(actual),project(referenceDraft));
+      referenceSaved=structuredClone(referenceDraft);
+    }
+  }
+});
+
+test('shallow second transaction matches the full-copy control for an isolated liquidation', () => {
+  const count=Math.ceil((WARMUP+LENGTH)/900)+16, data=bars(count);
+  const actual=createSession('BTCUSDT',data,()=>0);actual.end=actual.cursor+3;
+  enginePlaceOrder(actual,data,-1,9000,100,null,null,'market',TEST_ENTRY_REASON,100);
+  const reference=structuredClone(actual), index=actual.cursor+1, open=positionLiquidationPrice(actual.position)+1;
+  const row=[data[index][0],open,open+1,open-1,open+0.25,2];
+  const actualResult=advanceSecond(actual,row,data), referenceResult=advanceSecond(reference,row,data);
+  assert.equal(actualResult.trade.reason,'强平');
+  assert.deepEqual({reason:actualResult.trade.reason,kind:actualResult.executionEvents.map(e=>e.kind),balance:actual.balance,
+    trade:{entry:actual.trades.at(-1).entry,exit:actual.trades.at(-1).exit,pnl:actual.trades.at(-1).pnl,isolatedAdjustment:actual.trades.at(-1).isolatedAdjustment}},
+  {reason:referenceResult.trade.reason,kind:referenceResult.executionEvents.map(e=>e.kind),balance:reference.balance,
+    trade:{entry:reference.trades.at(-1).entry,exit:reference.trades.at(-1).exit,pnl:reference.trades.at(-1).pnl,isolatedAdjustment:reference.trades.at(-1).isolatedAdjustment}});
+});
+
+test('failed second settlement rolls back shared fills, ledger, trade, snapshot, and leaves live state untouched', () => {
+  const count=Math.ceil((WARMUP+LENGTH)/900)+16, data=bars(count), s=createSession('BTCUSDT',data,()=>0);
+  s.end=s.cursor+3;
+  s.trades.push({id:'collision-trade-id',tradeId:'collision-trade-id',positionId:'prior-position',side:1,
+    entry:100,exit:100,qty:1,notional:100,entryFee:0,fees:0,pnl:0,entryIndex:s.cursor,exitIndex:s.cursor,reason:'legacy'});
+  assert.equal(validateSession(s,s.symbol,data),true);
+  const placed=placeOrder(s,data,1,1000,95,92,null,'limit');
+  assert.equal(placed.status,'pending');
+  const pendingRef=s.pending, pendingBefore=structuredClone(s.pending), modelConfigRef=s.modelConfigs, modelConfigBefore=structuredClone(s.modelConfigs);
+  const historical={trade:s.trades[0],ledger:s.ledger[0],snapshot:s.accountSnapshots[0]};
+  const historyBefore={trade:structuredClone(historical.trade),ledger:structuredClone(historical.ledger),snapshot:structuredClone(historical.snapshot)};
+  const arrayRefs=Object.fromEntries(['orders','fills','ledger','accountSnapshots','trades','orderHistory'].map(k=>[k,s[k]]));
+  const lengths=Object.fromEntries(Object.entries(arrayRefs).map(([k,a])=>[k,a.length]));
+  const balanceBefore=s.balance, priceTimeBefore={cursor:s.cursor,minuteCursorTime:s.minuteCursorTime,secondCursorTime:s.secondCursorTime,
+    currentPrice:s.currentPrice,forming15m:s.forming15m,position:s.position};
+  const randomUUID=crypto.randomUUID;
+  let call=0;
+  crypto.randomUUID=()=>{++call;return call===8?'tx-3':`tx-${call}`;};
+  try {
+    const t=data[s.cursor+1][0];
+    assert.throws(()=>advanceSecond(s,[t,94,96,89,92,3],data),/推进后状态校验失败/);
+  } finally { crypto.randomUUID=randomUUID; }
+  assert.ok(call>=10,'failure was injected after entry fill, settlement ledger, and trade creation');
+  assert.equal(s.balance,balanceBefore);
+  assert.deepEqual({cursor:s.cursor,minuteCursorTime:s.minuteCursorTime,secondCursorTime:s.secondCursorTime,
+    currentPrice:s.currentPrice,forming15m:s.forming15m,position:s.position},priceTimeBefore);
+  assert.deepEqual(s.pending,pendingBefore);
+  assert.equal(s.pending,pendingRef);
+  assert.equal(s.modelConfigs,modelConfigRef);
+  assert.deepEqual(s.modelConfigs,modelConfigBefore);
+  assert.equal(s.trades[0],historical.trade);
+  assert.equal(s.ledger[0],historical.ledger);
+  assert.equal(s.accountSnapshots[0],historical.snapshot);
+  assert.deepEqual({trade:s.trades[0],ledger:s.ledger[0],snapshot:s.accountSnapshots[0]},historyBefore);
+  for (const [key,array] of Object.entries(arrayRefs)) {
+    assert.equal(s[key],array,`${key} keeps its original array identity`);
+    assert.equal(array.length,lengths[key],`${key} appends are rolled back`);
+  }
+  assert.equal(validateSession(s,s.symbol,data),true);
+});
+
 test('second replay finalizes each parent once, settles at the last real second, and minute fallback starts after the cutoff', () => {
   const data=bars(3),s=session(data,{end:1});
   placeOrder(s,data,1,1000,100,null,null,'market');

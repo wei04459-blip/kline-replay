@@ -10,8 +10,8 @@ const end = source.indexOf('\nfunction minuteRangeCovered(', start);
 assert.ok(start >= 0 && end > start, 'second disclosure cache helper should remain identifiable');
 
 function cacheHarness() {
-  const secondRowsBySymbol = new Map(), secondBarsBySymbol = new Map();
-  const sandbox = {secondRowsBySymbol, secondBarsBySymbol, SECOND_CACHE_MAX_ROWS: 750_000,
+  const secondRowsBySymbol = new Map(), secondBarsBySymbol = new Map(), secondCoverageBySymbol = new Map();
+  const sandbox = {secondRowsBySymbol, secondBarsBySymbol, secondCoverageBySymbol, SECOND_CACHE_MAX_ROWS: 750_000,
     intervalStart: (time, interval) => Math.floor(time / interval) * interval,
     aggregateDisclosedSeconds};
   vm.runInNewContext(`${source.slice(start, end)}\nglobalThis.remember=rememberDisclosedSecond;`, sandbox);

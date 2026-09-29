@@ -852,7 +852,13 @@ export function advanceSecond(session, secondBar, data) {
   const parentTime = intervalStart(time, BASE), parentIndex = indexAtOpen(data, parentTime);
   if (parentIndex < session.start || parentIndex > session.end) throw new Error('秒级行情缺少对应15分钟K线');
 
-  const next = structuredClone(session), beforeIndex = next.cursor;
+  // Advance on a shallow transaction draft. Historical evidence arrays are
+  // append-only in this path, so share them and roll back their lengths if the
+  // draft fails validation instead of recursively cloning every old record.
+  const next = {...session}, beforeIndex = next.cursor;
+  const appendOnlyArrays = ['orders', 'fills', 'ledger', 'riskChanges', 'accountSnapshots', 'trades', 'orderHistory'];
+  const originalLengths = new Map(appendOnlyArrays.map(key => [key, Array.isArray(session[key]) ? session[key].length : null]));
+  try {
   next.replayGranularity = 'seconds';
   const completedBefore = latestCompletedIndex(data, next.start, next.end, time);
   if (completedBefore > next.cursor) next.cursor = completedBefore;
@@ -950,13 +956,13 @@ export function advanceSecond(session, secondBar, data) {
   }
   if (time + 1 === minuteTime + 60 && next.modelConfigId) appendAccountSnapshot(next, data, 'minute-mark');
   if (!validateSession(next, next.symbol, data)) throw new Error('秒级推进后状态校验失败');
-  Object.assign(session, next);
+  const values = currentAccountValues(next, data);
   const currentTimeframeBoundary = intervalStart(previousCloseTime, session.tf) !== intervalStart(eventTime, session.tf);
-  const values = currentAccountValues(session, data);
   const minuteAccountSnapshot = time + 1 === minuteTime + 60 ? {type: 'minute-mark', recordedAt: new Date().toISOString(),
-    replayMarketTime: eventTime, visibleThrough: eventTime, cursor: visibleUpperIndex(session, data), minuteCursorTime: minuteTime,
-    currentPrice: secondBar[4], balance: session.balance, equity: values.equity, availableBalance: values.availableBalance,
+    replayMarketTime: eventTime, visibleThrough: eventTime, cursor: visibleUpperIndex(next, data), minuteCursorTime: minuteTime,
+    currentPrice: secondBar[4], balance: next.balance, equity: values.equity, availableBalance: values.availableBalance,
     usedMargin: values.usedMargin, reservedMargin: values.reservedMargin, valuation: 'net-close-estimate'} : null;
+  Object.assign(session, next);
   return {ended: replayEnded(session, data), secondTime: time, replayTime: eventTime, currentPrice: secondBar[4],
     forming1m: session.forming1m, forming1mMeta: structuredClone(session.forming1mMeta), forming15m: session.forming15m,
     completed1m: time + 1 === minuteTime + 60, completed15m: finalSecond, currentTimeframeBoundary,
@@ -964,6 +970,12 @@ export function advanceSecond(session, secondBar, data) {
     intrabarAmbiguous: Boolean(trade?.executionEvidence?.intrabarAmbiguous),
     affectedOrderIds: trade?.executionEvidence?.affectedOrderIds ?? [], rule: trade?.executionEvidence ?? null,
     missingSeconds: Math.max(0, time - previousCloseTime)};
+  } catch (error) {
+    for (const [key, length] of originalLengths) {
+      if (length !== null && next[key] === session[key] && Array.isArray(session[key])) session[key].length = length;
+    }
+    throw error;
+  }
 }
 
 export function advanceMinute(session, minuteBar, data) {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {cloneScreenshotRecord, inferReviewEventKind, normalizeSecondRow, normalizeSecondSource, reviewStateProjection} from '../dist/review-recorder.mjs';
+import {cloneScreenshotRecord, createReviewRecorder, inferReviewEventKind, normalizeSecondRow, normalizeSecondSource, reviewStateProjection} from '../dist/review-recorder.mjs';
 import {estimateOrderRisk} from '../dist/engine.mjs';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
@@ -14,6 +14,86 @@ const riskStart=appSource.indexOf('function estimatePlanRiskSnapshot('),riskEnd=
 const riskContext={estimateOrderRisk,active:null};
 vm.runInNewContext(`${appSource.slice(riskStart,riskEnd)}\nglobalThis.riskHelpers={estimatePlanRiskSnapshot,riskPreviewRows};`,riskContext);
 
+function fakeIndexedDB() {
+  const databases = new Map();
+  class Store {
+    constructor(database, name, keyPath) {
+      this.database=database; this.name=name; this.keyPath=keyPath; this.indexNames={contains:()=>true};
+    }
+    createIndex() { return this; }
+    index(name) { return {getAll: key => this._request(() => [...this.database.data.get(this.name).values()]
+      .filter(value => value?.[name] === key?.value).map(value => structuredClone(value)))}; }
+    _key(value) { return Array.isArray(this.keyPath) ? JSON.stringify(this.keyPath.map(key=>value[key])) : value[this.keyPath]; }
+    _request(run, fail = false) {
+      const request={result:undefined,error:null,onsuccess:null,onerror:null};
+      this.database.currentTx._queue(request,()=>run(),this.name,fail);
+      return request;
+    }
+    get(key) { return this._request(()=>{const value=this.database.data.get(this.name).get(JSON.stringify(key));return value===undefined?undefined:structuredClone(value);}); }
+    getAll() { return this._request(()=>[...this.database.data.get(this.name).values()].map(value=>structuredClone(value))); }
+    put(value) { return this._request(()=>{this.database.data.get(this.name).set(JSON.stringify(this._key(value)),structuredClone(value));return this._key(value);},true); }
+  }
+  class Tx {
+    constructor(database, storeNames, mode) {
+      this.database=database; this.storeNames=[].concat(storeNames); this.mode=mode; this.pending=0; this.aborted=false; this.completed=false;
+      this.database.transactions.push(this); this.database.currentTx=this;
+    }
+    objectStore(name) {
+      if(!this.storeNames.includes(name))throw new Error(`store not in transaction: ${name}`);
+      return new Store(this.database,name,this.database.keyPaths.get(name));
+    }
+    _queue(request, action, storeName, isWrite) {
+      this.pending++; clearTimeout(this.completeTimer);
+      setTimeout(()=>{
+        try {
+          if(isWrite && this.database.failNextStore===storeName){this.database.failNextStore=null;throw new Error('injected IDB write failure');}
+          request.result=action();
+          this.database.operations.push({store:storeName,write:!!isWrite,transaction:this});
+          request.onsuccess?.({target:request});
+        } catch(error) {
+          request.error=error; this.error=error; request.onerror?.({target:request}); this.onerror?.({target:this,error});
+        }
+        this.pending--; this._scheduleComplete();
+      },0);
+    }
+    _scheduleComplete() {
+      if(this.pending!==0||this.completed)return;
+      clearTimeout(this.completeTimer);
+      this.completeTimer=setTimeout(()=>{
+        if(this.pending!==0||this.completed)return;
+        this.completed=true;
+        (this.aborted?this.onabort:this.oncomplete)?.({target:this});
+      },0);
+    }
+    abort(){this.aborted=true;this._scheduleComplete();}
+  }
+  class DB {
+    constructor() { this.data=new Map();this.keyPaths=new Map();this.transactions=[];this.operations=[];this.failNextStore=null;
+      this.objectStoreNames={contains:name=>this.data.has(name)}; }
+    createObjectStore(name,{keyPath}) { this.data.set(name,new Map());this.keyPaths.set(name,keyPath);return new Store(this,name,keyPath); }
+    transaction(names,mode) { return new Tx(this,names,mode); }
+  }
+  return {databases,DB,open(name){
+    const request={result:null,onsuccess:null,onerror:null,onupgradeneeded:null};
+    setTimeout(()=>{
+      let database=databases.get(name);
+      if(!database){database=new DB();databases.set(name,database);request.result=database;request.transaction={objectStore:store=>new Store(database,store,database.keyPaths.get(store))};request.onupgradeneeded?.({target:request});}
+      request.result=database;request.onsuccess?.({target:request});
+    },0);
+    return request;
+  }};
+}
+
+function setupFakeStorage() {
+  const old={indexedDB:globalThis.indexedDB,IDBKeyRange:globalThis.IDBKeyRange,localStorage:globalThis.localStorage};
+  const fake=fakeIndexedDB();
+  globalThis.indexedDB={open:(name,version)=>fake.open(name,version)};
+  globalThis.IDBKeyRange={only:value=>({value})};
+  const values=new Map();
+  globalThis.localStorage={getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,String(value))};
+  return {fake,restore(){for(const [key,value] of Object.entries(old)){if(value===undefined)delete globalThis[key];else globalThis[key]=value;}}};
+}
+
 test('review projection preserves only the current disclosed replay state and its view/model evidence', () => {
   const session = {symbol: 'BTCUSDT', cursor: 42, minuteCursorTime: 1234567800, currentPrice: 101,
     forming15m: [1234567800, 100, 102, 99, 101, 3], tf: 3600, ma: true, ma10: false,
@@ -25,6 +105,70 @@ test('review projection preserves only the current disclosed replay state and it
   assert.equal(projected.volume, true);
   assert.deepEqual(projected.simulationModel, {id: 'isolated-v1'});
   assert.equal(Object.hasOwn(projected, 'futureRows'), false);
+});
+
+test('second rows batch into one IDB transaction and barriers preserve event, cutoff, and export order', async () => {
+  const env=setupFakeStorage();
+  try {
+    const recorder=createReviewRecorder({secondBatchSize:32,secondBatchDelayMs:60_000});
+    const day=1700000000, source={date:'2023-11-14',url:'https://example.test/day.zip',
+      checksum_url:'https://example.test/day.zip.CHECKSUM',sha256:'a'.repeat(64)};
+    const session={id:'batch-session',symbol:'BTCUSDT',cursor:2,start:0,trades:[],position:null,pending:null,
+      secondCursorTime:day+1,replayGranularity:'seconds'};
+    const writes=Array.from({length:5},(_,index)=>recorder.appendSecond(session.id,
+      [day+index,100+index,101+index,99+index,100.5+index,index+1],source));
+    const eventPromise=recorder.observe(session,{kind:'position-opened',view:{visibleThrough:day+2},
+      before:{position:null},after:{position:{positionId:'p-1'}}});
+    const event=await eventPromise;
+    assert.equal(event.seq,1);
+    await Promise.all(writes);
+    const secondsTransactions=env.fake.databases.get('kline-replay-review-v1').transactions
+      .filter(tx=>tx.mode==='readwrite'&&tx.storeNames.includes('seconds'));
+    assert.equal(secondsTransactions.length,1,'five quick appendSecond calls should use one atomic batch write');
+    const operations=env.fake.databases.get('kline-replay-review-v1').operations;
+    const secondCommitOrder=Math.max(...operations.filter(item=>item.store==='seconds').map(item=>env.fake.databases.get('kline-replay-review-v1').transactions.indexOf(item.transaction)));
+    const eventCommitOrder=Math.min(...operations.filter(item=>item.store==='events').map(item=>env.fake.databases.get('kline-replay-review-v1').transactions.indexOf(item.transaction)));
+    assert.ok(secondCommitOrder<eventCommitOrder,'second rows must commit before the key event transaction');
+    const watermarks=await recorder.captureWatermarks([session.id]);
+    assert.equal(watermarks[session.id],1);
+    const snapshot=await recorder.readSession(session.id,{maxSeq:watermarks[session.id],visibleThrough:day+2});
+    assert.deepEqual(snapshot.secondRows.map(row=>row[0]),[day,day+1],
+      'export/read cutoff is exclusive close time and hides the later queued rows');
+    assert.equal(snapshot.events.length,1);
+    assert.deepEqual(snapshot.secondDays,[source]);
+  } finally { env.restore(); }
+});
+
+test('second batch failures reject append callers and remain visible through flush failure state', async () => {
+  const env=setupFakeStorage();
+  try {
+    const recorder=createReviewRecorder({secondBatchSize:20,secondBatchDelayMs:60_000});
+    const databaseName='kline-replay-review-v1';
+    const write=recorder.appendSecond('failed-batch',[1700000000,10,12,9,11,4]);
+    // Opening the DB before injecting the one-shot store failure makes the failure deterministic.
+    await recorder.flush().catch(()=>{});
+    const database=env.fake.databases.get(databaseName);
+    database.failNextStore='seconds';
+    const failedWrite=recorder.appendSecond('failed-batch',[1700000001,11,12,10,11,2]);
+    const failedFlush=recorder.flush();
+    await assert.rejects(failedWrite,/injected IDB write failure/);
+    await assert.rejects(failedFlush,/injected IDB write failure/);
+    // The initial row was flushed before failure injection; the failed second row was not silently accepted.
+    await assert.doesNotReject(write);
+  } finally { env.restore(); }
+});
+
+test('archive import drains seconds queued before its duplicate-ID check', async () => {
+  const env=setupFakeStorage();
+  try {
+    const recorder=createReviewRecorder({secondBatchSize:20,secondBatchDelayMs:60_000});
+    const rowPromise=recorder.appendSecond('import-barrier',[1700000000,10,12,9,11,4]);
+    const result=await recorder.importSessionArchive({session:{id:'import-barrier',symbol:'BTCUSDT'},events:[],minutes:[]});
+    await rowPromise;
+    assert.equal(result.status,'conflict','the preceding batch must create the existing session before import checks its ID');
+    const read=await recorder.readSession('import-barrier',{visibleThrough:1700000001});
+    assert.deepEqual(read.secondRows,[[1700000000,10,12,9,11,4]]);
+  } finally { env.restore(); }
 });
 
 test('review projection preserves second-resolution cutoff and currently forming disclosed minute', () => {

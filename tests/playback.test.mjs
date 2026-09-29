@@ -17,6 +17,36 @@ const reasonResumeEnd = source.indexOf('\nasync function submitOrderReason(){', 
 assert.ok(reasonResumeStart >= 0 && reasonResumeEnd > reasonResumeStart, 'reason resume helper should remain identifiable');
 const reasonResumeSource = `${source.slice(source.indexOf('function reviewPlaybackSnapshot('), source.indexOf('\nasync function manualStep(', source.indexOf('function reviewPlaybackSnapshot(')))}\n${source.slice(reasonResumeStart, reasonResumeEnd)}`;
 
+test('speed options stay mounted across repeated renders and update only for applied mode or speed changes', () => {
+  const syncStart=source.indexOf('function usesSecondReplay('),syncEnd=source.indexOf('\nfunction toast(',syncStart);
+  const optionWrites=[];
+  const select={value:'1500',label:'',options:[],getAttribute(){return this.label;},setAttribute(_name,value){this.label=value;},replaceChildren(...options){optionWrites.push(options);this.options=options;this.value=options[0]?.value;}};
+  const active={replayGranularity:'minutes',speed:1500,secondSpeedMs:100};
+  const context={active,els:{speed:select},SECOND_SPEEDS:[[200,'5×'],[100,'10×'],[50,'20×'],[25,'40×']],
+    usesSecondReplay:s=>s?.replayGranularity==='seconds',playbackDelay:s=>s.replayGranularity==='seconds'?(Number(s.secondSpeedMs)||100):(Number(s.speed)||1500),
+    document:{createElement(){return {value:'',textContent:''};}}};
+  const sync=vm.runInNewContext(`${source.slice(syncStart,syncEnd)}; syncSpeedOptions;`,context);
+  sync();const stableOptions=select.options;
+  for(let i=0;i<20;i++)sync();
+  assert.equal(select.options,stableOptions,'ordinary playback renders must preserve native option nodes');
+  assert.equal(optionWrites.length,1);
+  active.replayGranularity='seconds';sync();
+  assert.equal(optionWrites.length,2,'switching replay mode rebuilds options once');
+  assert.equal(select.options.length,4);
+  active.secondSpeedMs=50;sync();
+  assert.equal(select.value,'50','an applied speed change updates the selection');
+  assert.equal(optionWrites.length,2,'speed changes do not rebuild option nodes');
+  assert.equal(context.playbackDelay(active),50,'the selected second speed is the delay used by playback');
+});
+
+test('second history reload around an earlier replay time drops future-only cache rows', () => {
+  const start=source.indexOf('function mergeSecondRows('),end=source.indexOf('\nfunction invalidateSecondBars(',start);
+  const merge=vm.runInNewContext(`${source.slice(start,end)}; mergeSecondWindow;`,{SECOND_CACHE_MAX_ROWS:150000});
+  const row=time=>[time,1,2,0,1,1];
+  const result=merge([row(1000),row(1100),row(1200)],[row(200),row(300)],100,400);
+  assert.deepEqual(Array.from(result,row=>row[0]),[200,300]);
+});
+
 function harness({results = [], nextMinute, nextSecond, readSecondRange, replayResolution = 'minute', tf = 180, time = 0} = {}) {
   const timers = [], toasts = [];
   const active = {id: 'session-1', symbol: 'BTCUSDT', cursor: 0, time, tf, end: 100, ended: false, replayGranularity: replayResolution};
@@ -24,7 +54,7 @@ function harness({results = [], nextMinute, nextSecond, readSecondRange, replayR
   const state = {
     active, data, pendingOrderRequest: null, transitionPending: false, invalidSavedActive: false, uiPlan: null, modificationDraft: null,
     isPlaying: false, reasonResumePlayback: false, fastForwarding: false, minuteActionPending: false, minuteRetryAction: null,
-    minuteGeneration: 0, minuteRequestId: 0, playTimer: 0,
+    minuteGeneration: 0, minuteRequestId: 0, playTimer: 0, playbackRenderTimer: 0, lastReplayObserveAt: 0,
     advanceCount: 0, renderCount: 0, persistCount: 0, draftSyncCount: 0,
     events: [...results], timers, toasts, reviewEvents: [], minuteRows: [], secondRows: []
   };
@@ -47,7 +77,7 @@ function harness({results = [], nextMinute, nextSecond, readSecondRange, replayR
     reviewId: prefix => `${prefix}-test-id`,
     reasonBlocksReplay: mode => ['entry','exit'].includes(mode??sandbox.pendingOrderRequest?.mode),
     reviewView: session => ({visibleThrough: session.time + 60, tf: session.tf}),
-    reviewRecorder: {appendMinute: async (_session, row) => { state.minuteRows.push(row); }, appendSecond: async (_session, row) => { state.secondRows.push(row); }, observe: async (_session, options = {}) => { if (options.kind) state.reviewEvents.push(options.kind); }},
+    reviewRecorder: {appendMinute: async (_session, row) => { state.minuteRows.push(row); }, appendSecond: async (_session, row) => { state.secondRows.push(row); }, observe: async (_session, options = {}) => { if (options.kind) state.reviewEvents.push(options.kind); },flush:async()=>{}},
     recordReviewEvent: (kind, details) => { state.reviewEvents.push({kind, details}); },
     executionStageSnapshots: (before, progressed, stage) => ({before, after: {...progressed, ...(stage?.after||{})}}),
     keyReviewKind: kind => /^(order-|position-|protection-|drawing-)/.test(kind),
@@ -80,6 +110,8 @@ function harness({results = [], nextMinute, nextSecond, readSecondRange, replayR
     render: () => { state.renderCount++; },
     persist: () => { state.persistCount++; },
     syncReplayProgress: () => {},
+    queuePlaybackRender: () => {},
+    flushPlaybackRender: () => {},
     secondHistoryStatus: {error:''},
     toast: message => toasts.push(message),
     pretty: value => String(value),

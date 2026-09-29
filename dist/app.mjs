@@ -14,8 +14,8 @@ const STORE_KEY = 'replay-lab-v1';
 const TF_LABELS = new Map([[60,'1分'],[120,'2分'],[180,'3分'],[300,'5分'],[900,'15分'],[1800,'30分'],[2700,'45分'],[3600,'1小时'],[14400,'4小时'],[86400,'1日'],[604800,'1周']]);
 const SMALL_TIMEFRAMES = new Set([60,120,180,300]);
 const SMALL_TF_CONTEXT_BARS = 2400;
-const SECOND_CONTEXT_BARS = 2400;
-const SECOND_CACHE_MAX_ROWS = 750000;
+const SECOND_CONTEXT_BARS = 500;
+const SECOND_CACHE_MAX_ROWS = 150000;
 const SECOND_SPEEDS = [[200,'5×'],[100,'10×'],[50,'20×'],[25,'40×']];
 const datasets = new Map();
 let active = null;
@@ -25,6 +25,14 @@ let journalMode = 'positions';
 let pendingSymbol = null;
 let isPlaying = false;
 let playTimer = 0;
+let persistTimer = 0;
+let pendingPersistOptions = null;
+let chartDataContext = '';
+let chartBarCount = 0;
+let chartLastBarTime = null;
+let chartFirstBarTime = null;
+let playbackRenderTimer = 0;
+let lastReplayObserveAt = 0;
 let minuteGeneration = 0;
 let minuteRequestId = 0;
 let minuteActionPending = false;
@@ -76,12 +84,22 @@ let secondHistoryStatus = {loading:false,error:'',unavailable:[]};
 function usesSecondReplay(session=active){return session?.replayGranularity==='seconds';}
 function replayResolution(session=active){return usesSecondReplay(session)?'1s':'1m';}
 function playbackDelay(session=active){return usesSecondReplay(session)?(Number(session?.secondSpeedMs)||100):(Number(session?.speed)||1500);}
+const speedSelectState=new WeakMap();
 function syncSpeedOptions(){
   if(!active||!els.speed)return;
-  const options=usesSecondReplay(active)?SECOND_SPEEDS:[[1500,'1×'],[750,'2×'],[300,'5×']];
-  els.speed.setAttribute('aria-label',usesSecondReplay(active)?'逐秒回放速度，倍速表示每秒推进的真实秒线数量':'分钟回放速度');
-  const selected=playbackDelay(active);els.speed.replaceChildren(...options.map(([value,label])=>{const option=document.createElement('option');option.value=String(value);option.textContent=label;return option;}));
-  if(options.some(([value])=>value===selected))els.speed.value=String(selected);else{els.speed.value=String(options[0][0]);if(usesSecondReplay(active))active.secondSpeedMs=options[0][0];else active.speed=options[0][0];}
+  const seconds=usesSecondReplay(active),mode=seconds?'seconds':'minutes',options=seconds?SECOND_SPEEDS:[[1500,'1×'],[750,'2×'],[300,'5×']];
+  const label=seconds?'逐秒回放速度，倍速表示每秒推进的真实秒线数量':'分钟回放速度';
+  if(els.speed.getAttribute('aria-label')!==label)els.speed.setAttribute('aria-label',label);
+  const selected=playbackDelay(active);let state=speedSelectState.get(els.speed);
+  const optionValues=options.map(([value])=>String(value));
+  const optionsChanged=!state||state.mode!==mode||state.values.length!==optionValues.length||state.values.some((value,index)=>value!==optionValues[index]);
+  if(optionsChanged){
+    els.speed.replaceChildren(...options.map(([value,text])=>{const option=document.createElement('option');option.value=String(value);option.textContent=text;return option;}));
+    state={mode,values:optionValues,appliedSpeed:null};speedSelectState.set(els.speed,state);
+  }
+  if(!options.some(([value])=>value===selected)){const fallback=options[0][0];if(seconds)active.secondSpeedMs=fallback;else active.speed=fallback;}
+  const applied=playbackDelay(active);
+  if(state.appliedSpeed!==applied){els.speed.value=String(applied);state.appliedSpeed=applied;}
 }
 
 function toast(message) {
@@ -127,6 +145,15 @@ async function ensureLegacyEvidenceBaselines(){
   return changed;
 }
 function persist(options={}) {
+  if(options.throttle){
+    pendingPersistOptions={...(pendingPersistOptions||{}),...options,audit:false};
+    if(!persistTimer)persistTimer=setTimeout(()=>{persistTimer=0;const pending=pendingPersistOptions||{audit:false};pendingPersistOptions=null;persistNow(pending);},1000);
+    return true;
+  }
+  if(persistTimer){clearTimeout(persistTimer);persistTimer=0;pendingPersistOptions=null;}
+  return persistNow(options);
+}
+function persistNow(options={}) {
   try {
     localStorage.setItem(STORE_KEY,JSON.stringify({version:1,source:'Binance spot public archive; UI simulation',active,history}));
     els['save-status'].textContent='已保存在此浏览器'; warnedStorage=false;
@@ -731,6 +758,7 @@ function mergeSecondRows(existing,incoming){
   const byTime=new Map();for(const row of [...(existing||[]),...(incoming||[])])if(Array.isArray(row)&&Number.isInteger(row[0])&&row.length>=6)byTime.set(row[0],row.slice(0,6));
   return [...byTime.values()].sort((a,b)=>a[0]-b[0]).slice(-SECOND_CACHE_MAX_ROWS);
 }
+function mergeSecondWindow(existing,incoming,from,through){return mergeSecondRows((existing||[]).filter(row=>row[0]>=from&&row[0]<through),incoming);}
 function invalidateSecondBars(symbol){if(symbol)secondBarsBySymbol.delete(symbol);else secondBarsBySymbol.clear();}
 function rememberDisclosedMinute(symbol,row){
   if(!Array.isArray(row)||!Number.isInteger(row[0]))return;
@@ -753,16 +781,18 @@ function rememberDisclosedSecond(symbol,row){
   }
   if(rows.length>SECOND_CACHE_MAX_ROWS)rows.splice(0,rows.length-SECOND_CACHE_MAX_ROWS);
   secondRowsBySymbol.set(symbol,rows);
+  if(rows.length){const coverage=secondCoverageBySymbol.get(symbol)||[];secondCoverageBySymbol.set(symbol,coverage.filter(range=>range.through>rows[0][0]).map(range=>({...range,from:Math.max(range.from,rows[0][0])})));}
   const nextThrough=row[0]+1,cacheByTf=secondBarsBySymbol.get(symbol);
   if(cacheByTf){
     for(const [tf,cache] of cacheByTf){
       if(cache.through>nextThrough){continue;}
-      const bucket=intervalStart(row[0],tf),bucketRows=[];
-      for(let index=rows.length-1;index>=0&&rows[index][0]>=bucket;index--)if(rows[index][0]+1<=nextThrough)bucketRows.push(rows[index]);
-      bucketRows.reverse();
+      const bucket=intervalStart(row[0],tf),bucketRows=[];let low=0,high=rows.length;
+      while(low<high){const mid=(low+high)>>>1;if(rows[mid][0]<bucket)low=mid+1;else high=mid;}
+      for(let index=low;index<rows.length&&rows[index][0]<bucket+tf;index++)if(rows[index][0]+1<=nextThrough)bucketRows.push(rows[index]);
       const updated=aggregateDisclosedSeconds(bucketRows,tf,nextThrough,0);
       if(!updated.length)continue;
-      const index=cache.bars.findIndex(bar=>bar.time===bucket),bar=updated.at(-1);
+      let left=0,right=cache.bars.length;while(left<right){const mid=(left+right)>>>1;if(cache.bars[mid].time<bucket)left=mid+1;else right=mid;}
+      const index=left,bar=updated.at(-1);
       if(index>=0)cache.bars[index]=bar;else cache.bars.push(bar);
       const cutoff=cache.bars.length-SECOND_CONTEXT_BARS-2;if(cutoff>0)cache.bars.splice(0,cutoff);
       cache.through=nextThrough;
@@ -790,7 +820,7 @@ async function ensureSmallTfHistory(session,seconds){
   }
   return {from,through};
 }
-function secondRangeCovered(symbol,from,through){return (secondCoverageBySymbol.get(symbol)||[]).some(range=>range.from<=from&&range.through>=through);}
+function secondRangeCovered(symbol,from,through){const rows=secondRowsBySymbol.get(symbol)||[];return rows.length>0&&rows[0][0]<=from&&rows.at(-1)[0]+1>=through&&(secondCoverageBySymbol.get(symbol)||[]).some(range=>range.from<=from&&range.through>=through);}
 function addSecondCoverage(symbol,from,through){
   const ranges=[...(secondCoverageBySymbol.get(symbol)||[]),{from,through}].sort((a,b)=>a.from-b.from),merged=[];
   for(const range of ranges){const last=merged.at(-1);if(last&&range.from<=last.through)last.through=Math.max(last.through,range.through);else merged.push({...range});}
@@ -805,8 +835,8 @@ async function ensureSecondHistory(session,seconds=session?.tf){
     const result=await readSecondRange(session.symbol,from,through);
     if(result.stoppedAt||result.unavailable?.length)throw new Error(result.unavailable?.at(-1)?.reason||'逐秒历史读取中断，请稍后重试。');
     const previous=secondRowsBySymbol.get(session.symbol)||[];
-    secondRowsBySymbol.set(session.symbol,mergeSecondRows(previous,result.candles));
-    addSecondCoverage(session.symbol,from,through);invalidateSecondBars(session.symbol);
+    const rows=mergeSecondWindow(previous,result.candles,from,through);secondRowsBySymbol.set(session.symbol,rows);
+    secondCoverageBySymbol.set(session.symbol,rows.length?[{from:rows[0][0],through}]:[]);invalidateSecondBars(session.symbol);
     secondHistoryStatus={loading:false,error:'',unavailable:result.unavailable||[]};
   }
   return {from,through};
@@ -1035,13 +1065,23 @@ function renderChart(fit=false,resetRange=false){
   if(!active||!candleSeries)return;
   const bars=disclosedBars();
   // Only disclosed candles are sent to the chart; no future whitespace/data points are created.
-  candleSeries.setData(bars.map(b=>{const partial=SMALL_TIMEFRAMES.has(active.tf)&&b.complete===false,color=partial?'#788489':b.close>=b.open?'#22c58b':'#f06d78';return {time:b.time,open:b.open,high:b.high,low:b.low,close:b.close,...(partial?{color,borderColor:color,wickColor:color}:{})};}));
-  volumeSeries.setData(bars.map(b=>({time:b.time,value:Number.isFinite(b.volume)?b.volume:0,color:SMALL_TIMEFRAMES.has(active.tf)&&b.complete===false?'#78848999':b.close>=b.open?'#22c58b99':'#f06d7899'})));
+  const context=`${active.id}|${active.symbol}|${active.tf}|${replayResolution(active)}`;
+  const candlePoint=b=>{const partial=SMALL_TIMEFRAMES.has(active.tf)&&b.complete===false,color=partial?'#788489':b.close>=b.open?'#22c58b':'#f06d78';return {time:b.time,open:b.open,high:b.high,low:b.low,close:b.close,...(partial?{color,borderColor:color,wickColor:color}:{})};};
+  const volumePoint=b=>({time:b.time,value:Number.isFinite(b.volume)?b.volume:0,color:SMALL_TIMEFRAMES.has(active.tf)&&b.complete===false?'#78848999':b.close>=b.open?'#22c58b99':'#f06d7899'});
+  const last=bars.at(-1),firstTime=bars[0]?.time??null,sameWindow=firstTime===chartFirstBarTime;
+  const sameBar=context===chartDataContext&&sameWindow&&bars.length===chartBarCount&&last&&last.time===chartLastBarTime;
+  const nextBar=context===chartDataContext&&sameWindow&&bars.length===chartBarCount+1&&bars[chartBarCount-1]?.time===chartLastBarTime&&last?.time>chartLastBarTime;
+  const incremental=!!(sameBar||nextBar);
+  if(sameBar){candleSeries.update(candlePoint(last));volumeSeries.update(volumePoint(last));}
+  else if(nextBar){const closed=bars[chartBarCount-1];candleSeries.update(candlePoint(closed));volumeSeries.update(volumePoint(closed));candleSeries.update(candlePoint(last));volumeSeries.update(volumePoint(last));}
+  else {candleSeries.setData(bars.map(candlePoint));volumeSeries.setData(bars.map(volumePoint));chartDataContext=context;}
+  chartBarCount=bars.length;chartLastBarTime=last?.time??null;chartFirstBarTime=firstTime;
   volumeSeries.applyOptions({visible:active.volume!==false});
   drawingTools?.refresh(bars);
   const key=maSignature();
-  if(maDataKey!==key){maSeries.setData(computeMa(bars));maDataKey=key;}
-  if(ma10DataKey!==key){ma10Series.setData(computeMa(bars,10));ma10DataKey=key;}
+  const movingAverage=(period,index=bars.length-1)=>{if(index<period-1)return null;let sum=0;for(let i=index-period+1;i<=index;i++)sum+=bars[i].close;return {time:bars[index].time,value:sum/period};};
+  if(incremental){const indices=nextBar?[bars.length-2,bars.length-1]:[bars.length-1];for(const index of indices){const ma=movingAverage(20,index),ma10=movingAverage(10,index);if(ma)maSeries.update(ma);if(ma10)ma10Series.update(ma10);}maDataKey=ma10DataKey=key;}
+  else {if(maDataKey!==key){maSeries.setData(computeMa(bars));maDataKey=key;}if(ma10DataKey!==key){ma10Series.setData(computeMa(bars,10));ma10DataKey=key;}}
   maSeries.applyOptions({visible:!!active.ma});
   ma10Series.applyOptions({visible:!!active.ma10});
   chart.applyOptions({localization:{timeFormatter:time=>formatChartTime(time)}});
@@ -1050,6 +1090,11 @@ function renderChart(fit=false,resetRange=false){
   renderPlanOverlay();
   updateQuote(bars.at(-1));
 }
+function queuePlaybackRender(){
+  if(playbackRenderTimer)return;
+  playbackRenderTimer=setTimeout(()=>{playbackRenderTimer=0;if(active&&!invalidSavedActive)render();},67);
+}
+function flushPlaybackRender(){if(playbackRenderTimer){clearTimeout(playbackRenderTimer);playbackRenderTimer=0;}if(active&&!invalidSavedActive)render();}
 function updateQuote(bar){
   if(!active||!bar){els['last-price'].textContent='—';return;}
   const previous=disclosedBars().at(-2),change=previous?(bar.close/previous.close-1)*100:0;
@@ -1216,8 +1261,9 @@ function syncPlaybackControls(){
 }
 function invalidateMinuteWork(){
   minuteGeneration++;minuteRequestId++;minuteActionPending=false;fastForwarding=false;clearTimeout(playTimer);playTimer=0;isPlaying=false;
+  if(playbackRenderTimer){clearTimeout(playbackRenderTimer);playbackRenderTimer=0;}
 }
-function pause(renderAfter=true){const interruptedFastForward=fastForwarding;invalidateMinuteWork();if(renderAfter&&active&&!invalidSavedActive)render();else if(active&&!invalidSavedActive)syncPlaybackControls();if(interruptedFastForward&&active)persist();}
+function pause(renderAfter=true){const interruptedFastForward=fastForwarding;invalidateMinuteWork();if(active&&!invalidSavedActive){if(renderAfter)render();else{flushPlaybackRender();syncPlaybackControls();}}if(active){persist({audit:false});void reviewRecorder.flush().catch(error=>setReviewStatus(`过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));}if(interruptedFastForward&&active)persist();}
 function minuteResultMessage(result,session=active){
   const messages=[];
   const coin=session?.symbol?.replace(/USDT$/,'')||session?.symbol||'订单';
@@ -1259,7 +1305,13 @@ async function advanceOneMinuteCore(generation,{draw=true,announce=true,row:supp
     if(!stages.length&&result.trade)semantic.push(['position-auto-closed',{trade:clone(result.trade),tradeId:result.trade.id||result.trade.orderId,orderId:result.trade.orderId}]);
     if(result.ended)semantic.push(['round-ended',{ended:true}]);
     if(draw||stop||semantic.length||stages.length){render();persist({audit:false});}
-    else syncReplayProgress(data);
+    else {
+      syncReplayProgress(data);
+      if(resolution==='seconds'&&isPlaying&&!wasFastForwarding){
+        queuePlaybackRender();persist({throttle:true});
+        const observedAt=Date.now();if(observedAt-lastReplayObserveAt>=1000){lastReplayObserveAt=observedAt;void reviewRecorder.observe(session,{view:reviewView(session)}).catch(error=>setReviewStatus(`过程记录未完整保存：${error?.message||'本地存储不可用'}`,true));}
+      }
+    }
     let eventBefore=stateBefore;
     const progressedState=reviewStateProjection(session);
     for(const stage of stages){
@@ -1295,7 +1347,7 @@ async function advanceOneMinuteCore(generation,{draw=true,announce=true,row:supp
 }
 function keyReviewKind(kind){return /^(order-|position-|protection-|drawing-)/.test(kind);}
 async function runAutomaticMinute(generation){
-  const result=await advanceOneMinuteCore(generation,{draw:true});
+  const seconds=usesSecondReplay(active),result=await advanceOneMinuteCore(generation,{draw:!seconds});
   if(result?.failed||result?.stop||generation!==minuteGeneration||!isPlaying||reasonBlocksReplay())return;
   playTimer=setTimeout(()=>runAutomaticMinute(generation),playbackDelay());
 }
@@ -1374,6 +1426,7 @@ async function startRound(symbol=active?.symbol||els.symbol.value){
 }
 function maybeStart(symbol){if(pendingOrderRequest)return;pendingSymbol=symbol;if(active?.position){requestExitReason({archiveSymbol:symbol,returnFocus:els['new-session']});return;}if(active?.pending){$('new-dialog').showModal();return;}startRound(symbol);}
 function downloadExport(){
+  persist({audit:false});
   const payload={version:1,source:{marketData:'Binance 现货公开档案',symbols:['BTCUSDT','ETHUSDT'],interval:BASE,replayInterval:usesSecondReplay(active)?1:60,replayMode:usesSecondReplay(active)?'真实1秒OHLC逐步回放；不推测秒内逐笔路径；所选周期K线只聚合已披露行情':'显式分钟回放；旧会话兼容；不推测分钟内逐笔路径',simulation:'本地练习记录，不代表真实成交',leverageModel:'1x–100x逐仓模拟；新订单记录含leverage、margin、marginMode、liquidationPrice；旧记录缺失时按1x显示且不追溯估算强平价',maintenanceMarginRate:0.005},exportedAt:new Date().toISOString(),current:active?clone(active):null,history:clone(history)};
   const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`K线回放_记录_${new Date().toISOString().slice(0,10)}.json`;document.body.append(a);a.click();a.remove();URL.revokeObjectURL(url);toast('练习记录 JSON 已导出');
 }
@@ -1409,6 +1462,7 @@ async function importReviewFile(file){
 }
 async function downloadReviewPackage(){
   if(reviewExporting)return;
+  persist({audit:false});
   reviewExporting=true;els['review-export'].disabled=true;
   const snapshotAt=Date.now(),currentSnapshot=active?clone(active):null,historySnapshot=clone(history),sessions=[currentSnapshot,...historySnapshot.map(item=>item?.session)].filter(item=>item?.id),sessionIds=sessions.map(item=>String(item.id));
   const cutoffAtClick=new Map(sessions.map(session=>[String(session.id),Number.isFinite(session.minuteCursorTime)?session.minuteCursorTime+60:(datasets.get(session.symbol)?.[session.cursor]?.[0]??NaN)+BASE]));
@@ -1513,6 +1567,11 @@ function wireEvents(){
     if(e.target.matches('input,textarea,select')||$('info-dialog').open||$('new-dialog').open)return;
     if(fastForwarding){if(e.key==='Escape'){e.preventDefault();pause();}return;}
     if(e.code==='Space'){e.preventDefault();togglePlayWithAudit();}else if(e.key.toLowerCase()==='n'){e.preventDefault();void manualStep('step-minute');}else if(e.key==='ArrowRight'){e.preventDefault();void manualStep('step-boundary');}
+  });
+  window.addEventListener('pagehide',()=>{
+    if(persistTimer){clearTimeout(persistTimer);persistTimer=0;const pending=pendingPersistOptions||{audit:false};pendingPersistOptions=null;persistNow(pending);}
+    else persistNow({audit:false});
+    void reviewRecorder.flush().catch(()=>{});
   });
 }
 async function boot(){

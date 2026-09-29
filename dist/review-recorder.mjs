@@ -149,11 +149,12 @@ function keyAction(kind) {
   return /^(order-|position-|protection-|drawing-|plan-|observation-)/.test(kind || '');
 }
 
-export function createReviewRecorder() {
+export function createReviewRecorder({secondBatchSize = 16, secondBatchDelayMs = 500} = {}) {
   let dbPromise;
   let queue = Promise.resolve();
   let lastError = null;
   const highWater = new Map();
+  const secondBatches = new Map();
   const issueKey = 'kline-review-recording-issues-v1';
   const failureIssues = new Map();
   try {
@@ -173,6 +174,55 @@ export function createReviewRecorder() {
     });
     return result;
   };
+
+  function flushSecondBatch(sessionId = null) {
+    const ids = sessionId === null ? [...secondBatches.keys()] : [String(sessionId)];
+    const flushed = [];
+    for (const id of ids) {
+      const batch = secondBatches.get(id);
+      if (!batch?.items.length) continue;
+      clearTimeout(batch.timer);
+      secondBatches.delete(id);
+      const write = enqueue(async () => {
+        const database = await db();
+        const tx = database.transaction(['sessions', 'seconds'], 'readwrite');
+        const done = transactionDone(tx);
+        const seconds = tx.objectStore('seconds'), sessions = tx.objectStore('sessions');
+        let meta = await requestResult(sessions.get(id));
+        if (!meta) meta = {sessionId: id, recordingStartedAt: batch.items[0].recordedAt, baseline: true, issues: [], nextSeq: 1};
+        for (const item of batch.items) seconds.put({sessionId: id, time: item.row[0], row: item.row, recordedAt: item.recordedAt});
+        const days = Array.isArray(meta.secondDays) ? meta.secondDays : [];
+        let changedDays = false;
+        for (const source of batch.items.map(item => item.source).filter(Boolean)) {
+          const existing = days.find(item => item?.date === source.date);
+          if (!existing) { days.push(source); changedDays = true; }
+          else if (existing.sha256 !== source.sha256) {
+            meta.issues = [...(meta.issues || []), `秒级行情来源校验信息在 ${source.date} 出现冲突。`];
+          }
+        }
+        if (changedDays) meta.secondDays = days;
+        sessions.put(meta);
+        await done;
+      }, id);
+      const completion = write.then(() => {
+        for (const item of batch.items) item.resolve();
+      }, error => {
+        for (const item of batch.items) item.reject(error);
+        throw error;
+      });
+      // Timer-triggered flushes have no direct awaiter; callers still receive
+      // each row's promise and the queue records any failure for read/export.
+      completion.catch(() => {});
+      flushed.push(completion);
+    }
+    if (!flushed.length) return Promise.resolve();
+    const allFlushed = Promise.all(flushed);
+    // Some barrier callers enqueue their own following task and intentionally
+    // do not await this promise; mark it handled while preserving rejection for
+    // explicit flush() callers.
+    allFlushed.catch(() => {});
+    return allFlushed;
+  }
 
   async function observe(session, options = {}) {
     if (!session?.id) return;
@@ -203,6 +253,9 @@ export function createReviewRecorder() {
     if (typeof options.screenshot === 'function') {
       try { screenshotPromise = Promise.resolve(options.screenshot()).catch(error => { lastError = error; return null; }); } catch (error) { lastError = error; screenshotPromise = Promise.resolve(null); }
     } else if (options.screenshot && typeof options.screenshot.then === 'function') screenshotPromise = options.screenshot;
+    const needsSecondBarrier = keyAction(options.kind) || typeof options.screenshot === 'function' ||
+      (options.before && options.after && keyAction(inferredKind(jsonClone(options.before), jsonClone(options.after))));
+    if (needsSecondBarrier) flushSecondBatch(sessionId);
     return enqueue(async () => {
       const database = await db();
       const readTx = database.transaction('sessions', 'readonly');
@@ -290,6 +343,7 @@ export function createReviewRecorder() {
   async function appendMinute(session, row) {
     if (!session?.id || !Array.isArray(row) || row.length < 6 || !row.slice(0, 6).every(Number.isFinite)) return;
     const sessionId=String(session.id),minuteRow=row.slice(0,6),time=minuteRow[0],cutoff=Number.isFinite(session.minuteCursorTime)?session.minuteCursorTime+60:null,recordedAt=new Date().toISOString();
+    flushSecondBatch(sessionId);
     return enqueue(async () => {
       const database = await db();
       const tx = database.transaction(['sessions', 'minutes'], 'readwrite');
@@ -307,36 +361,26 @@ export function createReviewRecorder() {
     },sessionId);
   }
 
-  async function appendSecond(sessionId, row, source = null) {
+  function appendSecond(sessionId, row, source = null) {
     const id = String(sessionId || '');
     const secondRow = normalizeSecondRow(row);
     if (!id || !secondRow) return;
-    const recordedAt = new Date().toISOString();
     const sourceCopy = normalizeSecondSource(source);
-    return enqueue(async () => {
-      const database = await db();
-      const tx = database.transaction(['sessions', 'seconds'], 'readwrite');
-      const done = transactionDone(tx);
-      const seconds = tx.objectStore('seconds'), sessions = tx.objectStore('sessions');
-      let meta = await requestResult(sessions.get(id));
-      if (!meta) meta = {sessionId: id, recordingStartedAt: recordedAt, baseline: true, issues: [], nextSeq: 1};
-      seconds.put({sessionId: id, time: secondRow[0], row: secondRow, recordedAt});
-      if (sourceCopy) {
-        const days = Array.isArray(meta.secondDays) ? meta.secondDays : [];
-        const existing = days.findIndex(item => item?.date === sourceCopy.date);
-        if (existing < 0) days.push(sourceCopy);
-        else if (days[existing].sha256 !== sourceCopy.sha256) {
-          meta.issues = [...(meta.issues || []), `秒级行情来源校验信息在 ${sourceCopy.date} 出现冲突。`];
-        }
-        meta.secondDays = days;
-      }
-      sessions.put(meta);
-      await done;
-    }, id);
+    const recordedAt = new Date().toISOString();
+    let batch = secondBatches.get(id);
+    if (!batch) {
+      batch = {items: [], timer: null};
+      secondBatches.set(id, batch);
+      batch.timer = setTimeout(() => { flushSecondBatch(id).catch(() => {}); }, Math.max(0, secondBatchDelayMs));
+    }
+    const promise = new Promise((resolve, reject) => batch.items.push({row: secondRow, source: sourceCopy, recordedAt, resolve, reject}));
+    if (batch.items.length >= Math.max(1, secondBatchSize | 0)) flushSecondBatch(id).catch(() => {});
+    return promise;
   }
 
   async function captureWatermarks(sessionIds) {
     const ids = [...new Set((sessionIds || []).filter(Boolean).map(String))];
+    flushSecondBatch();
     return enqueue(async () => {
       const database = await db();
       const tx = database.transaction('sessions', 'readonly');
@@ -361,6 +405,7 @@ export function createReviewRecorder() {
       throw new TypeError('导入练习缺少有效的session身份');
     }
     const sessionId = String(session.id);
+    flushSecondBatch(sessionId);
     const events = Array.isArray(archive.events) ? archive.events.map(jsonClone).filter(Boolean) : [];
     const screenshots = Array.isArray(archive.screenshots) ? archive.screenshots.map(cloneScreenshotRecord).filter(Boolean) : [];
     const minutes = Array.isArray(archive.minutes) ? archive.minutes.map(row => Array.isArray(row) ? row.slice(0, 6) : null).filter(row => row?.length === 6 && row.every(Number.isFinite)) : [];
@@ -434,16 +479,20 @@ export function createReviewRecorder() {
   }
 
   async function flush() {
+    flushSecondBatch();
     await queue;
     if (dbPromise) await db();
     if (lastError) throw lastError;
   }
 
   async function readSession(sessionId, {maxSeq = Number.MAX_SAFE_INTEGER, visibleThrough = Number.MAX_SAFE_INTEGER, snapshotAt = Number.MAX_SAFE_INTEGER} = {}) {
+    const id = String(sessionId);
+    flushSecondBatch(id);
+    await enqueue(async () => {}, id);
     const database = await db();
     const tx = database.transaction(['sessions', 'events', 'screenshots', 'minutes', 'seconds'], 'readonly');
     const done = transactionDone(tx);
-    const key = IDBKeyRange.only(String(sessionId));
+    const key = IDBKeyRange.only(id);
     const [meta, allEvents, allScreenshots, allMinutes, allSeconds] = await Promise.all([
       requestResult(tx.objectStore('sessions').get(String(sessionId))),
       requestResult(tx.objectStore('events').index('sessionId').getAll(key)),
@@ -452,13 +501,13 @@ export function createReviewRecorder() {
       requestResult(tx.objectStore('seconds').index('sessionId').getAll(key))
     ]);
     await done;
-    const events = allEvents.filter(x => x.sessionId === String(sessionId) && x.seq <= maxSeq && (x.visibleThrough === null || x.visibleThrough <= visibleThrough) && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.seq - b.seq);
+    const events = allEvents.filter(x => x.sessionId === id && x.seq <= maxSeq && (x.visibleThrough === null || x.visibleThrough <= visibleThrough) && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.seq - b.seq);
     const includedIds = new Set(events.map(x => x.screenshotId).filter(Boolean));
-    const screenshots = allScreenshots.filter(x => x.sessionId === String(sessionId) && includedIds.has(x.id)).map(({id, blob, eventId, mimeType, captureType}) => ({id, blob, eventId, mimeType, captureType}));
-    const minutes = allMinutes.filter(x => x.sessionId === String(sessionId) && x.time + 60 <= visibleThrough && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.time - b.time).map(x => x.row);
-    const secondRows = allSeconds.filter(x => x.sessionId === String(sessionId) && x.time + 1 <= visibleThrough && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.time - b.time).map(x => x.row);
+    const screenshots = allScreenshots.filter(x => x.sessionId === id && includedIds.has(x.id)).map(({id, blob, eventId, mimeType, captureType}) => ({id, blob, eventId, mimeType, captureType}));
+    const minutes = allMinutes.filter(x => x.sessionId === id && x.time + 60 <= visibleThrough && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.time - b.time).map(x => x.row);
+    const secondRows = allSeconds.filter(x => x.sessionId === id && x.time + 1 <= visibleThrough && (!Number.isFinite(Date.parse(x.recordedAt)) || Date.parse(x.recordedAt) <= snapshotAt)).sort((a, b) => a.time - b.time).map(x => x.row);
     return {
-      sessionId: String(sessionId), events, screenshots, minutes, secondRows,
+      sessionId: id, events, screenshots, minutes, secondRows,
       secondDays: jsonClone(meta?.secondDays ?? []),
       recordingStartedAt: meta?.recordingStartedAt ?? null,
       baseline: meta?.baseline ?? true,
