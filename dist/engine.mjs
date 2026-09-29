@@ -12,7 +12,8 @@ export const LENGTH = 180 * 24 * 60 * 60;
 export const CONTEXT = WARMUP;
 const WEEK = 7 * 24 * 60 * 60;
 const MONDAY_OFFSET = 4 * 24 * 60 * 60; // 1970-01-05 00:00 UTC; Unix epoch was Thursday.
-const VALID_TFS = new Set([900, 1800, 2700, 3600, 14400, 86400, WEEK]);
+const SHORT_TFS = new Set([60, 120, 180, 300]);
+const VALID_TFS = new Set([...SHORT_TFS, 900, 1800, 2700, 3600, 14400, 86400, WEEK]);
 
 function validLeverage(value) {
   return Number.isInteger(value) && value >= DEFAULT_LEVERAGE && value <= MAX_LEVERAGE;
@@ -659,7 +660,9 @@ export function ensureEvidenceBaseline(session, data) {
 // Aggregate only disclosed base candles. If `from` lands inside an interval,
 // include that interval's earlier candles so its OHLC remains truthful.
 export function aggregate(data, cursor, seconds, from = 0) {
-  if (!Array.isArray(data) || !Number.isInteger(cursor) || cursor < 0 || cursor >= data.length || !VALID_TFS.has(seconds)) return [];
+  // `data` is the immutable 15m source. Never reinterpret a 15m OHLCV candle
+  // as a 1–5m candle; callers must use aggregateDisclosedMinutes instead.
+  if (!Array.isArray(data) || !Number.isInteger(cursor) || cursor < 0 || cursor >= data.length || !VALID_TFS.has(seconds) || seconds < BASE) return [];
   let first = Number.isInteger(from) ? Math.max(0, Math.min(from, cursor)) : 0;
   const cursorCandle = candleAt(data, cursor);
   if (!cursorCandle) return [];
@@ -685,7 +688,9 @@ export function aggregate(data, cursor, seconds, from = 0) {
 }
 
 export function aggregateReplay(session, data, seconds, from = 0) {
-  if (!session || !Array.isArray(data) || !VALID_TFS.has(seconds) || !validIndexTriplet(session, data)) return [];
+  // The replay session only stores an aggregate `forming15m`; it cannot be
+  // split into historical sub-bars. Short-TF charting uses real minute rows.
+  if (!session || !Array.isArray(data) || !VALID_TFS.has(seconds) || seconds < BASE || !validIndexTriplet(session, data)) return [];
   const out = aggregate(data, session.cursor, seconds, from);
   const forming = session.forming15m;
   if (!forming) return out;
@@ -696,6 +701,55 @@ export function aggregateReplay(session, data, seconds, from = 0) {
     last.close = forming[4];
     last.volume += forming[5];
   } else out.push({time, open: forming[1], high: forming[2], low: forming[3], close: forming[4], volume: forming[5]});
+  return out;
+}
+
+/** Aggregate only real, fully disclosed 1m candles into 1/2/3/5m chart bars.
+ * `visibleThrough` is the exclusive UTC close-time cutoff (the same clock
+ * returned by replayTime). Invalid, duplicate, future, or partial rows are
+ * ignored. Missing minutes remain missing; no candle is synthesized. `from`
+ * is an optional index into the normalized disclosed minute rows; output
+ * rewinds to that row's interval start so the first emitted OHLC remains true.
+ */
+export function aggregateDisclosedMinutes(minuteRows, seconds, visibleThrough, from = 0) {
+  if (!Array.isArray(minuteRows) || !SHORT_TFS.has(seconds) || !Number.isInteger(visibleThrough) || visibleThrough < 0) return [];
+  const unique = new Map();
+  for (const row of minuteRows) {
+    if (!Array.isArray(row) || row.length < 6 || !row.slice(0, 6).every(Number.isFinite)) continue;
+    const [time] = row;
+    if (!Number.isInteger(time) || time < 0 || time % 60 !== 0 || time + 60 > visibleThrough || unique.has(time)) continue;
+    const valid = candleAt([row], 0);
+    if (valid) unique.set(time, valid.slice(0, 6));
+  }
+  let rows = [...unique.values()].sort((a, b) => a[0] - b[0]);
+  if (Number.isInteger(from) && from > 0 && rows.length) {
+    const first = Math.min(from, rows.length - 1);
+    const firstBucket = intervalStart(rows[first][0], seconds);
+    rows = rows.filter(row => row[0] >= firstBucket);
+  }
+  const out = [];
+  for (const row of rows) {
+    const time = intervalStart(row[0], seconds), previous = out.at(-1);
+    if (previous?.time === time) {
+      previous.high = Math.max(previous.high, row[2]);
+      previous.low = Math.min(previous.low, row[3]);
+      previous.close = row[4];
+      previous.volume += row[5];
+      previous.disclosedMinutes += 1;
+      if (row[0] !== previous.lastMinuteTime + 60) previous.contiguous = false;
+      previous.lastMinuteTime = row[0];
+    } else {
+      out.push({time, open: row[1], high: row[2], low: row[3], close: row[4], volume: row[5], disclosedMinutes: 1,
+        expectedMinutes: seconds / 60, firstMinuteTime: row[0], lastMinuteTime: row[0], contiguous: true});
+    }
+  }
+  for (const bar of out) {
+    bar.complete = bar.disclosedMinutes === bar.expectedMinutes && bar.contiguous &&
+      bar.firstMinuteTime === bar.time && bar.lastMinuteTime === bar.time + seconds - 60;
+    delete bar.firstMinuteTime;
+    delete bar.lastMinuteTime;
+    delete bar.contiguous;
+  }
   return out;
 }
 
@@ -1166,6 +1220,7 @@ export function advance(s, data) {
     return {ended: true, trade: null, orderFilled: null, orderCancelled};
   }
   if (!VALID_TFS.has(s.tf)) throw new Error('周期无效');
+  if (s.tf < BASE) throw new Error('短周期回放需要真实分钟行情，请使用advanceMinute推进');
   const current = assertCandle(data, s.cursor);
   const nextBoundary = intervalStart(current[0] + BASE, s.tf) + s.tf;
   let trade = null, orderFilled = null, orderCancelled = null;

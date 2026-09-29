@@ -3,6 +3,8 @@ const MIN_PRICE = Number.MIN_VALUE;
 const MAX_DRAWINGS = 500;
 const MIN_ZONE_TIME_SPAN = 1;
 const MIN_ZONE_PRICE_SPAN = 1e-8;
+export const FIBONACCI_LEVELS = Object.freeze([0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]);
+export const DRAWING_LINE_STYLES = Object.freeze({solid: '', dashed: '7 5', dotted: '2 4'});
 export const DRAWING_PALETTE = Object.freeze({
   teal: Object.freeze({label: '蓝青', line: '#69aebd', border: '#69aebd', fill: 'rgba(105,174,189,.13)', selectedFill: 'rgba(105,174,189,.21)', labelBackground: '#24464d'}),
   blue: Object.freeze({label: '蓝', line: '#6389c6', border: '#6389c6', fill: 'rgba(99,137,198,.13)', selectedFill: 'rgba(99,137,198,.21)', labelBackground: '#273a58'}),
@@ -38,6 +40,15 @@ function cloneDrawing(item) {
     return {id: item.id, type: item.type,
       start: {time: item.start.time, price: item.start.price},
       end: {time: item.end.time, price: item.end.price}};
+  }
+  if (item.type === 'fibonacci' && validPoint(item.start) && validPoint(item.end) &&
+      (item.start.time !== item.end.time || item.start.price !== item.end.price)) {
+    return {id: item.id, type: 'fibonacci',
+      start: {time: item.start.time, price: item.start.price},
+      end: {time: item.end.time, price: item.end.price},
+      colorPreset: validColorPreset(item.colorPreset) ? item.colorPreset : NEW_DRAWING_COLOR_PRESET,
+      lineStyle: Object.hasOwn(DRAWING_LINE_STYLES, item.lineStyle) ? item.lineStyle : 'solid',
+      extendRight: typeof item.extendRight === 'boolean' ? item.extendRight : true};
   }
   if (item.type === 'zone' && validPoint(item.start) && validPoint(item.end)) {
     const left = Math.min(item.start.time, item.end.time), right = Math.max(item.start.time, item.end.time);
@@ -115,7 +126,15 @@ export function projectDrawing(drawing, bars, intervalSeconds = 60) {
   });
   if (valid.type === 'horizontal') return {id: valid.id, type: valid.type, anchor: project(valid.anchor), colorPreset: valid.colorPreset};
   return {id: valid.id, type: valid.type, start: project(valid.start), end: project(valid.end),
-    ...(valid.type === 'zone' ? {colorPreset: valid.colorPreset} : {})};
+    ...(['zone', 'fibonacci'].includes(valid.type) ? {colorPreset: valid.colorPreset} : {}),
+    ...(valid.type === 'fibonacci' ? {lineStyle: valid.lineStyle, extendRight: valid.extendRight} : {})};
+}
+
+export function fibonacciPriceLevels(drawing) {
+  const valid = cloneDrawing(drawing);
+  if (!valid || valid.type !== 'fibonacci') return [];
+  // Fib 0 is the second-click pivot; 1 is the first-click swing origin.
+  return FIBONACCI_LEVELS.map(ratio => ({ratio, price: valid.end.price + (valid.start.price - valid.end.price) * ratio}));
 }
 
 function translatePoint(point, dt, dp) {
@@ -132,9 +151,10 @@ export function translateDrawing(drawing, dt, dp) {
 
 export function moveDrawingPoint(drawing, which, point) {
   const valid = cloneDrawing(drawing);
-  if (!valid || valid.type !== 'trend' || !validPoint(point) || !['start', 'end'].includes(which)) return null;
+  if (!valid || !['trend', 'fibonacci'].includes(valid.type) || !validPoint(point) || !['start', 'end'].includes(which)) return null;
   const result = {...valid, [which]: {time: point.time, price: point.price}};
-  return result.start.time === result.end.time ? null : result;
+  return result.type === 'trend' && result.start.time === result.end.time ? null :
+    result.type === 'fibonacci' && result.start.time === result.end.time && result.start.price === result.end.price ? null : cloneDrawing(result);
 }
 
 /** Resize one edge/corner of a normalized SMC zone in chart data coordinates. */
@@ -216,6 +236,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   let cachedSessionId;
   let cachedDrawingRef;
   let lastStateSignature = '';
+  let scaleRefreshPending = false;
 
   function session() { return getSession(); }
   function currentDrawings() {
@@ -285,7 +306,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     const selectedDrawing = currentDrawings().find(drawing => drawing.id === selectedId) ?? null;
     const state = {tool, selectedId, selectedType: selectedDrawing?.type ?? null,
       colorPreset: selectedDrawing?.colorPreset ?? null, drawingCount: currentDrawings().length,
-      phase: tool === 'trendline' || tool === 'zone' ? (draftStart ? 'end' : 'start') : null,
+      phase: tool === 'trendline' || tool === 'zone' || tool === 'fibonacci' ? (draftStart ? 'end' : 'start') : null,
       axisMenuOpen};
     const signature = JSON.stringify(state);
     if (signature !== lastStateSignature) { lastStateSignature = signature; onStateChange(state); }
@@ -356,8 +377,17 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   }
   function logicalX(logical) {
     const ts = chart.timeScale();
-    const x = ts.logicalToCoordinate(logical);
-    if (Number.isFinite(x)) return x;
+    // Lightweight Charts 5.0.9 only accepts integer logical indexes and
+    // returns 0 for fractional values. A timestamp between aggregated bars
+    // must interpolate the neighboring integer coordinates instead.
+    if (Number.isInteger(logical)) {
+      const x = ts.logicalToCoordinate(logical);
+      if (Number.isFinite(x)) return x;
+    } else {
+      const lo = Math.floor(logical), hi = Math.ceil(logical), fraction = logical - lo;
+      const x0 = ts.logicalToCoordinate(lo), x1 = ts.logicalToCoordinate(hi);
+      if (Number.isFinite(x0) && Number.isFinite(x1)) return x0 + (x1 - x0) * fraction;
+    }
     const bars = cachedBars;
     if (!bars?.length) return null;
     const maxIndex = Math.max(0, bars.length - 1);
@@ -463,6 +493,44 @@ export function createDrawingTools({chart, series, container, getSession, getBar
       }
       return;
     }
+    if (drawing.type === 'fibonacci') {
+      const palette = resolveDrawingPalette('fibonacci', drawing.colorPreset);
+      const xStart = a.x, xEnd = b.x;
+      const lineLeft = Math.min(xStart, xEnd);
+      const lineRight = drawing.extendRight ? plotWidth() : Math.max(xStart, xEnd);
+      // A quiet diagonal spine remains a reliable whole-drawing drag target.
+      const hit = createSvg('line', {x1: xStart, y1: a.y, x2: xEnd, y2: b.y,
+        stroke: 'transparent', 'stroke-width': 14, 'vector-effect': 'non-scaling-stroke'}, 'drawing-hit-area drawing-fib-hit');
+      bindHit(hit, drawing.id);
+      overlay.append(hit);
+      const spine = createSvg('line', {x1: xStart, y1: a.y, x2: xEnd, y2: b.y,
+        stroke: palette.line, opacity: chosen ? .58 : .28, 'stroke-width': chosen ? 1.2 : 1,
+        'stroke-dasharray': '3 4', 'vector-effect': 'non-scaling-stroke'}, 'drawing-fib-spine');
+      spine.style.pointerEvents = 'none'; overlay.append(spine);
+      for (const {ratio, price} of fibonacciPriceLevels(drawing)) {
+        const y = priceY(price);
+        if (!Number.isFinite(y)) continue;
+        const line = createSvg('line', {x1: lineLeft, x2: lineRight, y1: y, y2: y,
+          stroke: palette.line, opacity: chosen ? .98 : .78, 'stroke-width': chosen ? 1.7 : 1.25,
+          'stroke-dasharray': DRAWING_LINE_STYLES[drawing.lineStyle], 'vector-effect': 'non-scaling-stroke'},
+        `drawing-fib-level${chosen ? ' selected' : ''}`);
+        line.style.pointerEvents = 'none'; overlay.append(line);
+        const label = createSvg('text', {x: lineRight - 5, y: y - 4, fill: palette.line,
+          'font-size': 10, 'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          'text-anchor': 'end', 'paint-order': 'stroke', stroke: '#171b1e', 'stroke-width': 3,
+          'stroke-linejoin': 'round'}, 'drawing-fib-label');
+        label.textContent = `${ratio}  ${formatPrice(price)}`;
+        label.style.pointerEvents = 'none'; overlay.append(label);
+      }
+      if (chosen) {
+        for (const [which, point] of [['start', a], ['end', b]]) {
+          const handle = createSvg('circle', {cx: point.x, cy: point.y, r: 5, fill: palette.line,
+            stroke: '#171b1e', 'stroke-width': 2}, 'drawing-handle drawing-fib-handle');
+          bindHit(handle, drawing.id, which); overlay.append(handle);
+        }
+      }
+      return;
+    }
     const hit = createSvg('line', {x1: a.x, y1: a.y, x2: b.x, y2: b.y,
       stroke: 'transparent', 'stroke-width': 12, 'vector-effect': 'non-scaling-stroke'}, 'drawing-hit-area');
     bindHit(hit, drawing.id);
@@ -510,6 +578,25 @@ export function createDrawingTools({chart, series, container, getSession, getBar
         const preview = createSvg('rect', {x, y, width, height, fill: previewPalette.selectedFill, stroke: previewPalette.border, 'stroke-width': 1.5,
           'stroke-dasharray': '5 3', 'vector-effect': 'non-scaling-stroke'}, 'drawing-preview drawing-zone-preview');
         preview.style.pointerEvents = 'none'; overlay.append(preview);
+      }
+    } else if (tool === 'fibonacci') {
+      const previewPalette = resolveDrawingPalette('fibonacci', NEW_DRAWING_COLOR_PRESET);
+      const marker = createSvg('circle', {cx: a.x, cy: a.y, r: 5, fill: previewPalette.line, stroke: '#171b1e', 'stroke-width': 2}, 'drawing-start-marker drawing-fib-marker');
+      marker.style.pointerEvents = 'none'; overlay.append(marker);
+      if (!draftStart.current) return;
+      const b = pointToPixel(draftStart.current);
+      if (b) {
+        const left = Math.min(a.x, b.x), right = Math.max(a.x, b.x);
+        for (const ratio of FIBONACCI_LEVELS) {
+          const y = priceY(draftStart.current.price + (draftStart.point.price - draftStart.current.price) * ratio);
+          if (!Number.isFinite(y)) continue;
+          const line = createSvg('line', {x1: left, x2: plotWidth(), y1: y, y2: y, stroke: previewPalette.line,
+            opacity: .7, 'stroke-width': 1.2, 'stroke-dasharray': DRAWING_LINE_STYLES.solid}, 'drawing-preview drawing-fib-level-preview');
+          line.style.pointerEvents = 'none'; overlay.append(line);
+        }
+        const spine = createSvg('line', {x1: a.x, y1: a.y, x2: b.x, y2: b.y, stroke: previewPalette.line,
+          opacity: .45, 'stroke-width': 1, 'stroke-dasharray': '3 4'}, 'drawing-preview drawing-fib-spine-preview');
+        spine.style.pointerEvents = 'none'; overlay.append(spine);
       }
     }
   }
@@ -562,15 +649,17 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     if (tool === 'horizontal') {
       return finishDrawing({id: uid(), type: 'horizontal', anchor: point, colorPreset: NEW_DRAWING_COLOR_PRESET});
     }
-    if (tool === 'trendline') {
+    if (tool === 'trendline' || tool === 'fibonacci') {
       if (!draftStart) {
         draftStart = {point, current: point};
         render();
         return true;
       } else {
         const first = draftStart.point;
-        if (point.time === first.time) return false;
-        return finishDrawing({id: uid(), type: 'trend', start: first, end: point});
+        if (point.time === first.time && (tool !== 'fibonacci' || point.price === first.price)) return false;
+        return finishDrawing(tool === 'fibonacci' ? {id: uid(), type: 'fibonacci', start: first, end: point,
+          colorPreset: NEW_DRAWING_COLOR_PRESET, lineStyle: 'solid', extendRight: true} :
+          {id: uid(), type: 'trend', start: first, end: point});
       }
     }
     if (tool === 'zone') {
@@ -712,8 +801,13 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     }
   }
   function scheduleScaleRefresh() {
+    if (destroyed || scaleRefreshPending) return;
     if (typeof requestAnimationFrame !== 'function') { render(); return; }
-    requestAnimationFrame(() => requestAnimationFrame(render));
+    scaleRefreshPending = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      scaleRefreshPending = false;
+      if (!destroyed) render();
+    }));
   }
   function keyDown(event) {
     if (isLocked()) return;
@@ -731,7 +825,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
     return typeof Element !== 'undefined' && target instanceof Element && (target.matches('input,textarea,select,[contenteditable="true"]') || target.closest('[contenteditable="true"]'));
   }
   function setTool(nextTool) {
-    if (![null, 'horizontal', 'trendline', 'zone'].includes(nextTool)) throw new TypeError('未知画线工具。');
+    if (![null, 'horizontal', 'trendline', 'zone', 'fibonacci'].includes(nextTool)) throw new TypeError('未知画线工具。');
     if (isLocked() && nextTool) return false;
     tool = nextTool;
     draftStart = null;
@@ -755,10 +849,27 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   function setSelectedColor(colorPreset) {
     if (!selectedId || !validColorPreset(colorPreset) || isLocked()) return false;
     const drawing = currentDrawings().find(item => item.id === selectedId);
-    if (!drawing || !['horizontal', 'zone'].includes(drawing.type) || drawing.colorPreset === colorPreset) return false;
+    if (!drawing || !['horizontal', 'zone', 'fibonacci'].includes(drawing.type) || drawing.colorPreset === colorPreset) return false;
     if (!replaceDrawing(selectedId, {...drawing, colorPreset})) return false;
     render();
     return true;
+  }
+  function setSelectedFibOptions({lineStyle, extendRight} = {}) {
+    if (!selectedId || isLocked()) return false;
+    const drawing = currentDrawings().find(item => item.id === selectedId);
+    if (!drawing || drawing.type !== 'fibonacci') return false;
+    const next = {...drawing};
+    if (lineStyle !== undefined) {
+      if (!Object.hasOwn(DRAWING_LINE_STYLES, lineStyle)) return false;
+      next.lineStyle = lineStyle;
+    }
+    if (extendRight !== undefined) {
+      if (typeof extendRight !== 'boolean') return false;
+      next.extendRight = extendRight;
+    }
+    if (next.lineStyle === drawing.lineStyle && next.extendRight === drawing.extendRight) return false;
+    if (!replaceDrawing(selectedId, next)) return false;
+    render(); return true;
   }
   function cancel() {
     releaseCrosshairPin();
@@ -772,7 +883,9 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   function refresh(nextBars) {
     const bars = Array.isArray(nextBars) ? nextBars : getBars();
     cachedBars = Array.isArray(bars) ? bars : [];
-    render();
+    // setData and a subsequent fit/setVisibleLogicalRange can update coordinates
+    // over separate chart frames. Defer projection until those viewport changes settle.
+    scheduleScaleRefresh();
   }
   function pointerDownSelect(event) {
     if (tool || event.target !== overlay || isLocked()) return;
@@ -797,7 +910,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   container.addEventListener('pointercancel', scheduleScaleRefresh, true);
   container.addEventListener('wheel', scheduleScaleRefresh, {capture: true, passive: true});
   window.addEventListener('keydown', keyDown);
-  const rangeChanged = () => render();
+  const rangeChanged = () => scheduleScaleRefresh();
   chart.timeScale().subscribeVisibleLogicalRangeChange(rangeChanged);
   chart.timeScale().subscribeVisibleTimeRangeChange(rangeChanged);
   const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(scheduleScaleRefresh) : null;
@@ -807,6 +920,7 @@ export function createDrawingTools({chart, series, container, getSession, getBar
   return {
     setTool,
     setSelectedColor,
+    setSelectedFibOptions,
     deleteSelected,
     cancel,
     refresh,

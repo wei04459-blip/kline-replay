@@ -218,6 +218,34 @@ test('drawing coverage matches current drawing IDs to event after-snapshots, not
   assert.deepEqual(mismatched.currentStateOnlyIds, ['unrelated-current-line']);
 });
 
+test('short-timeframe currentBar is verified from minute prefix only even when a parent 15m row is complete', async () => {
+  const session = activeSession('short-view', start + 14 * minute, null);
+  session.tf = 120;
+  const minutes = Array.from({length: 15}, (_, index) => {
+    const time = start + index * minute;
+    return candle(time, 100 + index, 102 + index, 98 + index, 101 + index, index + 1);
+  });
+  const firstTwo = minutes.slice(0, 2);
+  const shortBar = {time: start, interval: 120, open: firstTwo[0][1], high: Math.max(...firstTwo.map(row => row[2])),
+    low: Math.min(...firstTwo.map(row => row[3])), close: firstTwo.at(-1)[4], volume: firstTwo.reduce((sum, row) => sum + row[5], 0)};
+  session.minuteCursorTime = start + 14 * minute;
+  const latestMinute = minutes.at(-1);
+  session.currentBar = {time: latestMinute[0], interval: 120, open: latestMinute[1], high: latestMinute[2],
+    low: latestMinute[3], close: latestMinute[4], volume: latestMinute[5]};
+  const output = await buildReviewExport({current: session, history: [], loadDataset: async () => dataset(),
+    readAudit: async () => ({minutes, events: [{id: 'short-view-event', seq: 1, kind: 'view-setting',
+      visibleThrough: start + 2 * minute, recordedAt: new Date().toISOString(),
+      view: {tf: 120, visibleThrough: start + 2 * minute, currentBar: shortBar}}], screenshots: [], issues: []})});
+  const files = await readStoredZip(output.blob);
+  const payload = JSON.parse(new TextDecoder().decode(files.get('完整记录.json')));
+  const round = payload.sessions[0];
+  assert.ok(round.market.contextCandles.some(row => row[0] === start), 'the completed parent 15m row is present in the export');
+  assert.deepEqual(round.session.currentBar, {...session.currentBar, complete: false});
+  assert.deepEqual(round.events[0].view.currentBar, {...shortBar, complete: true});
+  assert.equal(round.coverage.shortTimeframeEvidence.interval, 120);
+  assert.equal(round.coverage.shortTimeframeEvidence.status, 'minute-backed');
+});
+
 test('HTML review book orders stages numerically by event sequence, not by event ID or input order', async () => {
   const session = activeSession('ordered-book', start + minute, null);
   session.trades = [{id: 'ordered-trade', orderId: 'ordered-order', side: 1, entry: 100, exit: 101,
